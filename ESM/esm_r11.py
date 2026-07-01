@@ -79,6 +79,14 @@ class AppBase(BaseTk):
         self.latest_optimizer_results = None
         self.show_advanced = False
 
+        # [Learning Energy Curve] RU HW 단위 loading-energy 회귀 학습 관련 상태
+        self.cell_unavail_file = tk.StringVar()
+        self.learn_loading_metric = tk.StringVar(value="Total Traffic Byte (AirMacDL+UL)")
+        self.learn_down_ratio_th = tk.DoubleVar(value=0.9)
+        self.learn_min_samples = tk.IntVar(value=10)
+        self.learn_ru_df = pd.DataFrame()
+        self.learn_hw_df = pd.DataFrame()
+
         self._load_auto_jsons()
         self.create_widgets()
 
@@ -229,18 +237,21 @@ class AppBase(BaseTk):
         self.frame_main = ttk.Frame(self.notebook, padding=15)
         self.frame_pattern = ttk.Frame(self.notebook, padding=15)
         self.frame_energy = ttk.Frame(self.notebook, padding=15)
+        self.frame_learning = ttk.Frame(self.notebook, padding=15)
 
         self.notebook.add(self.frame_data_io, text=" 📂 Data I/O & CM ")
         self.notebook.add(self.frame_editors, text=" ⚙️ DB Editors ")
         self.notebook.add(self.frame_main, text=" ✨ Optimizer ")
         self.notebook.add(self.frame_pattern, text=" 📊 Traffic Pattern ")
         self.notebook.add(self.frame_energy, text=" ⚡ Energy Dashboard ")
+        self.notebook.add(self.frame_learning, text=" 📈 Learning Energy Curve ")
 
         self._build_data_io_ui()
         self._build_editors_ui()
         self._build_main_ui()
         self._build_pattern_ui()
         self._build_energy_ui()
+        self._build_learning_ui()
 
     def _build_data_io_ui(self):
         file_frame = ttk.Frame(self.frame_data_io, style='Card.TFrame', padding=15)
@@ -402,6 +413,7 @@ class AppBase(BaseTk):
     def open_traffic_pattern_popup(self): pass
     def _toggle_view_mode(self): pass
     def _render_interactive_graph(self, action): pass
+    def _build_learning_ui(self): pass
 
 class AppEditors(AppBase):
     def _build_editors_ui(self):
@@ -742,7 +754,9 @@ class AppDashboard(AppEditors):
         self._update_cm_treeview(df_sorted)
         self.tree_map.heading(col, command=lambda: self._sort_cm_tree(col, not reverse))
 
-    def _parse_energy_stat(self):
+    def _parse_energy_stat_raw(self):
+        """Energy Stat CSV를 로드/정규화만 하고 Dashboard의 날짜/시간 필터는 적용하지 않는 원본 파서.
+        Energy Dashboard(`_parse_energy_stat`)와 Learning Energy Curve 탭이 공유한다."""
         estat_path = self.energy_stat_file.get()
         if not estat_path: raise ValueError("Energy Stat Data (CSV)를 입력해주세요.")
 
@@ -756,8 +770,9 @@ class AppDashboard(AppEditors):
             elif cl == 'cascade': rename_map[c] = 'ru-cascade-id'
             elif cl.startswith('rupowertot'): rename_map[c] = 'RuPowerTot'
             elif cl.startswith('rupowercnt'): rename_map[c] = 'RuPowerCnt'
+            elif cl in ['timestamp', 'datetime']: rename_map[c] = 'TIMESTAMP'
             elif cl.startswith('date'): rename_map[c] = 'Date'
-            elif cl.startswith('time'): rename_map[c] = 'Time'
+            elif cl == 'time': rename_map[c] = 'Time'
         df_e.rename(columns=rename_map, inplace=True)
 
         if 'eNB_ID' not in df_e.columns: raise ValueError("eNB_ID(Ne unique id 등) 컬럼을 찾을 수 없습니다.")
@@ -771,7 +786,10 @@ class AppDashboard(AppEditors):
 
         df_e = df_e.dropna(subset=['Timestamp'])
         if df_e.empty: raise ValueError("Date/Time 정보를 해석할 수 없습니다.")
+        return df_e
 
+    def _parse_energy_stat(self):
+        df_e = self._parse_energy_stat_raw()
         min_d = df_e['Timestamp'].dt.date.min()
         max_d = df_e['Timestamp'].dt.date.max()
 
@@ -1446,6 +1464,25 @@ class ESAnalyzerApp(AppDashboard):
             formatted = [f"{v:,.2f}" if isinstance(v, (float, np.floating)) else v for v in row]
             tree.insert("", tk.END, values=formatted)
 
+    def _update_tree_precise(self, tree, df, precise_cols=()):
+        """[Learning Energy Curve 전용] Slope처럼 값이 매우 작은 컬럼은 유효숫자 기준으로,
+        나머지 실수 컬럼은 기존과 동일하게 소수점 2자리로 표시한다."""
+        tree.delete(*tree.get_children())
+        if df.empty: return
+        tree["columns"] = list(df.columns)
+        for col in df.columns:
+            tree.heading(col, text=col); tree.column(col, width=140, anchor=tk.CENTER)
+        for _, row in df.iterrows():
+            formatted = []
+            for col, v in row.items():
+                if isinstance(v, (float, np.floating)) and pd.notna(v):
+                    formatted.append(f"{v:.6g}" if col in precise_cols else f"{v:,.2f}")
+                elif isinstance(v, (float, np.floating)):
+                    formatted.append("N/A")
+                else:
+                    formatted.append(v)
+            tree.insert("", tk.END, values=formatted)
+
     def _calc_all_savings(self, df_energy_stat=None):
         """[수정] 누적 NC2 및 Gamma 기반 절감량 + board-type + 시간단위 에너지량 합산"""
         logging.info("========== [DEBUG] 에너지 절감 예측 연산 시작 (Gamma & Board-Type 포함) ==========")
@@ -2032,6 +2069,362 @@ class ESAnalyzerApp(AppDashboard):
 
         ttk.Button(bottom_frame, text="💾 최종 결과 파일(CSV) 저장", style='Success.TButton', command=save_files).pack(side=tk.RIGHT, ipadx=10)
         ttk.Label(bottom_frame, text=f"* 산점도 그래프는 이미 자동 저장되었습니다: {plot_dir}", foreground='#6B7280').pack(side=tk.LEFT)
+
+    # ---------------------------------------------------------
+    # [신규] Learning Energy Curve
+    # 상용망 통계(Cell Unavailable Time + Energy Stat + Traffic)를 이용하여
+    # RU HW(Board Type)별 loading-energy 1차 회귀(기울기/절편)와
+    # Cell OFF 시 예상 에너지 절감량을 학습/추론하는 탭.
+    # ---------------------------------------------------------
+    def _build_learning_ui(self):
+        ctrl_frame = ttk.LabelFrame(self.frame_learning, text=" 데이터 입력 및 학습 설정 ", padding=10)
+        ctrl_frame.pack(fill=tk.X, pady=5)
+
+        row0 = ttk.Frame(ctrl_frame)
+        row0.pack(fill=tk.X, pady=2)
+        ttk.Label(row0, text="Cell Unavailable Time Data (CSV):", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(row0, textvariable=self.cell_unavail_file, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(row0, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.cell_unavail_file)).pack(side=tk.LEFT)
+        ttk.Label(row0, text="  (※ Traffic Data / Energy Stat Data / CM Data는 'Data I/O & CM' 탭에서 로드한 것을 그대로 사용합니다)",
+                  foreground="gray").pack(side=tk.LEFT, padx=10)
+
+        row1 = ttk.Frame(ctrl_frame)
+        row1.pack(fill=tk.X, pady=8)
+        ttk.Label(row1, text="Loading 지표:").pack(side=tk.LEFT, padx=5)
+        self.learn_metric_combo = ttk.Combobox(row1, width=28, state='readonly', textvariable=self.learn_loading_metric)
+        self.learn_metric_combo['values'] = ["Total Traffic Byte (AirMacDL+UL)", "UsedRB (PRB 사용량)"]
+        self.learn_metric_combo.current(0)
+        self.learn_metric_combo.pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(row1, text=" | Cell OFF 판정 기준 (Down 비율 ≥):").pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Spinbox(row1, from_=0.5, to=1.0, increment=0.01, textvariable=self.learn_down_ratio_th, width=8).pack(side=tk.LEFT)
+
+        ttk.Label(row1, text=" | 최소 샘플 수 (RU당):").pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Spinbox(row1, from_=3, to=1000, increment=1, textvariable=self.learn_min_samples, width=8).pack(side=tk.LEFT)
+
+        row2 = ttk.Frame(ctrl_frame)
+        row2.pack(fill=tk.X, pady=10)
+        ttk.Button(row2, text="🔄 학습 실행 (Train 8 : Val 1 : Test 1)", style='Success.TButton', command=self._run_energy_curve_learning).pack(side=tk.LEFT, padx=5)
+        self.learn_status_label = tk.Label(row2, text="Ready...", fg="#6B7280", bg=self.BG_COLOR)
+        self.learn_status_label.pack(side=tk.LEFT, padx=15)
+
+        result_notebook = ttk.Notebook(self.frame_learning)
+        result_notebook.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        frame_ru = ttk.Frame(result_notebook)
+        frame_hw = ttk.Frame(result_notebook)
+        frame_plot = ttk.Frame(result_notebook)
+        result_notebook.add(frame_ru, text=" RU 단위 상세 결과 ")
+        result_notebook.add(frame_hw, text=" HW(Board Type) 평균 성능 ")
+        result_notebook.add(frame_plot, text=" 시각화 ")
+
+        self.tree_learn_ru = self._create_tree_in_frame(frame_ru)
+        self.tree_learn_hw = self._create_tree_in_frame(frame_hw)
+
+        plot_outer = ttk.Frame(frame_plot)
+        plot_outer.pack(fill=tk.BOTH, expand=True)
+        plot_canvas = tk.Canvas(plot_outer, bg=self.FRAME_BG, highlightthickness=0)
+        plot_scroll = ttk.Scrollbar(plot_outer, orient="vertical", command=plot_canvas.yview)
+        self.learning_plot_frame = ttk.Frame(plot_canvas)
+        self.learning_plot_frame.bind("<Configure>", lambda e: plot_canvas.configure(scrollregion=plot_canvas.bbox("all")))
+        plot_canvas.create_window((0, 0), window=self.learning_plot_frame, anchor="nw")
+        plot_canvas.configure(yscrollcommand=plot_scroll.set)
+        plot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        plot_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _parse_cell_unavail_stat(self):
+        """Cell Unavailable Time 통계(cellunavailableTimeDown[sec]) CSV 파서."""
+        filepath = self.cell_unavail_file.get()
+        if not filepath: raise ValueError("Cell Unavailable Time Data (CSV)를 선택해주세요.")
+
+        df = self._read_csv_auto(filepath)
+        rename_map = {}
+        for c in df.columns:
+            cl = str(c).strip().lower().replace('_', '').replace('-', '').replace(' ', '')
+            if cl in ['neuniqueid', 'enodebid', 'nodeid', 'neid', 'enbid', 'systemid']: rename_map[c] = 'eNB_ID'
+            elif cl in ['cellid', 'cnum', 'cellnuma', 'cellnumb', 'cellnumc', 'cellnumd', 'cellnum']: rename_map[c] = 'cell-num'
+            elif cl.startswith('cellunavailabletimedown'): rename_map[c] = 'CellUnavailTimeDown_sec'
+            elif cl in ['timestamp', 'datetime']: rename_map[c] = 'TIMESTAMP'
+            elif cl.startswith('date'): rename_map[c] = 'Date'
+            elif cl == 'time': rename_map[c] = 'Time'
+        df.rename(columns=rename_map, inplace=True)
+
+        if 'eNB_ID' not in df.columns or 'cell-num' not in df.columns:
+            raise ValueError("Cell Unavailable Time 데이터에 eNB_ID/cell-num 컬럼을 찾을 수 없습니다.")
+        if 'CellUnavailTimeDown_sec' not in df.columns:
+            raise ValueError("Cell Unavailable Time 데이터에 cellunavailableTimeDown 컬럼을 찾을 수 없습니다.")
+
+        df['eNB_ID'] = self._extract_int_id(df['eNB_ID'])
+        df['cell-num'] = self._extract_int_id(df['cell-num'])
+        df['CellUnavailTimeDown_sec'] = pd.to_numeric(df['CellUnavailTimeDown_sec'], errors='coerce').fillna(0)
+
+        if 'Date' in df.columns and 'Time' in df.columns:
+            df['Timestamp'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str), errors='coerce')
+        elif 'TIMESTAMP' in df.columns:
+            df['Timestamp'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
+        else:
+            raise ValueError("Cell Unavailable Time 데이터에 Date/Time 컬럼이 없습니다.")
+
+        df = df.dropna(subset=['Timestamp'])
+        if df.empty: raise ValueError("Cell Unavailable Time 데이터의 Date/Time 정보를 해석할 수 없습니다.")
+        df['Hourly_TS'] = df['Timestamp'].dt.floor('h')
+        return df
+
+    def _run_energy_curve_learning(self):
+        try:
+            self.learn_status_label.config(text="학습 데이터 준비 중...", fg="orange")
+            self.update()
+
+            if self.cm_map_df_full.empty:
+                raise ValueError("CM 데이터(Cell-RU Mapping)가 없습니다. 'Data I/O & CM' 탭에서 먼저 CM 데이터를 로드해주세요.")
+
+            ru_keys = ['ru-board-id', 'ru-port-id', 'ru-cascade-id']
+            avail_keys = [k for k in ru_keys if k in self.cm_map_df_full.columns]
+            if not avail_keys:
+                raise ValueError("CM 데이터에 RU 식별자(ru-board-id/ru-port-id/ru-cascade-id)가 없습니다.")
+
+            btype_col = next((c for c in self.cm_map_df_full.columns
+                               if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
+            if not btype_col:
+                raise ValueError("CM 데이터에 Board Type(RU HW 종류) 컬럼이 없습니다.")
+
+            cm_map = self.cm_map_df_full.rename(columns={btype_col: 'BoardType'}).copy()
+            cm_map['BoardType'] = cm_map['BoardType'].astype(str).str.strip()
+            for k in avail_keys: cm_map = cm_map[cm_map[k].astype(str) != '']
+            if cm_map.empty:
+                raise ValueError("CM 데이터에 유효한 RU 식별자를 가진 행이 없습니다.")
+
+            ru_boardtype = cm_map[avail_keys + ['BoardType']].drop_duplicates(subset=avail_keys, keep='first')
+
+            # --- 1. Cell Unavailable Time -> Cell 단위 시간당 Down 비율/상태(ON/OFF) ---
+            df_unavail = self._parse_cell_unavail_stat()
+            cell_hourly = df_unavail.groupby(['eNB_ID', 'cell-num', 'Hourly_TS'], observed=True)['CellUnavailTimeDown_sec'].sum().reset_index()
+            cell_hourly['Down_Ratio'] = (cell_hourly['CellUnavailTimeDown_sec'] / 3600.0).clip(upper=1.0)
+            down_th = self.learn_down_ratio_th.get()
+            cell_hourly['Cell_State'] = np.where(cell_hourly['Down_Ratio'] >= down_th, 'OFF', 'ON')
+
+            cm_by_cell = cm_map[['eNB_ID', 'cell-num'] + avail_keys].drop_duplicates()
+            cell_ru = pd.merge(cell_hourly, cm_by_cell, on=['eNB_ID', 'cell-num'], how='inner')
+            if cell_ru.empty:
+                raise ValueError("Cell Unavailable Time 데이터와 CM(Cell-RU Mapping) 정보의 eNB_ID/cell-num이 일치하지 않습니다.")
+
+            def _agg_state(states):
+                uniq = set(states)
+                if uniq == {'OFF'}: return 'OFF'
+                if uniq == {'ON'}: return 'ON'
+                return 'MIXED'
+
+            ru_state = cell_ru.groupby(avail_keys + ['Hourly_TS'], observed=True)['Cell_State'].agg(_agg_state).reset_index()
+            ru_state = ru_state[ru_state['Cell_State'] != 'MIXED']
+            if ru_state.empty:
+                raise ValueError("RU 단위로 ON/OFF 상태를 확정할 수 있는 시간대가 없습니다(cascade 내 셀 상태가 모두 MIXED). "
+                                 "Down 비율 판정 기준을 조정해보세요.")
+
+            # --- 2. Energy Stat -> RU 단위 시간당 소모 에너지[Wh] ---
+            df_e = self._parse_energy_stat_raw()
+            df_e['Hourly_TS'] = df_e['Timestamp'].dt.floor('h')
+            if any(k not in df_e.columns for k in avail_keys):
+                raise ValueError("Energy Stat 데이터에 CM과 동일한 RU 식별자(ru-board-id/ru-port-id/ru-cascade-id) 컬럼이 없습니다.")
+
+            ru_energy = df_e.groupby(avail_keys + ['Hourly_TS'], observed=True).agg({'RuPowerTot': 'sum', 'RuPowerCnt': 'sum'}).reset_index()
+            ru_energy['Energy_Wh'] = np.where(ru_energy['RuPowerCnt'] > 0, ru_energy['RuPowerTot'] / ru_energy['RuPowerCnt'], 0.0)
+
+            ru_energy_state = pd.merge(ru_state, ru_energy[avail_keys + ['Hourly_TS', 'Energy_Wh']], on=avail_keys + ['Hourly_TS'], how='inner')
+            if ru_energy_state.empty:
+                raise ValueError("Cell Unavailable Time과 Energy Stat 데이터의 RU/시간대가 겹치지 않습니다.")
+
+            # --- 3. Traffic 데이터 -> RU 단위 시간당 Loading ---
+            traffic_path = self.traffic_file.get()
+            if not traffic_path: raise ValueError("Traffic Data (CSV)를 'Data I/O & CM' 탭에서 선택해주세요.")
+
+            df_t = self._read_csv_auto(traffic_path)
+            df_t = self._normalize_core_cols(df_t)
+            if 'eNB_ID' not in df_t.columns or 'Sector' not in df_t.columns:
+                raise ValueError("Traffic 데이터에 eNB_ID/Sector 컬럼이 없습니다.")
+            df_t['eNB_ID'] = self._extract_int_id(df_t['eNB_ID'])
+            df_t['Sector'] = self._extract_int_id(df_t['Sector'])
+
+            time_col = 'Time' if 'Time' in df_t.columns else ('TIMESTAMP' if 'TIMESTAMP' in df_t.columns else None)
+            if not time_col: raise ValueError("Traffic 데이터에 Time 컬럼이 없습니다.")
+            df_t[time_col] = pd.to_datetime(df_t[time_col], errors='coerce')
+            df_t = df_t.dropna(subset=[time_col])
+            df_t['Hourly_TS'] = df_t[time_col].dt.floor('h')
+
+            metric = self.learn_loading_metric.get()
+            if metric.startswith('UsedRB'):
+                if 'UsedRB' not in df_t.columns: raise ValueError("Traffic 데이터에 UsedRB 컬럼이 없습니다.")
+                df_t['Loading_val'] = pd.to_numeric(df_t['UsedRB'], errors='coerce').fillna(0)
+                sector_agg = 'mean'
+            else:
+                for c in ['AirMacDLByte', 'AirMacULByte']:
+                    if c not in df_t.columns: df_t[c] = 0.0
+                df_t['Loading_val'] = df_t['AirMacDLByte'].fillna(0) + df_t['AirMacULByte'].fillna(0)
+                sector_agg = 'sum'
+
+            sector_hourly = df_t.groupby(['eNB_ID', 'Sector', 'Hourly_TS'], observed=True)['Loading_val'].agg(sector_agg).reset_index()
+
+            cm_by_sector = cm_map[['eNB_ID', 'Sector'] + avail_keys].drop_duplicates(subset=['eNB_ID', 'Sector'] + avail_keys)
+            sector_ru = pd.merge(sector_hourly, cm_by_sector, on=['eNB_ID', 'Sector'], how='inner')
+            if sector_ru.empty:
+                raise ValueError("Traffic 데이터와 CM(Cell-RU Mapping) 정보의 eNB_ID/Sector가 일치하지 않습니다.")
+
+            ru_loading = sector_ru.groupby(avail_keys + ['Hourly_TS'], observed=True)['Loading_val'].sum().reset_index()
+
+            # --- 4. RU 단위 최종 데이터셋 (Loading + Energy + Cell_State + BoardType) ---
+            ru_dataset = pd.merge(ru_energy_state, ru_loading, on=avail_keys + ['Hourly_TS'], how='inner')
+            ru_dataset = pd.merge(ru_dataset, ru_boardtype, on=avail_keys, how='left')
+            ru_dataset['BoardType'] = ru_dataset['BoardType'].fillna('Unknown')
+            if ru_dataset.empty:
+                raise ValueError("Loading / Energy / Cell 상태 데이터가 모두 일치하는 시간대가 없습니다.")
+
+            min_samples = max(int(self.learn_min_samples.get()), 3)
+            rng = np.random.default_rng(42)
+
+            ru_records, pooled_on_points = [], {}
+
+            # [수정] RU는 ru-board-id/ru-port-id/ru-cascade-id 조합(index)으로 구분하여 개별 회귀 학습을 수행.
+            # 이렇게 RU 단위로 쪼개어 분석하면 동일 Board Type 내에서도 RU 개수만큼 학습 샘플(데이터량)이
+            # 늘어나는 효과가 있고, 이후 같은 Board Type의 RU들끼리 평균을 내어 "해당 HW의 평균 성능"으로 간주한다.
+            for keys, group in ru_dataset.groupby(avail_keys, observed=True):
+                board_type = group['BoardType'].iloc[0]
+                on_rows = group[group['Cell_State'] == 'ON'].sort_values('Hourly_TS')
+                off_rows = group[group['Cell_State'] == 'OFF']
+
+                n_on = len(on_rows)
+                avg_energy_on = on_rows['Energy_Wh'].mean() if n_on > 0 else np.nan
+                avg_energy_off = off_rows['Energy_Wh'].mean() if len(off_rows) > 0 else np.nan
+                est_off_saving = (avg_energy_on - avg_energy_off) if (pd.notna(avg_energy_on) and pd.notna(avg_energy_off)) else np.nan
+
+                slope, intercept, r2_val, r2_test = np.nan, np.nan, np.nan, np.nan
+                n_train = n_val = n_test = 0
+
+                # Train 8 : Validation 1 : Test 1 분할 후 Train으로 1차 회귀(기울기) 학습, Val/Test로 성능 검증
+                if n_on >= min_samples and on_rows['Loading_val'].nunique() >= 2:
+                    idx = rng.permutation(n_on)
+                    n_train = max(int(round(n_on * 0.8)), 1)
+                    remain = n_on - n_train
+                    n_val = remain // 2
+                    train_idx = idx[:n_train]
+                    val_idx = idx[n_train:n_train + n_val]
+                    test_idx = idx[n_train + n_val:]
+                    n_val, n_test = len(val_idx), len(test_idx)
+
+                    x_train = on_rows['Loading_val'].values[train_idx]
+                    y_train = on_rows['Energy_Wh'].values[train_idx]
+
+                    if len(np.unique(x_train)) >= 2:
+                        slope, intercept = np.polyfit(x_train, y_train, 1)
+
+                        def _r2(idxs):
+                            if len(idxs) == 0: return np.nan
+                            xv = on_rows['Loading_val'].values[idxs]
+                            yv = on_rows['Energy_Wh'].values[idxs]
+                            pred = slope * xv + intercept
+                            ss_res = np.sum((yv - pred) ** 2)
+                            ss_tot = np.sum((yv - yv.mean()) ** 2)
+                            return (1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+                        r2_val, r2_test = _r2(val_idx), _r2(test_idx)
+
+                key_tuple = keys if isinstance(keys, tuple) else (keys,)
+                record = dict(zip(avail_keys, key_tuple))
+                record.update({
+                    'Board Type': board_type,
+                    'N_ON': n_on, 'N_OFF': len(off_rows),
+                    'N_Train': n_train, 'N_Val': n_val, 'N_Test': n_test,
+                    'Slope [Wh/unit]': slope, 'Intercept [Wh]': intercept,
+                    'R2_Val': r2_val, 'R2_Test': r2_test,
+                    'Avg Energy ON [Wh]': avg_energy_on, 'Avg Energy OFF [Wh]': avg_energy_off,
+                    'Est. Cell OFF Saving [Wh]': est_off_saving,
+                })
+                ru_records.append(record)
+
+                if n_on > 0:
+                    pooled_on_points.setdefault(board_type, []).append(
+                        (on_rows['Loading_val'].values, on_rows['Energy_Wh'].values)
+                    )
+
+            if not ru_records:
+                raise ValueError("분석 가능한 RU 데이터가 없습니다.")
+
+            ru_df = pd.DataFrame(ru_records)
+
+            hw_df = ru_df.groupby('Board Type', observed=True).agg(
+                RU_Count=('Board Type', 'count'),
+                Avg_Slope=('Slope [Wh/unit]', 'mean'),
+                Avg_Intercept=('Intercept [Wh]', 'mean'),
+                Avg_R2_Val=('R2_Val', 'mean'),
+                Avg_Off_Saving=('Est. Cell OFF Saving [Wh]', 'mean'),
+            ).reset_index()
+            hw_df.rename(columns={
+                'RU_Count': 'RU Count', 'Avg_Slope': 'Avg Slope [Wh/unit]', 'Avg_Intercept': 'Avg Intercept [Wh]',
+                'Avg_R2_Val': 'Avg R2 (Val)', 'Avg_Off_Saving': 'Avg Est. Cell OFF Saving [Wh]'
+            }, inplace=True)
+
+            self.learn_ru_df, self.learn_hw_df = ru_df, hw_df
+
+            self._update_tree_precise(self.tree_learn_ru, ru_df, precise_cols={'Slope [Wh/unit]', 'Intercept [Wh]'})
+            self._update_tree_precise(self.tree_learn_hw, hw_df, precise_cols={'Avg Slope [Wh/unit]', 'Avg Intercept [Wh]'})
+            self._render_learning_plots(hw_df, pooled_on_points)
+
+            self.learn_status_label.config(text=f"학습 완료: RU {len(ru_df)}개 / HW(Board Type) {len(hw_df)}종", fg=self.ACCENT_GREEN)
+
+        except Exception as e:
+            logging.error(f"[DEBUG] Learning Energy Curve Error: {e}", exc_info=True)
+            messagebox.showerror("오류", f"Learning Energy Curve 처리 중 오류가 발생했습니다.\n{e}")
+            self.learn_status_label.config(text="오류 발생", fg="red")
+
+    def _render_learning_plots(self, hw_df, pooled_on_points):
+        for widget in self.learning_plot_frame.winfo_children(): widget.destroy()
+        if hw_df.empty: return
+
+        board_types = list(pooled_on_points.keys())
+        n_types = len(board_types)
+
+        fig, axes = plt.subplots(n_types + 1, 2, figsize=(13, 4.2 * (n_types + 1)))
+        axes = np.atleast_2d(axes)
+        self._apply_plot_style(fig, axes.flatten())
+
+        for i, bt in enumerate(board_types):
+            ax_scatter, ax_bar = axes[i, 0], axes[i, 1]
+            x_all = np.concatenate([p[0] for p in pooled_on_points[bt]])
+            y_all = np.concatenate([p[1] for p in pooled_on_points[bt]])
+            ax_scatter.scatter(x_all, y_all, s=14, alpha=0.4, color=self.ACCENT_BLUE, label='RU-hour 샘플 (ON)')
+
+            row = hw_df[hw_df['Board Type'] == bt].iloc[0]
+            slope, intercept = row['Avg Slope [Wh/unit]'], row['Avg Intercept [Wh]']
+            if pd.notna(slope) and pd.notna(intercept) and x_all.size > 0:
+                x_line = np.linspace(x_all.min(), x_all.max(), 50)
+                y_line = slope * x_line + intercept
+                ax_scatter.plot(x_line, y_line, color='#EF4444', linewidth=2, label=f'평균 HW 곡선 (기울기={slope:.3g})')
+            ax_scatter.set_title(f'[{bt}] Loading vs Energy (RU 평균 성능)', fontweight='bold')
+            ax_scatter.set_xlabel('Loading'); ax_scatter.set_ylabel('Energy [Wh]')
+            ax_scatter.legend(fontsize=9)
+
+            ru_sub = self.learn_ru_df[self.learn_ru_df['Board Type'] == bt]
+            avg_on, avg_off = ru_sub['Avg Energy ON [Wh]'].mean(), ru_sub['Avg Energy OFF [Wh]'].mean()
+            labels = [l for l, v in zip(['Cell ON', 'Cell OFF'], [avg_on, avg_off]) if pd.notna(v)]
+            bars = [v for v in [avg_on, avg_off] if pd.notna(v)]
+            if bars:
+                ax_bar.bar(labels, bars, color=['#3B82F6', '#94A3B8'][:len(bars)], edgecolor='black', alpha=0.85)
+                ax_bar.set_title(f'[{bt}] Cell ON vs OFF 평균 소모 에너지', fontweight='bold')
+                ax_bar.set_ylabel('Energy [Wh]')
+
+        ax_slope, ax_saving = axes[n_types, 0], axes[n_types, 1]
+        ax_slope.bar(hw_df['Board Type'].astype(str), hw_df['Avg Slope [Wh/unit]'], color='#8B5CF6', edgecolor='black', alpha=0.85)
+        ax_slope.set_title('Board Type별 평균 Loading-Energy 기울기', fontweight='bold')
+        ax_slope.set_ylabel('Slope [Wh/unit]')
+        ax_slope.tick_params(axis='x', rotation=30)
+
+        ax_saving.bar(hw_df['Board Type'].astype(str), hw_df['Avg Est. Cell OFF Saving [Wh]'], color=self.ACCENT_GREEN, edgecolor='black', alpha=0.85)
+        ax_saving.set_title('Board Type별 평균 Cell OFF 예상 절감 에너지', fontweight='bold')
+        ax_saving.set_ylabel('Saving [Wh]')
+        ax_saving.tick_params(axis='x', rotation=30)
+
+        plt.tight_layout()
+        canvas = FigureCanvasTkAgg(fig, master=self.learning_plot_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
 if __name__ == "__main__":
     app = ESAnalyzerApp()
