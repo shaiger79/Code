@@ -45,6 +45,13 @@ try:
 except ImportError:
     HAS_CALENDAR = False
 
+try:
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.metrics import mean_squared_error as _sk_mse, mean_absolute_error as _sk_mae
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
 
@@ -2387,18 +2394,54 @@ class ESAnalyzerApp(AppDashboard):
         cm_map['BoardType'] = resolved.apply(lambda r: r[1])
         return cm_map
 
-    def _r2_score(self, y_true, y_pred):
+    def _regression_metrics(self, y_true, y_pred):
+        """[r13] R²/MSE/MAE를 함께 계산한다. sklearn이 설치되어 있으면 MSE/MAE는 sklearn.metrics를
+        사용하고(더 검증된 구현), 그렇지 않으면 직접 계산해 sklearn 없이도 전체 기능이 동작한다.
+        R²는 분산이 0인 예외 케이스에서 sklearn과 관례가 달라 항상 직접 계산(정의 불가 시 NaN)한다."""
         y_true, y_pred = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
-        if y_true.size == 0: return np.nan
+        if y_true.size == 0:
+            return {'r2': np.nan, 'mse': np.nan, 'mae': np.nan}
         ss_res = np.sum((y_true - y_pred) ** 2)
         ss_tot = np.sum((y_true - y_true.mean()) ** 2)
-        return (1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+        r2 = (1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+        if HAS_SKLEARN:
+            mse, mae = float(_sk_mse(y_true, y_pred)), float(_sk_mae(y_true, y_pred))
+        else:
+            mse, mae = float(np.mean((y_true - y_pred) ** 2)), float(np.mean(np.abs(y_true - y_pred)))
+        return {'r2': r2, 'mse': mse, 'mae': mae}
+
+    def _fit_isotonic(self, x_train, y_train):
+        """[r13] Isotonic(단조증가) Regression 적합. sklearn이 있으면 IsotonicRegression을 쓰고
+        (동률 처리·경계값 클리핑 등이 더 안정적), 없으면 자체 구현한 PAVA로 폴백한다.
+        두 경우 모두 predict(x_new) 콜러블을 반환해 호출부는 백엔드를 신경 쓰지 않아도 된다."""
+        if HAS_SKLEARN:
+            model = IsotonicRegression(increasing=True, out_of_bounds='clip')
+            model.fit(x_train, y_train)
+            return model.predict
+        xs_knots, y_knots = self._pava_isotonic_fit(x_train, y_train)
+        return lambda x_eval: self._isotonic_predict(xs_knots, y_knots, x_eval)
+
+    def _recommend_model(self, val_r2_by_model, order=('Linear', 'Log', 'Isotonic'), tolerance=0.02):
+        """[r13] '간단하지만 성능 좋은 모델'을 추천한다. Validation R²를 기준으로, 가장 성능이 좋은
+        모델의 R²에서 tolerance(기본 0.02) 이내인 모델들 중 가장 간단한(복잡도가 낮은 순서상 앞쪽) 모델을
+        채택한다 — Isotonic이 아주 근소하게만 더 좋다면 굳이 복잡한 모델을 쓰지 않겠다는 취지.
+        모든 모델의 R²가 0 이하(적합 실패 수준)면 추천하지 않는다."""
+        valid = {m: val_r2_by_model[m] for m in order if pd.notna(val_r2_by_model.get(m, np.nan))}
+        if not valid:
+            return 'N/A (데이터 부족)'
+        best_r2 = max(valid.values())
+        if best_r2 <= 0:
+            return 'N/A (적합도 낮음)'
+        for m in order:
+            r2 = val_r2_by_model.get(m, np.nan)
+            if pd.notna(r2) and r2 > 0 and r2 >= best_r2 - tolerance:
+                return m
+        return max(valid, key=valid.get)
 
     def _pava_isotonic_fit(self, x, y):
-        """[r13] Pool Adjacent Violators Algorithm으로 단조증가(비감소) Isotonic Regression을 적합한다.
-        (x 정렬 순서, 각 지점에 대응하는 적합값)의 매듭점을 반환하며, 새 x는
-        _isotonic_predict()로 선형보간(구간 밖은 양 끝값 고정)해 예측한다. Loading이 늘어날수록
-        Consumed Power가 절대 줄어들지 않는다는 물리적 제약을 그대로 반영하는 non-parametric 모델."""
+        """[r13] sklearn 미설치 환경을 위한 폴백: Pool Adjacent Violators Algorithm으로 단조증가
+        (비감소) Isotonic Regression을 직접 적합한다. (x 정렬 순서, 각 지점에 대응하는 적합값)의
+        매듭점을 반환하며, 새 x는 _isotonic_predict()로 선형보간(구간 밖은 양 끝값 고정)해 예측한다."""
         order = np.argsort(x)
         xs, ys = np.asarray(x, dtype=float)[order], np.asarray(y, dtype=float)[order]
         vals, weights = [], []
@@ -2549,14 +2592,15 @@ class ESAnalyzerApp(AppDashboard):
 
                 n_active = len(active_rows)
                 lin_slope = lin_intercept = np.nan
-                lin_r2_val = lin_r2_test = np.nan
-                quad_a2 = quad_a1 = quad_a0 = np.nan
-                quad_r2_val = quad_r2_test = np.nan
-                iso_r2_val = iso_r2_test = np.nan
+                log_a = log_b = np.nan
                 n_train = n_val = n_test = 0
+                MODEL_NAMES = ('Linear', 'Log', 'Isotonic')
+                metrics = {m: {'Val': {'r2': np.nan, 'mse': np.nan, 'mae': np.nan},
+                               'Test': {'r2': np.nan, 'mse': np.nan, 'mae': np.nan}} for m in MODEL_NAMES}
 
-                # [r13] Train 8 : Val 1 : Test 1 -> 동일한 분할로 3가지 난이도의 모델을 학습/검증한다.
-                #   1) 간단: 1차 선형회귀   2) 중간: 2차 다항회귀   3) 복잡/정확: Isotonic(단조증가) 회귀
+                # [r13-update] Train 8 : Val 1 : Test 1 -> 동일한 분할로 3가지 난이도의 모델을 학습/검증한다.
+                #   1) 간단: 1차 선형회귀   2) 중간: 로그스케일(P = a + b·ln(Loading+eps))
+                #   3) 복잡/정확: Isotonic(단조증가) 회귀 — 2차 다항회귀는 비단조/과대적합 위험으로 제외.
                 if n_active >= min_samples and active_rows['Loading_traffic'].nunique() >= 2:
                     idx = rng.permutation(n_active)
                     n_train = max(int(round(n_active * 0.8)), 1)
@@ -2576,29 +2620,37 @@ class ESAnalyzerApp(AppDashboard):
 
                     if len(np.unique(x_train)) >= 2:
                         lin_slope, lin_intercept = np.polyfit(x_train, y_train, 1)
-                        if n_val: lin_r2_val = self._r2_score(y_val, lin_slope * x_val + lin_intercept)
-                        if n_test: lin_r2_test = self._r2_score(y_test, lin_slope * x_test + lin_intercept)
+                        if n_val: metrics['Linear']['Val'] = self._regression_metrics(y_val, lin_slope * x_val + lin_intercept)
+                        if n_test: metrics['Linear']['Test'] = self._regression_metrics(y_test, lin_slope * x_test + lin_intercept)
 
-                    if len(np.unique(x_train)) >= 3:
-                        quad_a2, quad_a1, quad_a0 = np.polyfit(x_train, y_train, 2)
-                        if n_val: quad_r2_val = self._r2_score(y_val, quad_a2 * x_val ** 2 + quad_a1 * x_val + quad_a0)
-                        if n_test: quad_r2_test = self._r2_score(y_test, quad_a2 * x_test ** 2 + quad_a1 * x_test + quad_a0)
+                        log_eps = 1e-3
+                        log_b, log_a = np.polyfit(np.log(x_train + log_eps), y_train, 1)
+                        if n_val: metrics['Log']['Val'] = self._regression_metrics(y_val, log_b * np.log(x_val + log_eps) + log_a)
+                        if n_test: metrics['Log']['Test'] = self._regression_metrics(y_test, log_b * np.log(x_test + log_eps) + log_a)
 
-                    if len(np.unique(x_train)) >= 2:
-                        xs_knots, y_knots = self._pava_isotonic_fit(x_train, y_train)
-                        if n_val: iso_r2_val = self._r2_score(y_val, self._isotonic_predict(xs_knots, y_knots, x_val))
-                        if n_test: iso_r2_test = self._r2_score(y_test, self._isotonic_predict(xs_knots, y_knots, x_test))
+                        iso_predict = self._fit_isotonic(x_train, y_train)
+                        if n_val: metrics['Isotonic']['Val'] = self._regression_metrics(y_val, iso_predict(x_val))
+                        if n_test: metrics['Isotonic']['Test'] = self._regression_metrics(y_test, iso_predict(x_test))
+
+                recommended = self._recommend_model({m: metrics[m]['Val']['r2'] for m in MODEL_NAMES})
 
                 record = dict(zip(ru_path_keys, key_tuple))
                 record.update({
                     'Board Type': board_type, 'Cell_Count': cell_count, 'Shared': shared_label,
                     'N_OFF(PAoff)': len(off_rows), 'N_Idle': len(idle_rows), 'N_Active': n_active,
                     'N_Train': n_train, 'N_Val': n_val, 'N_Test': n_test,
+                    'Recommended Model': recommended,
                     'Linear Slope [W/util]': lin_slope, 'Linear Intercept [W]': lin_intercept,
-                    'Linear R2_Val': lin_r2_val, 'Linear R2_Test': lin_r2_test,
-                    'Quad a2 [W/util^2]': quad_a2, 'Quad a1 [W/util]': quad_a1, 'Quad a0 [W]': quad_a0,
-                    'Quad R2_Val': quad_r2_val, 'Quad R2_Test': quad_r2_test,
-                    'Isotonic R2_Val': iso_r2_val, 'Isotonic R2_Test': iso_r2_test,
+                    'Linear R2_Val': metrics['Linear']['Val']['r2'], 'Linear R2_Test': metrics['Linear']['Test']['r2'],
+                    'Linear MSE_Val': metrics['Linear']['Val']['mse'], 'Linear MSE_Test': metrics['Linear']['Test']['mse'],
+                    'Linear MAE_Val': metrics['Linear']['Val']['mae'], 'Linear MAE_Test': metrics['Linear']['Test']['mae'],
+                    'Log a [W]': log_a, 'Log b [W]': log_b,
+                    'Log R2_Val': metrics['Log']['Val']['r2'], 'Log R2_Test': metrics['Log']['Test']['r2'],
+                    'Log MSE_Val': metrics['Log']['Val']['mse'], 'Log MSE_Test': metrics['Log']['Test']['mse'],
+                    'Log MAE_Val': metrics['Log']['Val']['mae'], 'Log MAE_Test': metrics['Log']['Test']['mae'],
+                    'Isotonic R2_Val': metrics['Isotonic']['Val']['r2'], 'Isotonic R2_Test': metrics['Isotonic']['Test']['r2'],
+                    'Isotonic MSE_Val': metrics['Isotonic']['Val']['mse'], 'Isotonic MSE_Test': metrics['Isotonic']['Test']['mse'],
+                    'Isotonic MAE_Val': metrics['Isotonic']['Val']['mae'], 'Isotonic MAE_Test': metrics['Isotonic']['Test']['mae'],
                     'Idle Measured [W]': idle_measured, 'Idle Reference [W]': ref_idle,
                     'Idle Delta [W]': delta_idle, 'Idle Coe(meas/ref)': coe_idle,
                     'PAoff Measured [W]': paoff_measured, 'PAoff Reference [W]': ref_paoff,
@@ -2621,10 +2673,10 @@ class ESAnalyzerApp(AppDashboard):
             hw_df = ru_df.groupby(['Board Type', 'Shared'], observed=True).agg(
                 RU_Count=('Board Type', 'count'),
                 Avg_Linear_Slope=('Linear Slope [W/util]', 'mean'), Avg_Linear_Intercept=('Linear Intercept [W]', 'mean'),
-                Avg_Linear_R2=('Linear R2_Val', 'mean'),
-                Avg_Quad_a2=('Quad a2 [W/util^2]', 'mean'), Avg_Quad_a1=('Quad a1 [W/util]', 'mean'), Avg_Quad_a0=('Quad a0 [W]', 'mean'),
-                Avg_Quad_R2=('Quad R2_Val', 'mean'),
-                Avg_Isotonic_R2=('Isotonic R2_Val', 'mean'),
+                Avg_Linear_R2=('Linear R2_Val', 'mean'), Avg_Linear_MSE=('Linear MSE_Val', 'mean'), Avg_Linear_MAE=('Linear MAE_Val', 'mean'),
+                Avg_Log_a=('Log a [W]', 'mean'), Avg_Log_b=('Log b [W]', 'mean'),
+                Avg_Log_R2=('Log R2_Val', 'mean'), Avg_Log_MSE=('Log MSE_Val', 'mean'), Avg_Log_MAE=('Log MAE_Val', 'mean'),
+                Avg_Isotonic_R2=('Isotonic R2_Val', 'mean'), Avg_Isotonic_MSE=('Isotonic MSE_Val', 'mean'), Avg_Isotonic_MAE=('Isotonic MAE_Val', 'mean'),
                 Avg_Idle_Measured=('Idle Measured [W]', 'mean'), Idle_Reference=('Idle Reference [W]', 'first'),
                 Avg_Idle_Delta=('Idle Delta [W]', 'mean'), Avg_Idle_Coe=('Idle Coe(meas/ref)', 'mean'),
                 Avg_PAoff_Measured=('PAoff Measured [W]', 'mean'), PAoff_Reference=('PAoff Reference [W]', 'first'),
@@ -2632,20 +2684,27 @@ class ESAnalyzerApp(AppDashboard):
             ).reset_index()
             hw_df.rename(columns={
                 'RU_Count': 'RU Count',
-                'Avg_Linear_Slope': 'Avg Linear Slope [W/util]', 'Avg_Linear_Intercept': 'Avg Linear Intercept [W]', 'Avg_Linear_R2': 'Avg Linear R2 (Val)',
-                'Avg_Quad_a2': 'Avg Quad a2', 'Avg_Quad_a1': 'Avg Quad a1', 'Avg_Quad_a0': 'Avg Quad a0', 'Avg_Quad_R2': 'Avg Quad R2 (Val)',
-                'Avg_Isotonic_R2': 'Avg Isotonic R2 (Val)',
+                'Avg_Linear_Slope': 'Avg Linear Slope [W/util]', 'Avg_Linear_Intercept': 'Avg Linear Intercept [W]',
+                'Avg_Linear_R2': 'Avg Linear R2 (Val)', 'Avg_Linear_MSE': 'Avg Linear MSE (Val)', 'Avg_Linear_MAE': 'Avg Linear MAE (Val)',
+                'Avg_Log_a': 'Avg Log a [W]', 'Avg_Log_b': 'Avg Log b [W]',
+                'Avg_Log_R2': 'Avg Log R2 (Val)', 'Avg_Log_MSE': 'Avg Log MSE (Val)', 'Avg_Log_MAE': 'Avg Log MAE (Val)',
+                'Avg_Isotonic_R2': 'Avg Isotonic R2 (Val)', 'Avg_Isotonic_MSE': 'Avg Isotonic MSE (Val)', 'Avg_Isotonic_MAE': 'Avg Isotonic MAE (Val)',
                 'Avg_Idle_Measured': 'Avg Idle Measured [W]', 'Idle_Reference': 'Idle Reference [W]',
                 'Avg_Idle_Delta': 'Avg Idle Delta [W]', 'Avg_Idle_Coe': 'Avg Idle Coe(meas/ref)',
                 'Avg_PAoff_Measured': 'Avg PAoff Measured [W]', 'PAoff_Reference': 'PAoff Reference [W]',
                 'Avg_PAoff_Delta': 'Avg PAoff Delta [W]', 'Avg_PAoff_Coe': 'Avg PAoff Coe(meas/ref)',
             }, inplace=True)
 
+            # [r13] 그룹(HW×공유여부) 단위 대표 추천 모델 — 그룹 평균 Val R²를 기준으로 동일한 규칙 적용
+            hw_df['Recommended Model'] = hw_df.apply(lambda r: self._recommend_model({
+                'Linear': r['Avg Linear R2 (Val)'], 'Log': r['Avg Log R2 (Val)'], 'Isotonic': r['Avg Isotonic R2 (Val)'],
+            }), axis=1)
+
             self.learn_ru_df, self.learn_hw_df = ru_df, hw_df
 
-            precise_cols_ru = {'Linear Slope [W/util]', 'Linear Intercept [W]', 'Quad a2 [W/util^2]', 'Quad a1 [W/util]',
+            precise_cols_ru = {'Linear Slope [W/util]', 'Linear Intercept [W]', 'Log a [W]', 'Log b [W]',
                                 'Idle Coe(meas/ref)', 'PAoff Coe(meas/ref)'}
-            precise_cols_hw = {'Avg Linear Slope [W/util]', 'Avg Linear Intercept [W]', 'Avg Quad a2', 'Avg Quad a1',
+            precise_cols_hw = {'Avg Linear Slope [W/util]', 'Avg Linear Intercept [W]', 'Avg Log a [W]', 'Avg Log b [W]',
                                 'Avg Idle Coe(meas/ref)', 'Avg PAoff Coe(meas/ref)'}
             self._update_tree_precise(self.tree_learn_ru, ru_df, precise_cols=precise_cols_ru)
             self._update_tree_precise(self.tree_learn_hw, hw_df, precise_cols=precise_cols_hw)
@@ -2681,6 +2740,7 @@ class ESAnalyzerApp(AppDashboard):
         for i, (bt, shared_label) in enumerate(groups):
             ax_scatter, ax_bar = axes[i, 0], axes[i, 1]
             row = hw_df[(hw_df['Board Type'].astype(str) == bt) & (hw_df['Shared'].astype(str) == shared_label)].iloc[0]
+            recommended = row.get('Recommended Model', '')
 
             pts = pooled_active_points.get((bt, shared_label), [])
             x_all = np.concatenate([p[0] for p in pts]) if pts else np.array([])
@@ -2689,29 +2749,35 @@ class ESAnalyzerApp(AppDashboard):
                 ax_scatter.scatter(x_all, y_all, s=14, alpha=0.35, color=self.ACCENT_BLUE, label='RU-hour 샘플 (Active)', zorder=1)
                 x_line = np.linspace(0, x_all.max(), 80)
 
-                # [r13] 3종 모델 비교: 1) 간단(선형) 2) 중간(2차) 3) 복잡/정확(Isotonic, 그룹 전체 데이터로 직접 적합)
+                # [r13-update] 3종 모델 비교: ① 간단(선형) ② 중간(로그스케일) ③ 복잡/정확(Isotonic, 그룹 전체
+                # 데이터로 직접 적합). 추천 모델(Val R²/MSE 기준, 간단한 쪽을 우선)은 굵은 선으로 강조한다.
+                def _lw(name): return 3.2 if name == recommended else 2.0
+                def _star(name): return '★ ' if name == recommended else ''
+
                 if pd.notna(row['Avg Linear Slope [W/util]']) and pd.notna(row['Avg Linear Intercept [W]']):
                     slope, intercept = row['Avg Linear Slope [W/util]'], row['Avg Linear Intercept [W]']
-                    r2 = row['Avg Linear R2 (Val)']
-                    ax_scatter.plot(x_line, slope * x_line + intercept, color='#F59E0B', linewidth=2, linestyle='--',
-                                    label=f"① 간단(선형) R²(Val)={r2:.3f}" if pd.notna(r2) else "① 간단(선형)", zorder=3)
+                    r2, mse = row['Avg Linear R2 (Val)'], row['Avg Linear MSE (Val)']
+                    lbl = f"{_star('Linear')}① 간단(선형) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "① 간단(선형)"
+                    ax_scatter.plot(x_line, slope * x_line + intercept, color='#F59E0B', linewidth=_lw('Linear'), linestyle='--', label=lbl, zorder=3)
 
-                if pd.notna(row['Avg Quad a2']) and pd.notna(row['Avg Quad a1']) and pd.notna(row['Avg Quad a0']):
-                    a2, a1, a0 = row['Avg Quad a2'], row['Avg Quad a1'], row['Avg Quad a0']
-                    r2 = row['Avg Quad R2 (Val)']
-                    ax_scatter.plot(x_line, a2 * x_line ** 2 + a1 * x_line + a0, color='#8B5CF6', linewidth=2, linestyle='-.',
-                                    label=f"② 중간(2차) R²(Val)={r2:.3f}" if pd.notna(r2) else "② 중간(2차)", zorder=3)
+                if pd.notna(row['Avg Log a [W]']) and pd.notna(row['Avg Log b [W]']):
+                    log_a, log_b = row['Avg Log a [W]'], row['Avg Log b [W]']
+                    r2, mse = row['Avg Log R2 (Val)'], row['Avg Log MSE (Val)']
+                    y_log = log_b * np.log(x_line + 1e-3) + log_a
+                    lbl = f"{_star('Log')}② 중간(로그스케일) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "② 중간(로그스케일)"
+                    ax_scatter.plot(x_line, y_log, color='#8B5CF6', linewidth=_lw('Log'), linestyle='-.', label=lbl, zorder=3)
 
                 if x_all.size >= 2:
                     xs_knots, y_knots = self._pava_isotonic_fit(x_all, y_all)
-                    r2 = row['Avg Isotonic R2 (Val)']
-                    ax_scatter.plot(xs_knots, y_knots, color='#EF4444', linewidth=2.2,
-                                    label=f"③ 복잡/정확(Isotonic) R²(Val)={r2:.3f}" if pd.notna(r2) else "③ 복잡/정확(Isotonic)", zorder=4)
+                    r2, mse = row['Avg Isotonic R2 (Val)'], row['Avg Isotonic MSE (Val)']
+                    lbl = f"{_star('Isotonic')}③ 복잡/정확(Isotonic) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "③ 복잡/정확(Isotonic)"
+                    ax_scatter.plot(xs_knots, y_knots, color='#EF4444', linewidth=_lw('Isotonic'), label=lbl, zorder=4)
 
             if pd.notna(row['Avg Idle Measured [W]']):
                 ax_scatter.axhline(row['Avg Idle Measured [W]'], color=self.ACCENT_GREEN, linestyle=':', linewidth=1.5,
                                     label=f"실측 Idle 평균={row['Avg Idle Measured [W]']:.2f}W", zorder=2)
-            ax_scatter.set_title(f'[{bt} · {shared_label}] Loading_traffic vs Consumed Power — 3종 모델 비교', fontweight='bold')
+            rec_txt = f" — 추천: {recommended}" if recommended and 'N/A' not in str(recommended) else ""
+            ax_scatter.set_title(f'[{bt} · {shared_label}] Loading_traffic vs Consumed Power{rec_txt}', fontweight='bold')
             ax_scatter.set_xlabel('Loading_traffic (=ΣUsedRB_t/ΣnRB)'); ax_scatter.set_ylabel('Consumed Power [W]')
             ax_scatter.legend(fontsize=7.5, loc='lower right')
 
@@ -2731,11 +2797,16 @@ class ESAnalyzerApp(AppDashboard):
         x_pos = np.arange(len(hw_df))
         width = 0.25
         bars_lin = ax_r2.bar(x_pos - width, hw_df['Avg Linear R2 (Val)'], width, label='① 간단(선형)', color='#F59E0B', edgecolor='black', alpha=0.85)
-        bars_quad = ax_r2.bar(x_pos, hw_df['Avg Quad R2 (Val)'], width, label='② 중간(2차)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        bars_log = ax_r2.bar(x_pos, hw_df['Avg Log R2 (Val)'], width, label='② 중간(로그스케일)', color='#8B5CF6', edgecolor='black', alpha=0.85)
         bars_iso = ax_r2.bar(x_pos + width, hw_df['Avg Isotonic R2 (Val)'], width, label='③ 복잡/정확(Isotonic)', color='#EF4444', edgecolor='black', alpha=0.85)
-        _bar_labels(ax_r2, bars_lin, fmt="{:.2f}"); _bar_labels(ax_r2, bars_quad, fmt="{:.2f}"); _bar_labels(ax_r2, bars_iso, fmt="{:.2f}")
+        _bar_labels(ax_r2, bars_lin, fmt="{:.2f}"); _bar_labels(ax_r2, bars_log, fmt="{:.2f}"); _bar_labels(ax_r2, bars_iso, fmt="{:.2f}")
+        model_offset = {'Linear': -width, 'Log': 0.0, 'Isotonic': width}
+        for j, rec in enumerate(hw_df['Recommended Model']):
+            if rec in model_offset:
+                ax_r2.annotate('★', xy=(x_pos[j] + model_offset[rec], 1.02), ha='center', va='bottom', fontsize=11,
+                               color=self.ACCENT_GREEN, xycoords=('data', 'axes fraction'))
         ax_r2.set_xticks(x_pos); ax_r2.set_xticklabels(group_labels, rotation=0, fontsize=8)
-        ax_r2.set_title('그룹별 3종 모델 정확도 비교 (R², Validation)', fontweight='bold')
+        ax_r2.set_title('그룹별 3종 모델 정확도 비교 (R², Validation) — ★는 추천 모델 위치', fontweight='bold')
         ax_r2.set_ylabel('R² (Val)')
         ax_r2.legend(fontsize=8)
 

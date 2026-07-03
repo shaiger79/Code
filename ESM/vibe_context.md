@@ -2,7 +2,7 @@
 
 ## 1. 프로젝트 개요 (Project Overview)
 * **목적**: 이동통신(4G/5G) 네트워크의 Traffic Data(PM)와 Energy Stat Data를 분석하여, Energy Saving(ES) 적용 임계조건을 도출하고 예상 절감 에너지를 예측하는 GUI 기반 최적화 도구 개발.
-* **주요 스택**: Python, Tkinter (UI), Pandas (데이터 처리), Matplotlib (시각화)
+* **주요 스택**: Python, Tkinter (UI), Pandas (데이터 처리), Matplotlib (시각화), scikit-learn(선택적 — Learning Energy Curve의 Isotonic Regression/MSE/MAE 계산에 사용, 미설치 시 numpy로 직접 구현한 폴백으로 자동 대체)
 * **핵심 지표**:
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
@@ -127,13 +127,22 @@
   * **시각화**: Board Type × 공유여부 조합마다 한 행씩, 왼쪽엔 산점도 위에 3종 모델 곡선을 함께 그려 R²(Val)와 함께 표시(①점선/②일점쇄선/③실선으로 구분), 오른쪽엔 기존 Idle/PA off 예측값 막대. 하단 요약에 (a) 그룹별 3종 모델 R²(Val) 비교 막대(어떤 모델이 어떤 그룹에서 더 잘 맞는지 한눈에 비교), (b) 그룹별 Idle/PA off 보정폭 막대.
   * **검증**: 임시 가상환경에서, (a) 실제로 곡선형(포화 곡선, Idle+Amp*(1-exp(-k·Loading))) 관계를 갖는 합성 데이터에서 선형 R²=0.83인 반면 2차=0.98, Isotonic=0.99로 유의미하게 개선됨을 확인(모델 복잡도가 실제로 정확도를 높여준다는 것을 검증), (b) 실제로 선형인 데이터에서는 3종 모두 비슷하게(~0.96~0.97) 잘 맞아 복잡한 모델이 불이익을 주지 않음을 확인, (c) 공유여부만으로 그룹핑되고 nRB 관련 컬럼이 전혀 남아있지 않음을 확인.
 
+* **[v2.5 / esm_r13.py] (2026-07-03) 2차 다항식 → 로그스케일 모델 교체, MSE/MAE 지표 추가, sklearn 기반 "간단하지만 성능 좋은 모델" 추천 기능**
+  * **배경**: 사용자 피드백 — 2차 다항식은(비단조/과도한 곡률 위험 등으로) 실사용이 어려워 보임, Isotonic은 특정 예외 케이스를 빼면 대체로 좋아 보임 → 2차 대신 로그스케일 모델을 요청. 또한 R² 외에 MSE/MAE도 함께 고려해서 모델을 추천해달라는 요청, 그리고 이제 sklearn을 사용해도 되니 간단하면서도 성능 좋은 모델을 찾아달라는 요청.
+  * **② 중간 모델을 2차 다항식 → 로그스케일로 교체**: `Consumed Power = a + b·ln(Loading_traffic + ε)` (ε=1e-3, `np.polyfit`으로 로그변환된 x에 대해 1차 회귀). 부하가 커질수록 증가폭이 점점 완만해지는(체감) 물리적으로 흔한 패턴을 2개 파라미터로 안정적으로 표현하며, 2차 다항식과 달리 비단조(위로 볼록 후 감소)로 튈 위험이 없음. 컬럼: `Log a [W]`/`Log b [W]`/`Log R2_Val`/`Log R2_Test`/`Log MSE_Val`/`Log MSE_Test`/`Log MAE_Val`/`Log MAE_Test`.
+  * **MSE/MAE 지표 추가**: 3종 모델(Linear/Log/Isotonic) 모두 R² 외에 MSE(평균제곱오차)·MAE(평균절대오차)를 Val/Test 양쪽에 대해 계산해 RU 단위 상세 결과·HW 요약 표에 모두 반영. sklearn이 설치되어 있으면 `sklearn.metrics.mean_squared_error`/`mean_absolute_error`를 쓰고(신규 `_regression_metrics()`), 없으면 numpy로 직접 계산하는 폴백으로 자동 전환.
+  * **sklearn 채택**: 이제 sklearn 사용이 허용되어, Isotonic Regression은 자체 구현한 PAVA 대신 `sklearn.isotonic.IsotonicRegression(increasing=True, out_of_bounds='clip')`을 우선 사용(동률 처리·경계값 클리핑이 더 안정적)하도록 `_fit_isotonic()`을 추가. tkinterdnd2/tkcalendar와 동일한 패턴으로 `HAS_SKLEARN` 플래그를 두어, sklearn이 없는 환경에서는 기존 자체 구현(PAVA)·수동 MSE/MAE 계산으로 자동 폴백해 기능이 그대로 동작한다(현장 PC에 sklearn이 없어도 앱이 깨지지 않음).
+  * **"간단하지만 성능 좋은 모델" 추천 기능 (신규 `_recommend_model()`)**: RU 단위·HW(Board Type×공유여부) 그룹 단위 모두에 `Recommended Model` 컬럼을 추가. 로직: Validation R²가 가장 높은 모델을 기준으로, 복잡도가 낮은 순서(Linear → Log → Isotonic)로 훑어서 최고 R²와 0.02 이내 차이가 나는 가장 간단한 모델을 채택(오컴의 면도날 — Isotonic이 아주 근소하게만 더 좋다면 굳이 안 씀). 모든 모델의 R²가 0 이하면 "N/A(적합도 낮음)"으로 표시.
+  * **시각화**: 그래프 범례에 각 모델의 R²와 MSE를 함께 표시하고, 추천된 모델은 굵은 선(★ 표시)으로 강조. 그래프 제목에도 "— 추천: {모델명}"을 표시. 하단 요약 R² 비교 막대그래프에는 그룹별로 추천된 모델 위치에 ★ 표시를 얹어 한눈에 확인 가능.
+  * **검증**: sklearn을 설치한 임시 가상환경에서 3가지 서로 다른 참값 형태(① 로그형 체감곡선 → Log 추천, ② 순수 선형 → Linear 추천(단순함 우선 규칙 확인), ③ 계단형(선형·로그 어느 쪽도 잘 안 맞는 형태) → Isotonic 추천)로 각각 합성 데이터를 만들어 추천 로직이 실제 곡선 형태에 맞게 정확히 동작함을 확인함.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.4(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 공유여부(Shared) 기준 전면 재구성 + 3종 Energy Curve 모델링(선형/2차/Isotonic)까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.5(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 공유여부(Shared) 기준 전면 재구성 + 3종 Energy Curve 모델링(선형/로그스케일/Isotonic, sklearn 기반) + MSE/MAE 지표 + 모델 추천 기능까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
-  4. **다음 결정 대기**: 실데이터 시각화에서 3종 모델(선형/2차/Isotonic) 중 어느 것이 그래프 모양상 가장 적합한지 사용자가 판단 예정 — 결과에 따라 최종 채택 모델을 하나로 정하거나, Board Type×공유여부 그룹마다 다른 모델을 쓰도록 할 수 있음.
+  4. **다음 결정 대기**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
   5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
