@@ -2,7 +2,7 @@
 
 ## 1. 프로젝트 개요 (Project Overview)
 * **목적**: 이동통신(4G/5G) 네트워크의 Traffic Data(PM)와 Energy Stat Data를 분석하여, Energy Saving(ES) 적용 임계조건을 도출하고 예상 절감 에너지를 예측하는 GUI 기반 최적화 도구 개발.
-* **주요 스택**: Python, Tkinter (UI), Pandas (데이터 처리), Matplotlib (시각화), scikit-learn(선택적 — Learning Energy Curve의 Isotonic Regression/MSE/MAE 계산에 사용, 미설치 시 numpy로 직접 구현한 폴백으로 자동 대체)
+* **주요 스택**: Python, Tkinter (UI), Pandas (데이터 처리), Matplotlib (시각화), scikit-learn(선택적 — Learning Energy Curve의 Isotonic Regression/MSE/MAE 계산에 사용, 미설치 시 numpy로 직접 구현한 폴백으로 자동 대체), scipy(선택적 — Learning Energy Curve의 지수포화 ExpSat 모델 `curve_fit`에 사용, 미설치 시 해당 모델만 비활성화)
 * **핵심 지표**:
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
@@ -136,13 +136,24 @@
   * **시각화**: 그래프 범례에 각 모델의 R²와 MSE를 함께 표시하고, 추천된 모델은 굵은 선(★ 표시)으로 강조. 그래프 제목에도 "— 추천: {모델명}"을 표시. 하단 요약 R² 비교 막대그래프에는 그룹별로 추천된 모델 위치에 ★ 표시를 얹어 한눈에 확인 가능.
   * **검증**: sklearn을 설치한 임시 가상환경에서 3가지 서로 다른 참값 형태(① 로그형 체감곡선 → Log 추천, ② 순수 선형 → Linear 추천(단순함 우선 규칙 확인), ③ 계단형(선형·로그 어느 쪽도 잘 안 맞는 형태) → Isotonic 추천)로 각각 합성 데이터를 만들어 추천 로직이 실제 곡선 형태에 맞게 정확히 동작함을 확인함.
 
+* **[v2.6 / esm_r13.py] (2026-07-03) 시각화 UI 개선 + 로그모델 → 지수포화(ExpSat) 모델 교체 + Sector 내 Cell수 그룹핑 추가 + 한글 폰트 커밋 검토**
+  * **배경**: 사용자가 한 턴에 4가지를 동시에 요청 — ① 시각화 탭 마우스 스크롤 미작동/그래프 크기 고정/간격 협소/라벨 겹침 UI 문제, ② 로그스케일 모델 제외하고 더 나은(복잡해도 무방한) 모델 추가, ③ Sector(=Cnum%10) 내 Cell수를 기준으로 한 세 번째 학습 그룹핑 축 추가(예: 3-Cell Sector끼리만 모아 학습 vs 1-Cell Sector끼리만 모아 학습), ④ 사용자가 직접 커밋한 한글 폰트 설정 코드 리뷰 및 보완.
+  * **① 시각화 UI 개선**:
+    - **마우스 스크롤 미작동 수정**: 임베드된 matplotlib 캔버스 위에서는 `canvas.bind()`만으로 휠 이벤트가 잡히지 않는 문제 — 스크롤 컨테이너(`plot_outer`)의 `<Enter>`/`<Leave>` 이벤트에서 `bind_all`/`unbind_all`로 마우스 휠 핸들러를 그때그때 등록/해제하는 방식으로 교체(Linux `Button-4`/`Button-5`, Windows/Mac `<MouseWheel>`의 `event.delta` 모두 처리).
+    - **창 크기에 따른 그래프 크기 자동 조정**: `self.learning_plot_canvas`의 실제 픽셀 폭을 읽어 그림 폭(inch)을 동적으로 계산하는 `_get_plot_fig_width_inches()`를 추가하고, `<Configure>` 리사이즈 이벤트를 300ms 디바운스(`self.after`)해 학습을 다시 돌리지 않고 마지막 결과(`self.learn_hw_df`/`self.learn_pooled_active_points`)로 그래프만 다시 그리는 `_redraw_learning_plots_if_ready()`를 추가.
+    - **그래프 간격/겹침 개선**: `plt.tight_layout()` → `constrained_layout=True` + `fig.set_constrained_layout_pads(w_pad=0.35, h_pad=0.55, hspace=0.18, wspace=0.14)`로 교체, 행당 높이를 4.6→5.8인치로 확대, 그래프 제목을 2줄로 나누고 폰트 크기를 10으로 낮춰 라벨 겹침을 줄임.
+  * **② 로그모델 → 지수포화(Exponential Saturation) 모델 교체**: `Consumed Power = a − b·exp(−k·Loading_traffic)` (scipy `curve_fit`으로 비선형 최소자승 적합, 초기값은 데이터 범위 기반으로 자동 추정, 파라미터에 물리적으로 타당한 bounds 설정). RU 전력증폭기가 부하 증가에 따라 증가폭이 점점 줄고 특정 최대치(포화 전력)로 수렴하는 특성을 로그모델보다 물리적으로 더 정확히 표현. `HAS_SCIPY` 플래그(tkinterdnd2/tkcalendar/sklearn과 동일한 패턴)를 신규 추가해 scipy 미설치 환경에서도 앱이 깨지지 않고 해당 모델만 비활성화되도록 구성(`_fit_exp_saturation()`이 `None`을 반환하면 그 RU/그룹은 ExpSat 결과 없이 나머지 2종 모델로만 비교). 컬럼명 전체를 `Log *` → `ExpSat *`(a/b/k, R2/MSE/MAE Val/Test)로 교체하고 `_recommend_model` 기본 순서도 `('Linear', 'ExpSat', 'Isotonic')`로 변경.
+  * **③ Sector 내 Cell수 그룹핑 추가**: CM의 `cell-num`(Cnum)을 10으로 나눈 나머지를 Sector로 정의(`Sector = Cnum % 10`)하고, 같은 `eNB_ID`+`Sector` 내 서로 다른 Cell 개수를 `Sector_Cell_Count`로 계산. RU path에 연결된 Cell(들)이 속한 Sector의 Cell수를 대표값(최빈값)으로 삼아 `Sector Group`(예: `3Cell/Sector`, `1Cell/Sector`) 레이블을 부여하고, 기존 `Board Type × Shared/Exclusive` 2축 그룹핑에 `Sector Group`을 세 번째 축으로 추가(`hw_df = ru_df.groupby(['Board Type', 'Shared', 'Sector Group'])`). 예: 같은 RU HW의 Shared RU라도 Sector 내 Cell이 3개인 대상만 모아 학습한 결과와 1개인 대상만 모아 학습한 결과를 분리해서 비교 가능. 시각화(`_render_learning_plots`)도 3-tuple 그룹 순회로 갱신, 그래프 제목/하단 요약 라벨에 Sector Group 포함.
+  * **④ 한글 폰트 커밋 검토/보완**: 사용자가 직접 커밋한 `plt.rcParams['font.family'] = 'Malgun Gothic'`은 Windows 전용 폰트만 지정하고 `axes.unicode_minus` 설정이 빠져 있어, macOS/Linux 환경에서는 한글이 깨지고 음수 부호(-)도 깨질 위험이 있었음 → `_KOREAN_FONT_CANDIDATES`(Malgun Gothic/AppleGothic/NanumGothic/Noto Sans CJK KR/Noto Sans KR) 리스트로 교체해 `matplotlib.font_manager`에서 실제 설치된 폰트를 확인 후 우선순위대로 선택하고, 하나도 없으면 경고 로그만 남기고 넘어가도록(크래시 방지) 수정. `axes.unicode_minus = False`도 함께 추가.
+  * **검증**: 임시 가상환경(scipy/sklearn/numpy/pandas 설치)에서 4가지 모두 로직 단위 검증 — (a) 참값이 지수포화 곡선인 합성 데이터에서 `curve_fit`이 실제 a/b/k 값을 15% 오차 이내로 정확히 복원하고 R²(Val)가 Linear(0.76)보다 크게 높음(0.996)을 확인, (b) 참값이 순수 선형인 데이터에서는 여전히 Linear가 추천됨(오컴의 면도날 규칙 유지 확인), (c) 데이터가 3개 미만이거나 상수인 퇴화 케이스에서 `_fit_exp_saturation`이 예외 없이 `None`을 반환함을 확인, (d) `Cnum % 10` 기준 Sector 그룹핑이 3-Cell/1-Cell Sector를 정확히 구분하고 `Board Type × Shared × Sector Group` 3축 groupby가 그룹을 올바르게 분리 유지함을 확인. matplotlib UI 변경(스크롤/리사이즈/간격)은 앞선 라운드에서 이미 matplotlib 3.11 환경으로 렌더링 검증 완료된 패턴을 그대로 재사용.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.5(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 공유여부(Shared) 기준 전면 재구성 + 3종 Energy Curve 모델링(선형/로그스케일/Isotonic, sklearn 기반) + MSE/MAE 지표 + 모델 추천 기능까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.6(`esm_r13.py`) - Learning Energy Curve 시각화 UI(스크롤/반응형 크기/간격) 개선 + 로그모델을 지수포화(ExpSat, scipy curve_fit) 모델로 교체 + Sector(Cnum%10) 내 Cell수를 세 번째 그룹핑 축으로 추가 + 한글 폰트 크로스플랫폼 보완까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
-  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
-  4. **다음 결정 대기**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
+  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 이번 라운드의 스크롤/리사이즈 UI와 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
+  4. **다음 결정 대기**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정. Sector Group 세분화로 그룹 수가 늘어나 일부 그룹은 표본 수(`min_samples`) 미달로 모델 적합이 안 될 수 있으므로 실데이터 확인 필요.
   5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 

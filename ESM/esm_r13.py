@@ -27,6 +27,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import matplotlib.font_manager as fm
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import logging
 import os
@@ -52,7 +53,25 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
-plt.rcParams['font.family'] = 'Malgun Gothic'
+try:
+    from scipy.optimize import curve_fit
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
+
+# [r13-update] 그래프에 한글(제목/범례/축 라벨)이 많아 한글 지원 폰트가 필요하다. 'Malgun Gothic'(맑은 고딕)은
+# Windows에 기본 내장되어 있어 실제 실행 환경(로컬 Windows PC)에서 바로 동작한다. 다른 OS(Mac/Linux)에서
+# 실행할 경우를 대비해, 지정한 폰트가 실제로 설치되어 있는지 확인 후 없으면 OS별 대체 한글 폰트를 차례로
+# 시도하고, 그마저 없으면 기본 폰트로 조용히 폴백한다(글자가 네모(□)로 깨지는 대신 최소한 실행은 되도록).
+_KOREAN_FONT_CANDIDATES = ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 'Noto Sans CJK KR', 'Noto Sans KR']
+_available_fonts = {f.name for f in fm.fontManager.ttflist}
+for _font_name in _KOREAN_FONT_CANDIDATES:
+    if _font_name in _available_fonts:
+        plt.rcParams['font.family'] = _font_name
+        break
+else:
+    logging.warning(f"한글 지원 폰트를 찾지 못했습니다({_KOREAN_FONT_CANDIDATES}). 그래프의 한글이 깨질 수 있습니다.")
+plt.rcParams['axes.unicode_minus'] = False  # 한글 폰트 상당수가 유니코드 마이너스(−) 글리프가 없어 음수 축 라벨이 깨지는 것을 방지
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
@@ -112,6 +131,7 @@ class AppBase(BaseTk):
         self.learn_min_samples = tk.IntVar(value=10)
         self.learn_ru_df = pd.DataFrame()
         self.learn_hw_df = pd.DataFrame()  # [r13] Board Type x 공유여부(Shared/Exclusive) 기준으로 집계
+        self.learn_pooled_active_points = {}  # [r13-update] 창 크기 변경 시 재사용할 마지막 학습 결과(산점도 원본 포인트)
 
         self._load_auto_jsons()
         self.create_widgets()
@@ -2217,14 +2237,67 @@ class ESAnalyzerApp(AppDashboard):
 
         plot_outer = ttk.Frame(frame_plot)
         plot_outer.pack(fill=tk.BOTH, expand=True)
-        plot_canvas = tk.Canvas(plot_outer, bg=self.FRAME_BG, highlightthickness=0)
-        plot_scroll = ttk.Scrollbar(plot_outer, orient="vertical", command=plot_canvas.yview)
-        self.learning_plot_frame = ttk.Frame(plot_canvas)
-        self.learning_plot_frame.bind("<Configure>", lambda e: plot_canvas.configure(scrollregion=plot_canvas.bbox("all")))
-        plot_canvas.create_window((0, 0), window=self.learning_plot_frame, anchor="nw")
-        plot_canvas.configure(yscrollcommand=plot_scroll.set)
-        plot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.learning_plot_canvas = tk.Canvas(plot_outer, bg=self.FRAME_BG, highlightthickness=0)
+        plot_scroll = ttk.Scrollbar(plot_outer, orient="vertical", command=self.learning_plot_canvas.yview)
+        self.learning_plot_frame = ttk.Frame(self.learning_plot_canvas)
+        self.learning_plot_frame.bind("<Configure>", lambda e: self.learning_plot_canvas.configure(scrollregion=self.learning_plot_canvas.bbox("all")))
+        self.learning_plot_canvas.create_window((0, 0), window=self.learning_plot_frame, anchor="nw")
+        self.learning_plot_canvas.configure(yscrollcommand=plot_scroll.set)
+        self.learning_plot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         plot_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # [r13-update] 마우스 휠 스크롤 지원: 캔버스 위젯에만 bind하면 그 위에 그려진 matplotlib
+        # 차트(자식 위젯)에 마우스가 있을 때는 휠 이벤트가 전달되지 않으므로, 시각화 탭 영역에
+        # 마우스가 들어와 있는 동안만 bind_all로 전역 휠 이벤트를 캔버스 스크롤에 연결한다(탭을
+        # 벗어나면 즉시 해제해 다른 스크롤 가능 위젯에 영향을 주지 않는다).
+        def _on_mousewheel(event):
+            if getattr(event, 'num', None) == 4: self.learning_plot_canvas.yview_scroll(-1, "units")
+            elif getattr(event, 'num', None) == 5: self.learning_plot_canvas.yview_scroll(1, "units")
+            elif getattr(event, 'delta', 0): self.learning_plot_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        def _bind_wheel(_event):
+            plot_outer.bind_all("<MouseWheel>", _on_mousewheel)
+            plot_outer.bind_all("<Button-4>", _on_mousewheel)
+            plot_outer.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(_event):
+            plot_outer.unbind_all("<MouseWheel>")
+            plot_outer.unbind_all("<Button-4>")
+            plot_outer.unbind_all("<Button-5>")
+
+        plot_outer.bind("<Enter>", _bind_wheel)
+        plot_outer.bind("<Leave>", _unbind_wheel)
+
+        # [r13-update] 창 크기에 따라 그래프 폭도 함께 변하도록, 탭 영역 크기가 바뀔 때마다
+        # (드래그 중 매 픽셀이 아니라 크기 변경이 멈춘 뒤) 마지막 학습 결과로 그래프를 다시 그린다.
+        self._plot_resize_after_id = None
+
+        def _on_plot_area_resize(event):
+            if event.widget is not plot_outer: return
+            if self._plot_resize_after_id is not None:
+                self.after_cancel(self._plot_resize_after_id)
+            self._plot_resize_after_id = self.after(300, self._redraw_learning_plots_if_ready)
+
+        plot_outer.bind("<Configure>", _on_plot_area_resize)
+
+    def _redraw_learning_plots_if_ready(self):
+        """[r13-update] 시각화 탭 크기 변경(디바운스 후)이나 최초 렌더링 시 호출. 마지막 학습 결과가
+        있으면 현재 창 폭에 맞춰 다시 그린다(학습을 재실행하지 않고 캐시된 결과만 재사용)."""
+        self._plot_resize_after_id = None
+        if self.learn_hw_df is not None and not self.learn_hw_df.empty:
+            self._render_learning_plots(self.learn_hw_df, self.learn_pooled_active_points)
+
+    def _get_plot_fig_width_inches(self, dpi=100, min_inches=11.0):
+        """[r13-update] 시각화 탭의 현재 표시 폭(px)을 그래프 Figure의 인치 폭으로 변환한다.
+        창이 아직 그려지기 전(초기 렌더링) 등 폭을 알 수 없으면 min_inches로 대체한다."""
+        try:
+            width_px = self.learning_plot_canvas.winfo_width()
+        except Exception:
+            width_px = 0
+        if width_px < 200:  # 아직 위젯이 배치되지 않았거나 탭이 숨겨져 있는 경우
+            return min_inches
+        scrollbar_margin_px = 24
+        return max((width_px - scrollbar_margin_px) / dpi, min_inches)
 
     def _download_learn_result(self, df, default_name):
         if df is None or df.empty:
@@ -2423,7 +2496,28 @@ class ESAnalyzerApp(AppDashboard):
         xs_knots, y_knots = self._pava_isotonic_fit(x_train, y_train)
         return lambda x_eval: self._isotonic_predict(xs_knots, y_knots, x_eval)
 
-    def _recommend_model(self, val_r2_by_model, order=('Linear', 'Log', 'Isotonic'), tolerance=0.02):
+    def _fit_exp_saturation(self, x_train, y_train):
+        """[r13-update] 지수 포화(exponential saturation) 곡선 P = a − b·exp(−k·x)를 적합한다.
+        RU 전력증폭기의 전형적인 특성(부하가 늘수록 증가폭이 줄고 특정 최대치로 수렴)을 로그 모델보다
+        물리적으로 더 정확하게 표현하는 비선형 모델(a=포화 시 최대 전력, b=Idle과 포화 전력의 차이,
+        k=포화 속도). scipy가 없거나 최적화가 수렴하지 않으면 None을 반환한다."""
+        if not HAS_SCIPY or len(np.unique(x_train)) < 3:
+            return None
+        y_min, y_max = float(np.min(y_train)), float(np.max(y_train))
+        span = max(y_max - y_min, 1e-3)
+        a0, b0, k0 = y_max + span * 0.2, span * 1.2, 3.0
+        try:
+            popt, _ = curve_fit(
+                lambda x, a, b, k: a - b * np.exp(-k * x),
+                x_train, y_train, p0=[a0, b0, k0],
+                bounds=([y_min - span, 0.0, 1e-3], [y_max + 10 * span, 20 * span, 200.0]),
+                maxfev=5000,
+            )
+            return tuple(float(p) for p in popt)
+        except Exception:
+            return None
+
+    def _recommend_model(self, val_r2_by_model, order=('Linear', 'ExpSat', 'Isotonic'), tolerance=0.02):
         """[r13] '간단하지만 성능 좋은 모델'을 추천한다. Validation R²를 기준으로, 가장 성능이 좋은
         모델의 R²에서 tolerance(기본 0.02) 이내인 모델들 중 가장 간단한(복잡도가 낮은 순서상 앞쪽) 모델을
         채택한다 — Isotonic이 아주 근소하게만 더 좋다면 굳이 복잡한 모델을 쓰지 않겠다는 취지.
@@ -2498,6 +2592,15 @@ class ESAnalyzerApp(AppDashboard):
             # [r12-update] CM의 PA-shared-cell 정보로 동일 PA(RU path)를 공유하는 Cell을 하나로 묶는다.
             cm_map = self._resolve_pa_shared_ru_paths(cm_map, avail_keys)
             cm_by_cell = cm_map[['eNB_ID', 'cell-num'] + avail_keys].drop_duplicates()
+
+            # [r13-update2] Sector = Cnum(cell-num) % 10. 같은 eNB_ID+Sector 내 서로 다른 Cell 개수를
+            # "Sector 내 Cell수"로 계산해, RU HW x 공유여부에 이어 세 번째 학습 그룹핑 축으로 사용한다.
+            cm_by_cell['Sector'] = pd.to_numeric(cm_by_cell['cell-num'], errors='coerce') % 10
+            sector_cell_counts = (cm_by_cell.dropna(subset=['Sector'])
+                                   .groupby(['eNB_ID', 'Sector'], observed=True)['cell-num']
+                                   .nunique().reset_index(name='Sector_Cell_Count'))
+            cm_by_cell_sector = pd.merge(cm_by_cell, sector_cell_counts, on=['eNB_ID', 'Sector'], how='left')
+
             ru_boardtype = cm_map[ru_path_keys + ['BoardType']].drop_duplicates(subset=ru_path_keys, keep='first')
 
             # --- 1. Cell 단위 학습데이터 파싱 후 Cell(eNB_ID+cell-num) 단위로 시간 granularity 통일 ---
@@ -2568,6 +2671,13 @@ class ESAnalyzerApp(AppDashboard):
             shared_lookup = {tuple(r[k] for k in ru_path_keys): r['Shared'] for _, r in ru_cell_counts.iterrows()}
             cellcount_lookup = {tuple(r[k] for k in ru_path_keys): r['Cell_Count'] for _, r in ru_cell_counts.iterrows()}
 
+            # [r13-update2] RU path에 연결된 Cell(들)이 속한 Sector의 "Sector 내 Cell수"를 대표값으로 사용한다.
+            # (한 RU path의 Cell들이 여러 Sector에 걸치는 드문 경우는 최빈값을 사용)
+            ru_sector_cellcount = cm_by_cell_sector.dropna(subset=['Sector_Cell_Count']).groupby(ru_path_keys, observed=True)['Sector_Cell_Count'].agg(
+                lambda s: s.mode().iat[0] if not s.mode().empty else np.nan
+            ).reset_index()
+            sector_cellcount_lookup = {tuple(r[k] for k in ru_path_keys): r['Sector_Cell_Count'] for _, r in ru_sector_cellcount.iterrows()}
+
             ru_records, pooled_active_points = [], {}
 
             # [r12] RU(eNB_ID + Bid/RuPort/Cascade) 단위로 개별 학습 -> 이후 같은 Board Type x 공유여부끼리
@@ -2577,6 +2687,8 @@ class ESAnalyzerApp(AppDashboard):
                 key_tuple = keys if isinstance(keys, tuple) else (keys,)
                 shared_label = shared_lookup.get(key_tuple, 'Exclusive (단독)')
                 cell_count = cellcount_lookup.get(key_tuple, 1)
+                sector_cell_count = sector_cellcount_lookup.get(key_tuple, np.nan)
+                sector_group = f"{int(sector_cell_count)}Cell/Sector" if pd.notna(sector_cell_count) else 'Unknown'
 
                 off_rows = group[group['Cell_State'] == 'OFF']
                 on_rows = group[group['Cell_State'] == 'ON']
@@ -2594,15 +2706,15 @@ class ESAnalyzerApp(AppDashboard):
 
                 n_active = len(active_rows)
                 lin_slope = lin_intercept = np.nan
-                log_a = log_b = np.nan
+                expsat_a = expsat_b = expsat_k = np.nan
                 n_train = n_val = n_test = 0
-                MODEL_NAMES = ('Linear', 'Log', 'Isotonic')
+                MODEL_NAMES = ('Linear', 'ExpSat', 'Isotonic')
                 metrics = {m: {'Val': {'r2': np.nan, 'mse': np.nan, 'mae': np.nan},
                                'Test': {'r2': np.nan, 'mse': np.nan, 'mae': np.nan}} for m in MODEL_NAMES}
 
-                # [r13-update] Train 8 : Val 1 : Test 1 -> 동일한 분할로 3가지 난이도의 모델을 학습/검증한다.
-                #   1) 간단: 1차 선형회귀   2) 중간: 로그스케일(P = a + b·ln(Loading+eps))
-                #   3) 복잡/정확: Isotonic(단조증가) 회귀 — 2차 다항회귀는 비단조/과대적합 위험으로 제외.
+                # [r13-update2] Train 8 : Val 1 : Test 1 -> 동일한 분할로 3가지 난이도의 모델을 학습/검증한다.
+                #   1) 간단: 1차 선형회귀   2) 중간: 지수포화(P = a − b·exp(−k·Loading), RU PA 포화 특성 반영)
+                #   3) 복잡/정확: Isotonic(단조증가) 회귀 — 로그스케일은 저부하 구간 기울기 왜곡이 커서 제외.
                 if n_active >= min_samples and active_rows['Loading_traffic'].nunique() >= 2:
                     idx = rng.permutation(n_active)
                     n_train = max(int(round(n_active * 0.8)), 1)
@@ -2625,10 +2737,12 @@ class ESAnalyzerApp(AppDashboard):
                         if n_val: metrics['Linear']['Val'] = self._regression_metrics(y_val, lin_slope * x_val + lin_intercept)
                         if n_test: metrics['Linear']['Test'] = self._regression_metrics(y_test, lin_slope * x_test + lin_intercept)
 
-                        log_eps = 1e-3
-                        log_b, log_a = np.polyfit(np.log(x_train + log_eps), y_train, 1)
-                        if n_val: metrics['Log']['Val'] = self._regression_metrics(y_val, log_b * np.log(x_val + log_eps) + log_a)
-                        if n_test: metrics['Log']['Test'] = self._regression_metrics(y_test, log_b * np.log(x_test + log_eps) + log_a)
+                        expsat_params = self._fit_exp_saturation(x_train, y_train)
+                        if expsat_params is not None:
+                            expsat_a, expsat_b, expsat_k = expsat_params
+                            _expsat_pred = lambda x, a=expsat_a, b=expsat_b, k=expsat_k: a - b * np.exp(-k * x)
+                            if n_val: metrics['ExpSat']['Val'] = self._regression_metrics(y_val, _expsat_pred(x_val))
+                            if n_test: metrics['ExpSat']['Test'] = self._regression_metrics(y_test, _expsat_pred(x_test))
 
                         iso_predict = self._fit_isotonic(x_train, y_train)
                         if n_val: metrics['Isotonic']['Val'] = self._regression_metrics(y_val, iso_predict(x_val))
@@ -2639,6 +2753,7 @@ class ESAnalyzerApp(AppDashboard):
                 record = dict(zip(ru_path_keys, key_tuple))
                 record.update({
                     'Board Type': board_type, 'Cell_Count': cell_count, 'Shared': shared_label,
+                    'Sector_Cell_Count': sector_cell_count, 'Sector Group': sector_group,
                     'N_OFF(PAoff)': len(off_rows), 'N_Idle': len(idle_rows), 'N_Active': n_active,
                     'N_Train': n_train, 'N_Val': n_val, 'N_Test': n_test,
                     'Recommended Model': recommended,
@@ -2646,10 +2761,10 @@ class ESAnalyzerApp(AppDashboard):
                     'Linear R2_Val': metrics['Linear']['Val']['r2'], 'Linear R2_Test': metrics['Linear']['Test']['r2'],
                     'Linear MSE_Val': metrics['Linear']['Val']['mse'], 'Linear MSE_Test': metrics['Linear']['Test']['mse'],
                     'Linear MAE_Val': metrics['Linear']['Val']['mae'], 'Linear MAE_Test': metrics['Linear']['Test']['mae'],
-                    'Log a [W]': log_a, 'Log b [W]': log_b,
-                    'Log R2_Val': metrics['Log']['Val']['r2'], 'Log R2_Test': metrics['Log']['Test']['r2'],
-                    'Log MSE_Val': metrics['Log']['Val']['mse'], 'Log MSE_Test': metrics['Log']['Test']['mse'],
-                    'Log MAE_Val': metrics['Log']['Val']['mae'], 'Log MAE_Test': metrics['Log']['Test']['mae'],
+                    'ExpSat a [W]': expsat_a, 'ExpSat b [W]': expsat_b, 'ExpSat k': expsat_k,
+                    'ExpSat R2_Val': metrics['ExpSat']['Val']['r2'], 'ExpSat R2_Test': metrics['ExpSat']['Test']['r2'],
+                    'ExpSat MSE_Val': metrics['ExpSat']['Val']['mse'], 'ExpSat MSE_Test': metrics['ExpSat']['Test']['mse'],
+                    'ExpSat MAE_Val': metrics['ExpSat']['Val']['mae'], 'ExpSat MAE_Test': metrics['ExpSat']['Test']['mae'],
                     'Isotonic R2_Val': metrics['Isotonic']['Val']['r2'], 'Isotonic R2_Test': metrics['Isotonic']['Test']['r2'],
                     'Isotonic MSE_Val': metrics['Isotonic']['Val']['mse'], 'Isotonic MSE_Test': metrics['Isotonic']['Test']['mse'],
                     'Isotonic MAE_Val': metrics['Isotonic']['Val']['mae'], 'Isotonic MAE_Test': metrics['Isotonic']['Test']['mae'],
@@ -2661,7 +2776,7 @@ class ESAnalyzerApp(AppDashboard):
                 ru_records.append(record)
 
                 if n_active > 0:
-                    pooled_active_points.setdefault((board_type, shared_label), []).append(
+                    pooled_active_points.setdefault((board_type, shared_label, sector_group), []).append(
                         (active_rows['Loading_traffic'].values, active_rows['Consumed_Power'].values)
                     )
 
@@ -2670,14 +2785,15 @@ class ESAnalyzerApp(AppDashboard):
 
             ru_df = pd.DataFrame(ru_records)
 
-            # [r13] Board Type x 공유여부(Shared/Exclusive) 기준으로 집계 — 사용자가 이 기준의 결과만
-            # 사용할 예정이므로, 공유여부를 반영하지 않은 Board Type 단독 평균은 더 이상 산출하지 않는다.
-            hw_df = ru_df.groupby(['Board Type', 'Shared'], observed=True).agg(
+            # [r13-update2] Board Type x 공유여부(Shared/Exclusive) x Sector 내 Cell수 기준으로 집계한다.
+            # Sector 내 Cell수(예: 3Cell/Sector, 1Cell/Sector)를 세 번째 그룹핑 축으로 추가해, 동일 RU HW라도
+            # Sector 구성(단일/다중 Cell)에 따라 부하-전력 특성이 다를 수 있는 경우를 분리해서 학습/추천한다.
+            hw_df = ru_df.groupby(['Board Type', 'Shared', 'Sector Group'], observed=True).agg(
                 RU_Count=('Board Type', 'count'),
                 Avg_Linear_Slope=('Linear Slope [W/util]', 'mean'), Avg_Linear_Intercept=('Linear Intercept [W]', 'mean'),
                 Avg_Linear_R2=('Linear R2_Val', 'mean'), Avg_Linear_MSE=('Linear MSE_Val', 'mean'), Avg_Linear_MAE=('Linear MAE_Val', 'mean'),
-                Avg_Log_a=('Log a [W]', 'mean'), Avg_Log_b=('Log b [W]', 'mean'),
-                Avg_Log_R2=('Log R2_Val', 'mean'), Avg_Log_MSE=('Log MSE_Val', 'mean'), Avg_Log_MAE=('Log MAE_Val', 'mean'),
+                Avg_ExpSat_a=('ExpSat a [W]', 'mean'), Avg_ExpSat_b=('ExpSat b [W]', 'mean'), Avg_ExpSat_k=('ExpSat k', 'mean'),
+                Avg_ExpSat_R2=('ExpSat R2_Val', 'mean'), Avg_ExpSat_MSE=('ExpSat MSE_Val', 'mean'), Avg_ExpSat_MAE=('ExpSat MAE_Val', 'mean'),
                 Avg_Isotonic_R2=('Isotonic R2_Val', 'mean'), Avg_Isotonic_MSE=('Isotonic MSE_Val', 'mean'), Avg_Isotonic_MAE=('Isotonic MAE_Val', 'mean'),
                 Avg_Idle_Measured=('Idle Measured [W]', 'mean'), Idle_Reference=('Idle Reference [W]', 'first'),
                 Avg_Idle_Delta=('Idle Delta [W]', 'mean'), Avg_Idle_Coe=('Idle Coe(meas/ref)', 'mean'),
@@ -2688,8 +2804,8 @@ class ESAnalyzerApp(AppDashboard):
                 'RU_Count': 'RU Count',
                 'Avg_Linear_Slope': 'Avg Linear Slope [W/util]', 'Avg_Linear_Intercept': 'Avg Linear Intercept [W]',
                 'Avg_Linear_R2': 'Avg Linear R2 (Val)', 'Avg_Linear_MSE': 'Avg Linear MSE (Val)', 'Avg_Linear_MAE': 'Avg Linear MAE (Val)',
-                'Avg_Log_a': 'Avg Log a [W]', 'Avg_Log_b': 'Avg Log b [W]',
-                'Avg_Log_R2': 'Avg Log R2 (Val)', 'Avg_Log_MSE': 'Avg Log MSE (Val)', 'Avg_Log_MAE': 'Avg Log MAE (Val)',
+                'Avg_ExpSat_a': 'Avg ExpSat a [W]', 'Avg_ExpSat_b': 'Avg ExpSat b [W]', 'Avg_ExpSat_k': 'Avg ExpSat k',
+                'Avg_ExpSat_R2': 'Avg ExpSat R2 (Val)', 'Avg_ExpSat_MSE': 'Avg ExpSat MSE (Val)', 'Avg_ExpSat_MAE': 'Avg ExpSat MAE (Val)',
                 'Avg_Isotonic_R2': 'Avg Isotonic R2 (Val)', 'Avg_Isotonic_MSE': 'Avg Isotonic MSE (Val)', 'Avg_Isotonic_MAE': 'Avg Isotonic MAE (Val)',
                 'Avg_Idle_Measured': 'Avg Idle Measured [W]', 'Idle_Reference': 'Idle Reference [W]',
                 'Avg_Idle_Delta': 'Avg Idle Delta [W]', 'Avg_Idle_Coe': 'Avg Idle Coe(meas/ref)',
@@ -2697,22 +2813,23 @@ class ESAnalyzerApp(AppDashboard):
                 'Avg_PAoff_Delta': 'Avg PAoff Delta [W]', 'Avg_PAoff_Coe': 'Avg PAoff Coe(meas/ref)',
             }, inplace=True)
 
-            # [r13] 그룹(HW×공유여부) 단위 대표 추천 모델 — 그룹 평균 Val R²를 기준으로 동일한 규칙 적용
+            # [r13-update2] 그룹(HW×공유여부×Sector 내 Cell수) 단위 대표 추천 모델 — 그룹 평균 Val R²를 기준으로 동일한 규칙 적용
             hw_df['Recommended Model'] = hw_df.apply(lambda r: self._recommend_model({
-                'Linear': r['Avg Linear R2 (Val)'], 'Log': r['Avg Log R2 (Val)'], 'Isotonic': r['Avg Isotonic R2 (Val)'],
+                'Linear': r['Avg Linear R2 (Val)'], 'ExpSat': r['Avg ExpSat R2 (Val)'], 'Isotonic': r['Avg Isotonic R2 (Val)'],
             }), axis=1)
 
             self.learn_ru_df, self.learn_hw_df = ru_df, hw_df
+            self.learn_pooled_active_points = pooled_active_points
 
-            precise_cols_ru = {'Linear Slope [W/util]', 'Linear Intercept [W]', 'Log a [W]', 'Log b [W]',
+            precise_cols_ru = {'Linear Slope [W/util]', 'Linear Intercept [W]', 'ExpSat a [W]', 'ExpSat b [W]', 'ExpSat k',
                                 'Idle Coe(meas/ref)', 'PAoff Coe(meas/ref)'}
-            precise_cols_hw = {'Avg Linear Slope [W/util]', 'Avg Linear Intercept [W]', 'Avg Log a [W]', 'Avg Log b [W]',
+            precise_cols_hw = {'Avg Linear Slope [W/util]', 'Avg Linear Intercept [W]', 'Avg ExpSat a [W]', 'Avg ExpSat b [W]', 'Avg ExpSat k',
                                 'Avg Idle Coe(meas/ref)', 'Avg PAoff Coe(meas/ref)'}
             self._update_tree_precise(self.tree_learn_ru, ru_df, precise_cols=precise_cols_ru)
             self._update_tree_precise(self.tree_learn_hw, hw_df, precise_cols=precise_cols_hw)
             self._render_learning_plots(hw_df, pooled_active_points)
 
-            self.learn_status_label.config(text=f"학습 완료: RU {len(ru_df)}개 / HW×공유여부 {len(hw_df)}종", fg=self.ACCENT_GREEN)
+            self.learn_status_label.config(text=f"학습 완료: RU {len(ru_df)}개 / HW×공유여부×Sector Cell수 {len(hw_df)}종", fg=self.ACCENT_GREEN)
 
         except Exception as e:
             logging.error(f"[DEBUG] Learning Energy Curve Error: {e}", exc_info=True)
@@ -2723,11 +2840,15 @@ class ESAnalyzerApp(AppDashboard):
         for widget in self.learning_plot_frame.winfo_children(): widget.destroy()
         if hw_df.empty: return
 
-        # [r13] Board Type x 공유여부(Shared/Exclusive) 조합마다 한 행씩 시각화한다.
-        groups = list(hw_df[['Board Type', 'Shared']].astype(str).itertuples(index=False, name=None))
+        # [r13-update2] Board Type x 공유여부(Shared/Exclusive) x Sector 내 Cell수 조합마다 한 행씩 시각화한다.
+        groups = list(hw_df[['Board Type', 'Shared', 'Sector Group']].astype(str).itertuples(index=False, name=None))
         n_groups = len(groups)
 
-        fig, axes = plt.subplots(n_groups + 1, 2, figsize=(13, 4.6 * (n_groups + 1)))
+        # [r13-update] 창 폭에 맞춰 그래프 폭을 정하고, 그래프/제목/범례가 서로 겹치지 않도록
+        # 행간 간격을 넉넉히 확보(constrained_layout + 별도 pad)한다.
+        fig_width = self._get_plot_fig_width_inches()
+        fig, axes = plt.subplots(n_groups + 1, 2, figsize=(fig_width, 5.8 * (n_groups + 1)), constrained_layout=True)
+        fig.set_constrained_layout_pads(w_pad=0.35, h_pad=0.55, hspace=0.18, wspace=0.14)
         axes = np.atleast_2d(axes)
         self._apply_plot_style(fig, axes.flatten())
 
@@ -2739,19 +2860,20 @@ class ESAnalyzerApp(AppDashboard):
                             xytext=(0, 3 if h >= 0 else -12), textcoords="offset points",
                             ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
 
-        for i, (bt, shared_label) in enumerate(groups):
+        for i, (bt, shared_label, sector_group) in enumerate(groups):
             ax_scatter, ax_bar = axes[i, 0], axes[i, 1]
-            row = hw_df[(hw_df['Board Type'].astype(str) == bt) & (hw_df['Shared'].astype(str) == shared_label)].iloc[0]
+            row = hw_df[(hw_df['Board Type'].astype(str) == bt) & (hw_df['Shared'].astype(str) == shared_label)
+                        & (hw_df['Sector Group'].astype(str) == sector_group)].iloc[0]
             recommended = row.get('Recommended Model', '')
 
-            pts = pooled_active_points.get((bt, shared_label), [])
+            pts = pooled_active_points.get((bt, shared_label, sector_group), [])
             x_all = np.concatenate([p[0] for p in pts]) if pts else np.array([])
             y_all = np.concatenate([p[1] for p in pts]) if pts else np.array([])
             if x_all.size > 0:
                 ax_scatter.scatter(x_all, y_all, s=14, alpha=0.35, color=self.ACCENT_BLUE, label='RU-hour 샘플 (Active)', zorder=1)
                 x_line = np.linspace(0, x_all.max(), 80)
 
-                # [r13-update] 3종 모델 비교: ① 간단(선형) ② 중간(로그스케일) ③ 복잡/정확(Isotonic, 그룹 전체
+                # [r13-update2] 3종 모델 비교: ① 간단(선형) ② 중간(지수포화, ExpSat) ③ 복잡/정확(Isotonic, 그룹 전체
                 # 데이터로 직접 적합). 추천 모델(Val R²/MSE 기준, 간단한 쪽을 우선)은 굵은 선으로 강조한다.
                 def _lw(name): return 3.2 if name == recommended else 2.0
                 def _star(name): return '★ ' if name == recommended else ''
@@ -2762,12 +2884,12 @@ class ESAnalyzerApp(AppDashboard):
                     lbl = f"{_star('Linear')}① 간단(선형) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "① 간단(선형)"
                     ax_scatter.plot(x_line, slope * x_line + intercept, color='#F59E0B', linewidth=_lw('Linear'), linestyle='--', label=lbl, zorder=3)
 
-                if pd.notna(row['Avg Log a [W]']) and pd.notna(row['Avg Log b [W]']):
-                    log_a, log_b = row['Avg Log a [W]'], row['Avg Log b [W]']
-                    r2, mse = row['Avg Log R2 (Val)'], row['Avg Log MSE (Val)']
-                    y_log = log_b * np.log(x_line + 1e-3) + log_a
-                    lbl = f"{_star('Log')}② 중간(로그스케일) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "② 중간(로그스케일)"
-                    ax_scatter.plot(x_line, y_log, color='#8B5CF6', linewidth=_lw('Log'), linestyle='-.', label=lbl, zorder=3)
+                if pd.notna(row['Avg ExpSat a [W]']) and pd.notna(row['Avg ExpSat b [W]']) and pd.notna(row['Avg ExpSat k']):
+                    a_p, b_p, k_p = row['Avg ExpSat a [W]'], row['Avg ExpSat b [W]'], row['Avg ExpSat k']
+                    r2, mse = row['Avg ExpSat R2 (Val)'], row['Avg ExpSat MSE (Val)']
+                    y_expsat = a_p - b_p * np.exp(-k_p * x_line)
+                    lbl = f"{_star('ExpSat')}② 중간(지수포화) R²={r2:.3f}, MSE={mse:.2f}" if pd.notna(r2) else "② 중간(지수포화)"
+                    ax_scatter.plot(x_line, y_expsat, color='#8B5CF6', linewidth=_lw('ExpSat'), linestyle='-.', label=lbl, zorder=3)
 
                 if x_all.size >= 2:
                     xs_knots, y_knots = self._pava_isotonic_fit(x_all, y_all)
@@ -2779,7 +2901,7 @@ class ESAnalyzerApp(AppDashboard):
                 ax_scatter.axhline(row['Avg Idle Measured [W]'], color=self.ACCENT_GREEN, linestyle=':', linewidth=1.5,
                                     label=f"실측 Idle 평균={row['Avg Idle Measured [W]']:.2f}W", zorder=2)
             rec_txt = f" — 추천: {recommended}" if recommended and 'N/A' not in str(recommended) else ""
-            ax_scatter.set_title(f'[{bt} · {shared_label}] Loading_traffic vs Consumed Power{rec_txt}', fontweight='bold')
+            ax_scatter.set_title(f'[{bt} · {shared_label} · {sector_group}]\nLoading_traffic vs Consumed Power{rec_txt}', fontweight='bold', fontsize=10)
             ax_scatter.set_xlabel('Loading_traffic (=ΣUsedRB_t/ΣnRB)'); ax_scatter.set_ylabel('Consumed Power [W]')
             ax_scatter.legend(fontsize=7.5, loc='lower right')
 
@@ -2790,19 +2912,19 @@ class ESAnalyzerApp(AppDashboard):
             if vals:
                 bars = ax_bar.bar(labels, vals, color=colors, edgecolor='black', alpha=0.9)
                 _bar_labels(ax_bar, bars, fmt="{:.2f}W")
-                ax_bar.set_title(f'[{bt} · {shared_label}] Idle/PA off 소비전력 예측값: Reference vs 실측 보정값', fontweight='bold')
+                ax_bar.set_title(f'[{bt} · {shared_label} · {sector_group}]\nIdle/PA off 소비전력: Reference vs 실측 보정값', fontweight='bold', fontsize=10)
                 ax_bar.set_ylabel('Power [W]')
 
         # 하단 요약: (a) 그룹별 3종 모델 R²(Val) 비교, (b) 그룹별 Idle/PA off 보정폭
         ax_r2, ax_delta = axes[n_groups, 0], axes[n_groups, 1]
-        group_labels = [f"{bt}\n{sh}" for bt, sh in groups]
+        group_labels = [f"{bt}\n{sh}\n{sg}" for bt, sh, sg in groups]
         x_pos = np.arange(len(hw_df))
         width = 0.25
         bars_lin = ax_r2.bar(x_pos - width, hw_df['Avg Linear R2 (Val)'], width, label='① 간단(선형)', color='#F59E0B', edgecolor='black', alpha=0.85)
-        bars_log = ax_r2.bar(x_pos, hw_df['Avg Log R2 (Val)'], width, label='② 중간(로그스케일)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        bars_expsat = ax_r2.bar(x_pos, hw_df['Avg ExpSat R2 (Val)'], width, label='② 중간(지수포화)', color='#8B5CF6', edgecolor='black', alpha=0.85)
         bars_iso = ax_r2.bar(x_pos + width, hw_df['Avg Isotonic R2 (Val)'], width, label='③ 복잡/정확(Isotonic)', color='#EF4444', edgecolor='black', alpha=0.85)
-        _bar_labels(ax_r2, bars_lin, fmt="{:.2f}"); _bar_labels(ax_r2, bars_log, fmt="{:.2f}"); _bar_labels(ax_r2, bars_iso, fmt="{:.2f}")
-        model_offset = {'Linear': -width, 'Log': 0.0, 'Isotonic': width}
+        _bar_labels(ax_r2, bars_lin, fmt="{:.2f}"); _bar_labels(ax_r2, bars_expsat, fmt="{:.2f}"); _bar_labels(ax_r2, bars_iso, fmt="{:.2f}")
+        model_offset = {'Linear': -width, 'ExpSat': 0.0, 'Isotonic': width}
         for j, rec in enumerate(hw_df['Recommended Model']):
             if rec in model_offset:
                 ax_r2.annotate('★', xy=(x_pos[j] + model_offset[rec], 1.02), ha='center', va='bottom', fontsize=11,
@@ -2822,7 +2944,6 @@ class ESAnalyzerApp(AppDashboard):
         ax_delta.set_ylabel('Delta [W]')
         ax_delta.legend(fontsize=9)
 
-        plt.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=self.learning_plot_frame)
         canvas.draw()
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
