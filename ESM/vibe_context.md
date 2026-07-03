@@ -115,14 +115,26 @@
   * **수정**: `AppBase`에 `_get_qual_cmap(name, n)` 헬퍼를 추가 — 신형 API(`plt.colormaps[name].resampled(n)`, matplotlib 3.6+)를 우선 시도하고, 실패 시 구형 API(`plt.cm.get_cmap`)로 자동 폴백하여 신/구 matplotlib 버전 모두에서 동작하도록 함. 기존 2곳의 호출을 모두 이 헬퍼로 교체.
   * **검증**: 실제 오류를 재현한 matplotlib 3.11.0 가상환경에서 신형 API 경로가 정상 동작하고 기존과 동일하게 정수 인덱스로 색상을 얻을 수 있음을 확인.
 
+* **[v2.4 / esm_r13.py] (2026-07-03) nRB 구간 분석 제거, 공유여부(Shared) 기준으로 결과 전면 재구성 + 3종 Energy Curve 모델링**
+  * **배경**: v2.3에서 만든 두 진단(공유여부 vs nRB 구간) 중, 사용자가 **공유여부(Shared/Exclusive) 결과만 사용하기로 결정** — nRB 구간 분석은 제거하고, 대신 다른 모든 결과(HW 요약, Idle/PA off 보정값, Energy Curve 등)도 전부 공유여부 기준으로 나누어 보여달라는 요청. 또한 loading에 따른 Consumed Power 추정을 1차 함수 하나로만 하지 말고, 정확도를 위해 커브피팅 난이도가 다른 3종 모델을 그래프에 함께 그려서 눈으로 비교해 고를 수 있게 해달라는 요청.
+  * **nRB 구간 분석 완전 제거**: `_assign_nrb_buckets()`, `Total_nRB`/`nRB_Bucket` 컬럼, `learn_hw_nrb_df`, "[r13] nRB 구간별 비교" 탭/다운로드 버튼을 모두 삭제.
+  * **공유여부(Shared)가 결과 전체의 기본 축이 됨**: 기존에는 `hw_df`가 Board Type만으로 집계되고 `hw_shared_df`가 별도 진단표였는데, 이제 `hw_df` 자체를 `groupby(['Board Type', 'Shared'])`로 집계 — Idle/PA off 측정값·레퍼런스·Delta·보정계수, 3종 모델의 계수/R² 등 모든 요약 항목이 Board Type × 공유여부 단위로 나온다. 별도의 "공유여부별 비교" 탭은 이제 메인 HW 요약 탭 자체이므로 삭제(탭 2개 → RU 단위 상세 / HW(Board Type×공유여부) 요약 / 시각화, 총 3개로 정리).
+  * **Loading → Consumed Power 3종 모델링** (모두 동일한 Train 8 : Val 1 : Test 1 분할로 공정 비교):
+    1. **① 간단(선형)**: 기존 1차 회귀(`np.polyfit(...,1)`) — `Linear Slope`/`Linear Intercept`/`Linear R2_Val`/`Linear R2_Test`.
+    2. **② 중간(2차 다항식)**: `np.polyfit(...,2)` — `Quad a2`/`Quad a1`/`Quad a0`/`Quad R2_Val`/`Quad R2_Test`. 완만한 곡률(예: 부하가 커질수록 증가폭이 커지거나 작아지는 패턴)을 반영.
+    3. **③ 복잡/정확(Isotonic Regression, PAVA)**: 신규 `_pava_isotonic_fit()`(Pool Adjacent Violators Algorithm, numpy만으로 구현) + `_isotonic_predict()`(구간 밖은 양 끝값 고정한 선형보간). "Loading이 늘어날수록 소비전력이 줄어들 수 없다"는 물리적 제약을 그대로 반영하는 완전 비모수(non-parametric) 모델이라 다항식처럼 차수를 정하거나 오버피팅(Runge 현상)을 걱정할 필요 없이 가장 유연하게 실제 곡선 형태를 따라간다. sklearn 등 외부 ML 라이브러리를 새로 추가하지 않기 위해 numpy만으로 직접 구현(현장 PC의 pip 설치 제약을 고려한 선택).
+    4. RU 단위 개별 학습은 기존처럼 유지(데이터량 증가 효과)하고, 그룹(HW×공유여부) 대표값은 선형/2차는 RU별 계수의 평균, Isotonic은 그룹 내 전체 RU의 Active 샘플을 모아 한 번에 재적합(비모수 모델은 계수 평균이 의미가 없으므로).
+  * **시각화**: Board Type × 공유여부 조합마다 한 행씩, 왼쪽엔 산점도 위에 3종 모델 곡선을 함께 그려 R²(Val)와 함께 표시(①점선/②일점쇄선/③실선으로 구분), 오른쪽엔 기존 Idle/PA off 예측값 막대. 하단 요약에 (a) 그룹별 3종 모델 R²(Val) 비교 막대(어떤 모델이 어떤 그룹에서 더 잘 맞는지 한눈에 비교), (b) 그룹별 Idle/PA off 보정폭 막대.
+  * **검증**: 임시 가상환경에서, (a) 실제로 곡선형(포화 곡선, Idle+Amp*(1-exp(-k·Loading))) 관계를 갖는 합성 데이터에서 선형 R²=0.83인 반면 2차=0.98, Isotonic=0.99로 유의미하게 개선됨을 확인(모델 복잡도가 실제로 정확도를 높여준다는 것을 검증), (b) 실제로 선형인 데이터에서는 3종 모두 비슷하게(~0.96~0.97) 잘 맞아 복잡한 모델이 불이익을 주지 않음을 확인, (c) 공유여부만으로 그룹핑되고 nRB 관련 컬럼이 전혀 남아있지 않음을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.3(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 기울기 분산 진단(공유여부/nRB 구간별 세분화)까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.4(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 공유여부(Shared) 기준 전면 재구성 + 3종 Energy Curve 모델링(선형/2차/Isotonic)까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
-  4. **다음 결정 대기**: 실데이터로 "[r13] 공유여부별 비교"/"[r13] nRB 구간별 비교" 결과를 보고, 기울기 분산을 더 잘 설명하는 기준을 하나 채택하거나 두 기준을 조합해 더 세분화할지 결정.
-  5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
+  4. **다음 결정 대기**: 실데이터 시각화에서 3종 모델(선형/2차/Isotonic) 중 어느 것이 그래프 모양상 가장 적합한지 사용자가 판단 예정 — 결과에 따라 최종 채택 모델을 하나로 정하거나, Board Type×공유여부 그룹마다 다른 모델을 쓰도록 할 수 있음.
+  5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
 ---

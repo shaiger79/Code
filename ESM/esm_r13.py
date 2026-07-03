@@ -102,9 +102,7 @@ class AppBase(BaseTk):
         self.learn_down_ratio_th = tk.DoubleVar(value=0.9)
         self.learn_min_samples = tk.IntVar(value=10)
         self.learn_ru_df = pd.DataFrame()
-        self.learn_hw_df = pd.DataFrame()
-        self.learn_hw_shared_df = pd.DataFrame()  # [r13] RU path 공유(Shared) vs 단독(Exclusive) 비교
-        self.learn_hw_nrb_df = pd.DataFrame()      # [r13] RU path 총 nRB 구간별 비교
+        self.learn_hw_df = pd.DataFrame()  # [r13] Board Type x 공유여부(Shared/Exclusive) 기준으로 집계
 
         self._load_auto_jsons()
         self.create_widgets()
@@ -2192,31 +2190,21 @@ class ESAnalyzerApp(AppDashboard):
         row4.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(row4, text="💾 RU 단위 상세 결과 CSV 다운로드",
                    command=lambda: self._download_learn_result(self.learn_ru_df, "LearningEnergyCurve_RU_Detail.csv")).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row4, text="💾 HW(Board Type) 요약 CSV 다운로드",
+        ttk.Button(row4, text="💾 HW(Board Type × 공유여부) 요약 CSV 다운로드",
                    command=lambda: self._download_learn_result(self.learn_hw_df, "LearningEnergyCurve_HW_Summary.csv")).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row4, text="💾 공유여부별 비교 CSV 다운로드",
-                   command=lambda: self._download_learn_result(self.learn_hw_shared_df, "LearningEnergyCurve_HW_Shared_vs_Exclusive.csv")).pack(side=tk.LEFT, padx=5)
-        ttk.Button(row4, text="💾 nRB 구간별 비교 CSV 다운로드",
-                   command=lambda: self._download_learn_result(self.learn_hw_nrb_df, "LearningEnergyCurve_HW_nRB_Bucket.csv")).pack(side=tk.LEFT, padx=5)
 
         result_notebook = ttk.Notebook(self.frame_learning)
         result_notebook.pack(fill=tk.BOTH, expand=True, pady=10)
 
         frame_ru = ttk.Frame(result_notebook)
         frame_hw = ttk.Frame(result_notebook)
-        frame_shared = ttk.Frame(result_notebook)
-        frame_nrb = ttk.Frame(result_notebook)
         frame_plot = ttk.Frame(result_notebook)
         result_notebook.add(frame_ru, text=" RU 단위 상세 결과 ")
-        result_notebook.add(frame_hw, text=" HW(Board Type) 평균 성능 & 보정값 ")
-        result_notebook.add(frame_shared, text=" [r13] 공유여부별 비교 ")
-        result_notebook.add(frame_nrb, text=" [r13] nRB 구간별 비교 ")
+        result_notebook.add(frame_hw, text=" HW(Board Type × 공유여부) 평균 성능 & 보정값 ")
         result_notebook.add(frame_plot, text=" 시각화 ")
 
         self.tree_learn_ru = self._create_tree_in_frame(frame_ru)
         self.tree_learn_hw = self._create_tree_in_frame(frame_hw)
-        self.tree_learn_hw_shared = self._create_tree_in_frame(frame_shared)
-        self.tree_learn_hw_nrb = self._create_tree_in_frame(frame_nrb)
 
         plot_outer = ttk.Frame(frame_plot)
         plot_outer.pack(fill=tk.BOTH, expand=True)
@@ -2399,23 +2387,40 @@ class ESAnalyzerApp(AppDashboard):
         cm_map['BoardType'] = resolved.apply(lambda r: r[1])
         return cm_map
 
-    def _assign_nrb_buckets(self, ru_df, n_bins=3):
-        """[r13] Board Type별로 RU의 Total_nRB를 구간(최대 n_bins개, 분위수 기준)으로 나눈다.
-        같은 Board Type 내 RU들의 Total_nRB가 거의 동일해 구간을 나눌 수 없으면 'All' 하나로 묶는다."""
-        buckets = pd.Series(index=ru_df.index, dtype=object)
-        for _, idx in ru_df.groupby('Board Type', observed=True).groups.items():
-            sub = ru_df.loc[idx, 'Total_nRB']
-            n_uniq = sub.nunique(dropna=True)
-            if n_uniq <= 1:
-                buckets.loc[idx] = 'All'
-                continue
-            try:
-                cats = pd.qcut(sub, q=min(n_bins, n_uniq), duplicates='drop')
-                labels = [f"{iv.left:.0f}~{iv.right:.0f}" for iv in cats.cat.categories]
-                buckets.loc[idx] = cats.cat.rename_categories(labels).astype(str)
-            except Exception:
-                buckets.loc[idx] = 'All'
-        return buckets
+    def _r2_score(self, y_true, y_pred):
+        y_true, y_pred = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
+        if y_true.size == 0: return np.nan
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - y_true.mean()) ** 2)
+        return (1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+
+    def _pava_isotonic_fit(self, x, y):
+        """[r13] Pool Adjacent Violators Algorithm으로 단조증가(비감소) Isotonic Regression을 적합한다.
+        (x 정렬 순서, 각 지점에 대응하는 적합값)의 매듭점을 반환하며, 새 x는
+        _isotonic_predict()로 선형보간(구간 밖은 양 끝값 고정)해 예측한다. Loading이 늘어날수록
+        Consumed Power가 절대 줄어들지 않는다는 물리적 제약을 그대로 반영하는 non-parametric 모델."""
+        order = np.argsort(x)
+        xs, ys = np.asarray(x, dtype=float)[order], np.asarray(y, dtype=float)[order]
+        vals, weights = [], []
+        for yi in ys:
+            vals.append(float(yi)); weights.append(1.0)
+            while len(vals) > 1 and vals[-2] > vals[-1]:
+                v2, w2 = vals.pop(), weights.pop()
+                v1, w1 = vals.pop(), weights.pop()
+                vals.append((v1 * w1 + v2 * w2) / (w1 + w2))
+                weights.append(w1 + w2)
+        fitted = np.empty(len(ys))
+        idx = 0
+        for v, w in zip(vals, weights):
+            cnt = int(round(w))
+            fitted[idx:idx + cnt] = v
+            idx += cnt
+        return xs, fitted
+
+    def _isotonic_predict(self, xs_knots, y_knots, x_eval):
+        x_eval = np.asarray(x_eval, dtype=float)
+        if len(xs_knots) == 0: return np.full_like(x_eval, np.nan)
+        return np.interp(x_eval, xs_knots, y_knots)
 
     def _run_energy_curve_learning(self):
         try:
@@ -2511,12 +2516,23 @@ class ESAnalyzerApp(AppDashboard):
             min_samples = max(int(self.learn_min_samples.get()), 3)
             rng = np.random.default_rng(42)
 
+            # [r13] RU path 공유(Shared) vs 단독(Exclusive) 여부를 루프보다 먼저 계산해두고,
+            # 이후 모든 결과(요약/시각화)를 이 기준으로 나눈다. (nRB 구간 분석은 제거)
+            ru_cell_counts = cm_by_cell.groupby(ru_path_keys, observed=True)['cell-num'].nunique().reset_index(name='Cell_Count')
+            ru_cell_counts['Shared'] = np.where(ru_cell_counts['Cell_Count'] > 1, 'Shared (공유)', 'Exclusive (단독)')
+            shared_lookup = {tuple(r[k] for k in ru_path_keys): r['Shared'] for _, r in ru_cell_counts.iterrows()}
+            cellcount_lookup = {tuple(r[k] for k in ru_path_keys): r['Cell_Count'] for _, r in ru_cell_counts.iterrows()}
+
             ru_records, pooled_active_points = [], {}
 
-            # [r12] RU(eNB_ID + Bid/RuPort/Cascade) 단위로 개별 학습 -> 이후 같은 Board Type끼리 평균하여
-            # "해당 HW의 평균 성능"으로 간주 (RU 단위 분해 -> 학습 데이터량 증가 효과)
+            # [r12] RU(eNB_ID + Bid/RuPort/Cascade) 단위로 개별 학습 -> 이후 같은 Board Type x 공유여부끼리
+            # 평균하여 "해당 HW(공유/단독)의 평균 성능"으로 간주 (RU 단위 분해 -> 학습 데이터량 증가 효과)
             for keys, group in ru_dataset.groupby(ru_path_keys, observed=True):
                 board_type = group['BoardType'].iloc[0]
+                key_tuple = keys if isinstance(keys, tuple) else (keys,)
+                shared_label = shared_lookup.get(key_tuple, 'Exclusive (단독)')
+                cell_count = cellcount_lookup.get(key_tuple, 1)
+
                 off_rows = group[group['Cell_State'] == 'OFF']
                 on_rows = group[group['Cell_State'] == 'ON']
                 idle_rows = on_rows[on_rows['Loading_traffic'] <= 1e-9]
@@ -2532,10 +2548,15 @@ class ESAnalyzerApp(AppDashboard):
                 coe_paoff = (paoff_measured / ref_paoff) if (pd.notna(paoff_measured) and pd.notna(ref_paoff) and ref_paoff != 0) else np.nan
 
                 n_active = len(active_rows)
-                slope, intercept, r2_val, r2_test = np.nan, np.nan, np.nan, np.nan
+                lin_slope = lin_intercept = np.nan
+                lin_r2_val = lin_r2_test = np.nan
+                quad_a2 = quad_a1 = quad_a0 = np.nan
+                quad_r2_val = quad_r2_test = np.nan
+                iso_r2_val = iso_r2_test = np.nan
                 n_train = n_val = n_test = 0
 
-                # Train 8 : Val 1 : Test 1 -> Train으로 Loading_traffic 대비 Consumed Power 1차 회귀 학습
+                # [r13] Train 8 : Val 1 : Test 1 -> 동일한 분할로 3가지 난이도의 모델을 학습/검증한다.
+                #   1) 간단: 1차 선형회귀   2) 중간: 2차 다항회귀   3) 복잡/정확: Isotonic(단조증가) 회귀
                 if n_active >= min_samples and active_rows['Loading_traffic'].nunique() >= 2:
                     idx = rng.permutation(n_active)
                     n_train = max(int(round(n_active * 0.8)), 1)
@@ -2548,28 +2569,36 @@ class ESAnalyzerApp(AppDashboard):
 
                     x_train = active_rows['Loading_traffic'].values[train_idx]
                     y_train = active_rows['Consumed_Power'].values[train_idx]
+                    x_val = active_rows['Loading_traffic'].values[val_idx]
+                    y_val = active_rows['Consumed_Power'].values[val_idx]
+                    x_test = active_rows['Loading_traffic'].values[test_idx]
+                    y_test = active_rows['Consumed_Power'].values[test_idx]
 
                     if len(np.unique(x_train)) >= 2:
-                        slope, intercept = np.polyfit(x_train, y_train, 1)
+                        lin_slope, lin_intercept = np.polyfit(x_train, y_train, 1)
+                        if n_val: lin_r2_val = self._r2_score(y_val, lin_slope * x_val + lin_intercept)
+                        if n_test: lin_r2_test = self._r2_score(y_test, lin_slope * x_test + lin_intercept)
 
-                        def _r2(idxs):
-                            if len(idxs) == 0: return np.nan
-                            xv = active_rows['Loading_traffic'].values[idxs]
-                            yv = active_rows['Consumed_Power'].values[idxs]
-                            pred = slope * xv + intercept
-                            ss_res = np.sum((yv - pred) ** 2)
-                            ss_tot = np.sum((yv - yv.mean()) ** 2)
-                            return (1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
+                    if len(np.unique(x_train)) >= 3:
+                        quad_a2, quad_a1, quad_a0 = np.polyfit(x_train, y_train, 2)
+                        if n_val: quad_r2_val = self._r2_score(y_val, quad_a2 * x_val ** 2 + quad_a1 * x_val + quad_a0)
+                        if n_test: quad_r2_test = self._r2_score(y_test, quad_a2 * x_test ** 2 + quad_a1 * x_test + quad_a0)
 
-                        r2_val, r2_test = _r2(val_idx), _r2(test_idx)
+                    if len(np.unique(x_train)) >= 2:
+                        xs_knots, y_knots = self._pava_isotonic_fit(x_train, y_train)
+                        if n_val: iso_r2_val = self._r2_score(y_val, self._isotonic_predict(xs_knots, y_knots, x_val))
+                        if n_test: iso_r2_test = self._r2_score(y_test, self._isotonic_predict(xs_knots, y_knots, x_test))
 
-                key_tuple = keys if isinstance(keys, tuple) else (keys,)
                 record = dict(zip(ru_path_keys, key_tuple))
                 record.update({
-                    'Board Type': board_type,
+                    'Board Type': board_type, 'Cell_Count': cell_count, 'Shared': shared_label,
                     'N_OFF(PAoff)': len(off_rows), 'N_Idle': len(idle_rows), 'N_Active': n_active,
                     'N_Train': n_train, 'N_Val': n_val, 'N_Test': n_test,
-                    'Slope [W/util]': slope, 'Intercept [W]': intercept, 'R2_Val': r2_val, 'R2_Test': r2_test,
+                    'Linear Slope [W/util]': lin_slope, 'Linear Intercept [W]': lin_intercept,
+                    'Linear R2_Val': lin_r2_val, 'Linear R2_Test': lin_r2_test,
+                    'Quad a2 [W/util^2]': quad_a2, 'Quad a1 [W/util]': quad_a1, 'Quad a0 [W]': quad_a0,
+                    'Quad R2_Val': quad_r2_val, 'Quad R2_Test': quad_r2_test,
+                    'Isotonic R2_Val': iso_r2_val, 'Isotonic R2_Test': iso_r2_test,
                     'Idle Measured [W]': idle_measured, 'Idle Reference [W]': ref_idle,
                     'Idle Delta [W]': delta_idle, 'Idle Coe(meas/ref)': coe_idle,
                     'PAoff Measured [W]': paoff_measured, 'PAoff Reference [W]': ref_paoff,
@@ -2578,7 +2607,7 @@ class ESAnalyzerApp(AppDashboard):
                 ru_records.append(record)
 
                 if n_active > 0:
-                    pooled_active_points.setdefault(board_type, []).append(
+                    pooled_active_points.setdefault((board_type, shared_label), []).append(
                         (active_rows['Loading_traffic'].values, active_rows['Consumed_Power'].values)
                     )
 
@@ -2587,64 +2616,42 @@ class ESAnalyzerApp(AppDashboard):
 
             ru_df = pd.DataFrame(ru_records)
 
-            # [r13] 기울기(Slope) 분산 원인 진단용 세분화 정보 부착
-            #  - Shared: 해당 RU path를 몇 개의 Cell이 공유하는지(CM 기준. 1개면 단독)
-            #  - Total_nRB: 해당 RU path에 연결된 총 nRB(공유 시 합산된 nRB, 시간별로 거의 불변이므로 중앙값 사용)
-            ru_cell_counts = cm_by_cell.groupby(ru_path_keys, observed=True)['cell-num'].nunique().reset_index(name='Cell_Count')
-            ru_cell_counts['Shared'] = np.where(ru_cell_counts['Cell_Count'] > 1, 'Shared (공유)', 'Exclusive (단독)')
-            ru_total_nrb = ru_dataset.groupby(ru_path_keys, observed=True)['nRB_sum'].median().reset_index().rename(columns={'nRB_sum': 'Total_nRB'})
-
-            ru_df = pd.merge(ru_df, ru_cell_counts[ru_path_keys + ['Cell_Count', 'Shared']], on=ru_path_keys, how='left')
-            ru_df = pd.merge(ru_df, ru_total_nrb, on=ru_path_keys, how='left')
-            ru_df['nRB_Bucket'] = self._assign_nrb_buckets(ru_df)
-
-            hw_df = ru_df.groupby('Board Type', observed=True).agg(
+            # [r13] Board Type x 공유여부(Shared/Exclusive) 기준으로 집계 — 사용자가 이 기준의 결과만
+            # 사용할 예정이므로, 공유여부를 반영하지 않은 Board Type 단독 평균은 더 이상 산출하지 않는다.
+            hw_df = ru_df.groupby(['Board Type', 'Shared'], observed=True).agg(
                 RU_Count=('Board Type', 'count'),
-                Avg_Slope=('Slope [W/util]', 'mean'), Avg_Intercept=('Intercept [W]', 'mean'), Avg_R2_Val=('R2_Val', 'mean'),
+                Avg_Linear_Slope=('Linear Slope [W/util]', 'mean'), Avg_Linear_Intercept=('Linear Intercept [W]', 'mean'),
+                Avg_Linear_R2=('Linear R2_Val', 'mean'),
+                Avg_Quad_a2=('Quad a2 [W/util^2]', 'mean'), Avg_Quad_a1=('Quad a1 [W/util]', 'mean'), Avg_Quad_a0=('Quad a0 [W]', 'mean'),
+                Avg_Quad_R2=('Quad R2_Val', 'mean'),
+                Avg_Isotonic_R2=('Isotonic R2_Val', 'mean'),
                 Avg_Idle_Measured=('Idle Measured [W]', 'mean'), Idle_Reference=('Idle Reference [W]', 'first'),
                 Avg_Idle_Delta=('Idle Delta [W]', 'mean'), Avg_Idle_Coe=('Idle Coe(meas/ref)', 'mean'),
                 Avg_PAoff_Measured=('PAoff Measured [W]', 'mean'), PAoff_Reference=('PAoff Reference [W]', 'first'),
                 Avg_PAoff_Delta=('PAoff Delta [W]', 'mean'), Avg_PAoff_Coe=('PAoff Coe(meas/ref)', 'mean'),
             ).reset_index()
             hw_df.rename(columns={
-                'RU_Count': 'RU Count', 'Avg_Slope': 'Avg Slope [W/util]', 'Avg_Intercept': 'Avg Intercept [W]', 'Avg_R2_Val': 'Avg R2 (Val)',
+                'RU_Count': 'RU Count',
+                'Avg_Linear_Slope': 'Avg Linear Slope [W/util]', 'Avg_Linear_Intercept': 'Avg Linear Intercept [W]', 'Avg_Linear_R2': 'Avg Linear R2 (Val)',
+                'Avg_Quad_a2': 'Avg Quad a2', 'Avg_Quad_a1': 'Avg Quad a1', 'Avg_Quad_a0': 'Avg Quad a0', 'Avg_Quad_R2': 'Avg Quad R2 (Val)',
+                'Avg_Isotonic_R2': 'Avg Isotonic R2 (Val)',
                 'Avg_Idle_Measured': 'Avg Idle Measured [W]', 'Idle_Reference': 'Idle Reference [W]',
                 'Avg_Idle_Delta': 'Avg Idle Delta [W]', 'Avg_Idle_Coe': 'Avg Idle Coe(meas/ref)',
                 'Avg_PAoff_Measured': 'Avg PAoff Measured [W]', 'PAoff_Reference': 'PAoff Reference [W]',
                 'Avg_PAoff_Delta': 'Avg PAoff Delta [W]', 'Avg_PAoff_Coe': 'Avg PAoff Coe(meas/ref)',
             }, inplace=True)
 
-            # [r13] 세분화 요약 1: Board Type x 공유여부(Shared/Exclusive)
-            hw_shared_df = ru_df.groupby(['Board Type', 'Shared'], observed=True).agg(
-                RU_Count=('Board Type', 'count'), Avg_Total_nRB=('Total_nRB', 'mean'),
-                Avg_Slope=('Slope [W/util]', 'mean'), Avg_Intercept=('Intercept [W]', 'mean'), Avg_R2_Val=('R2_Val', 'mean'),
-            ).reset_index().rename(columns={
-                'RU_Count': 'RU Count', 'Avg_Total_nRB': 'Avg Total nRB',
-                'Avg_Slope': 'Avg Slope [W/util]', 'Avg_Intercept': 'Avg Intercept [W]', 'Avg_R2_Val': 'Avg R2 (Val)',
-            })
-
-            # [r13] 세분화 요약 2: Board Type x 총 nRB 구간
-            hw_nrb_df = ru_df.groupby(['Board Type', 'nRB_Bucket'], observed=True).agg(
-                RU_Count=('Board Type', 'count'), Avg_Total_nRB=('Total_nRB', 'mean'),
-                Avg_Slope=('Slope [W/util]', 'mean'), Avg_Intercept=('Intercept [W]', 'mean'), Avg_R2_Val=('R2_Val', 'mean'),
-            ).reset_index().rename(columns={
-                'RU_Count': 'RU Count', 'Avg_Total_nRB': 'Avg Total nRB',
-                'Avg_Slope': 'Avg Slope [W/util]', 'Avg_Intercept': 'Avg Intercept [W]', 'Avg_R2_Val': 'Avg R2 (Val)',
-            })
-
             self.learn_ru_df, self.learn_hw_df = ru_df, hw_df
-            self.learn_hw_shared_df, self.learn_hw_nrb_df = hw_shared_df, hw_nrb_df
 
-            precise_cols_ru = {'Slope [W/util]', 'Intercept [W]', 'Idle Coe(meas/ref)', 'PAoff Coe(meas/ref)'}
-            precise_cols_hw = {'Avg Slope [W/util]', 'Avg Intercept [W]', 'Avg Idle Coe(meas/ref)', 'Avg PAoff Coe(meas/ref)'}
-            precise_cols_breakdown = {'Avg Slope [W/util]', 'Avg Intercept [W]'}
+            precise_cols_ru = {'Linear Slope [W/util]', 'Linear Intercept [W]', 'Quad a2 [W/util^2]', 'Quad a1 [W/util]',
+                                'Idle Coe(meas/ref)', 'PAoff Coe(meas/ref)'}
+            precise_cols_hw = {'Avg Linear Slope [W/util]', 'Avg Linear Intercept [W]', 'Avg Quad a2', 'Avg Quad a1',
+                                'Avg Idle Coe(meas/ref)', 'Avg PAoff Coe(meas/ref)'}
             self._update_tree_precise(self.tree_learn_ru, ru_df, precise_cols=precise_cols_ru)
             self._update_tree_precise(self.tree_learn_hw, hw_df, precise_cols=precise_cols_hw)
-            self._update_tree_precise(self.tree_learn_hw_shared, hw_shared_df, precise_cols=precise_cols_breakdown)
-            self._update_tree_precise(self.tree_learn_hw_nrb, hw_nrb_df, precise_cols=precise_cols_breakdown)
             self._render_learning_plots(hw_df, pooled_active_points)
 
-            self.learn_status_label.config(text=f"학습 완료: RU {len(ru_df)}개 / HW(Board Type) {len(hw_df)}종", fg=self.ACCENT_GREEN)
+            self.learn_status_label.config(text=f"학습 완료: RU {len(ru_df)}개 / HW×공유여부 {len(hw_df)}종", fg=self.ACCENT_GREEN)
 
         except Exception as e:
             logging.error(f"[DEBUG] Learning Energy Curve Error: {e}", exc_info=True)
@@ -2655,11 +2662,11 @@ class ESAnalyzerApp(AppDashboard):
         for widget in self.learning_plot_frame.winfo_children(): widget.destroy()
         if hw_df.empty: return
 
-        board_types = [bt for bt in hw_df['Board Type'].astype(str)]
-        n_types = len(board_types)
+        # [r13] Board Type x 공유여부(Shared/Exclusive) 조합마다 한 행씩 시각화한다.
+        groups = list(hw_df[['Board Type', 'Shared']].astype(str).itertuples(index=False, name=None))
+        n_groups = len(groups)
 
-        # [r13] 요약 막대(1행) 아래에 nRB/공유여부 진단용 1행을 추가로 확보
-        fig, axes = plt.subplots(n_types + 2, 2, figsize=(13, 4.2 * (n_types + 2)))
+        fig, axes = plt.subplots(n_groups + 1, 2, figsize=(13, 4.6 * (n_groups + 1)))
         axes = np.atleast_2d(axes)
         self._apply_plot_style(fig, axes.flatten())
 
@@ -2671,31 +2678,42 @@ class ESAnalyzerApp(AppDashboard):
                             xytext=(0, 3 if h >= 0 else -12), textcoords="offset points",
                             ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
 
-        for i, bt in enumerate(board_types):
+        for i, (bt, shared_label) in enumerate(groups):
             ax_scatter, ax_bar = axes[i, 0], axes[i, 1]
-            row = hw_df[hw_df['Board Type'].astype(str) == bt].iloc[0]
+            row = hw_df[(hw_df['Board Type'].astype(str) == bt) & (hw_df['Shared'].astype(str) == shared_label)].iloc[0]
 
-            pts = pooled_active_points.get(bt, [])
+            pts = pooled_active_points.get((bt, shared_label), [])
             x_all = np.concatenate([p[0] for p in pts]) if pts else np.array([])
             y_all = np.concatenate([p[1] for p in pts]) if pts else np.array([])
             if x_all.size > 0:
-                ax_scatter.scatter(x_all, y_all, s=14, alpha=0.4, color=self.ACCENT_BLUE, label='RU-hour 샘플 (Active)')
-                if pd.notna(row['Avg Slope [W/util]']) and pd.notna(row['Avg Intercept [W]']):
-                    slope, intercept = row['Avg Slope [W/util]'], row['Avg Intercept [W]']
-                    x_line = np.linspace(0, x_all.max(), 50)
-                    y_line = slope * x_line + intercept
-                    ax_scatter.plot(x_line, y_line, color='#EF4444', linewidth=2, label='학습된 평균 HW Energy Curve')
-                    r2 = row['Avg R2 (Val)']
-                    r2_txt = f", R²(Val)={r2:.3f}" if pd.notna(r2) else ""
-                    formula = f"P ≈ {intercept:.3g} + {slope:.3g} × Loading_traffic{r2_txt}"
-                    ax_scatter.text(0.02, 0.98, formula, transform=ax_scatter.transAxes, fontsize=9,
-                                     ha='left', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor=self.GRID_COLOR))
+                ax_scatter.scatter(x_all, y_all, s=14, alpha=0.35, color=self.ACCENT_BLUE, label='RU-hour 샘플 (Active)', zorder=1)
+                x_line = np.linspace(0, x_all.max(), 80)
+
+                # [r13] 3종 모델 비교: 1) 간단(선형) 2) 중간(2차) 3) 복잡/정확(Isotonic, 그룹 전체 데이터로 직접 적합)
+                if pd.notna(row['Avg Linear Slope [W/util]']) and pd.notna(row['Avg Linear Intercept [W]']):
+                    slope, intercept = row['Avg Linear Slope [W/util]'], row['Avg Linear Intercept [W]']
+                    r2 = row['Avg Linear R2 (Val)']
+                    ax_scatter.plot(x_line, slope * x_line + intercept, color='#F59E0B', linewidth=2, linestyle='--',
+                                    label=f"① 간단(선형) R²(Val)={r2:.3f}" if pd.notna(r2) else "① 간단(선형)", zorder=3)
+
+                if pd.notna(row['Avg Quad a2']) and pd.notna(row['Avg Quad a1']) and pd.notna(row['Avg Quad a0']):
+                    a2, a1, a0 = row['Avg Quad a2'], row['Avg Quad a1'], row['Avg Quad a0']
+                    r2 = row['Avg Quad R2 (Val)']
+                    ax_scatter.plot(x_line, a2 * x_line ** 2 + a1 * x_line + a0, color='#8B5CF6', linewidth=2, linestyle='-.',
+                                    label=f"② 중간(2차) R²(Val)={r2:.3f}" if pd.notna(r2) else "② 중간(2차)", zorder=3)
+
+                if x_all.size >= 2:
+                    xs_knots, y_knots = self._pava_isotonic_fit(x_all, y_all)
+                    r2 = row['Avg Isotonic R2 (Val)']
+                    ax_scatter.plot(xs_knots, y_knots, color='#EF4444', linewidth=2.2,
+                                    label=f"③ 복잡/정확(Isotonic) R²(Val)={r2:.3f}" if pd.notna(r2) else "③ 복잡/정확(Isotonic)", zorder=4)
+
             if pd.notna(row['Avg Idle Measured [W]']):
-                ax_scatter.axhline(row['Avg Idle Measured [W]'], color=self.ACCENT_GREEN, linestyle='--', linewidth=1.5,
-                                    label=f"실측 Idle 평균={row['Avg Idle Measured [W]']:.2f}W")
-            ax_scatter.set_title(f'[{bt}] Loading_traffic vs Consumed Power (Energy Curve 모델)', fontweight='bold')
+                ax_scatter.axhline(row['Avg Idle Measured [W]'], color=self.ACCENT_GREEN, linestyle=':', linewidth=1.5,
+                                    label=f"실측 Idle 평균={row['Avg Idle Measured [W]']:.2f}W", zorder=2)
+            ax_scatter.set_title(f'[{bt} · {shared_label}] Loading_traffic vs Consumed Power — 3종 모델 비교', fontweight='bold')
             ax_scatter.set_xlabel('Loading_traffic (=ΣUsedRB_t/ΣnRB)'); ax_scatter.set_ylabel('Consumed Power [W]')
-            ax_scatter.legend(fontsize=8, loc='lower right')
+            ax_scatter.legend(fontsize=7.5, loc='lower right')
 
             labels, vals, colors = [], [], []
             for lbl, v, c in [('Idle\nRef', row['Idle Reference [W]'], '#94A3B8'), ('Idle\nMeasured', row['Avg Idle Measured [W]'], '#3B82F6'),
@@ -2704,63 +2722,32 @@ class ESAnalyzerApp(AppDashboard):
             if vals:
                 bars = ax_bar.bar(labels, vals, color=colors, edgecolor='black', alpha=0.9)
                 _bar_labels(ax_bar, bars, fmt="{:.2f}W")
-                ax_bar.set_title(f'[{bt}] Idle/PA off 소비전력 예측값: Reference vs 실측 보정값', fontweight='bold')
+                ax_bar.set_title(f'[{bt} · {shared_label}] Idle/PA off 소비전력 예측값: Reference vs 실측 보정값', fontweight='bold')
                 ax_bar.set_ylabel('Power [W]')
 
-        ax_slope, ax_delta = axes[n_types, 0], axes[n_types, 1]
-        bars_slope = ax_slope.bar(hw_df['Board Type'].astype(str), hw_df['Avg Slope [W/util]'], color='#8B5CF6', edgecolor='black', alpha=0.85)
-        _bar_labels(ax_slope, bars_slope, fmt="{:.3g}")
-        ax_slope.set_title('Board Type별 평균 Loading-Power 기울기 (Energy Curve 기울기)', fontweight='bold')
-        ax_slope.set_ylabel('Slope [W/util]')
-        ax_slope.tick_params(axis='x', rotation=30)
-
-        width = 0.35
+        # 하단 요약: (a) 그룹별 3종 모델 R²(Val) 비교, (b) 그룹별 Idle/PA off 보정폭
+        ax_r2, ax_delta = axes[n_groups, 0], axes[n_groups, 1]
+        group_labels = [f"{bt}\n{sh}" for bt, sh in groups]
         x_pos = np.arange(len(hw_df))
-        bars_idle = ax_delta.bar(x_pos - width / 2, hw_df['Avg Idle Delta [W]'], width, label='Idle Delta (실측-Ref)', color=self.ACCENT_GREEN, edgecolor='black', alpha=0.85)
-        bars_paoff = ax_delta.bar(x_pos + width / 2, hw_df['Avg PAoff Delta [W]'], width, label='PAoff Delta (실측-Ref)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        width = 0.25
+        bars_lin = ax_r2.bar(x_pos - width, hw_df['Avg Linear R2 (Val)'], width, label='① 간단(선형)', color='#F59E0B', edgecolor='black', alpha=0.85)
+        bars_quad = ax_r2.bar(x_pos, hw_df['Avg Quad R2 (Val)'], width, label='② 중간(2차)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        bars_iso = ax_r2.bar(x_pos + width, hw_df['Avg Isotonic R2 (Val)'], width, label='③ 복잡/정확(Isotonic)', color='#EF4444', edgecolor='black', alpha=0.85)
+        _bar_labels(ax_r2, bars_lin, fmt="{:.2f}"); _bar_labels(ax_r2, bars_quad, fmt="{:.2f}"); _bar_labels(ax_r2, bars_iso, fmt="{:.2f}")
+        ax_r2.set_xticks(x_pos); ax_r2.set_xticklabels(group_labels, rotation=0, fontsize=8)
+        ax_r2.set_title('그룹별 3종 모델 정확도 비교 (R², Validation)', fontweight='bold')
+        ax_r2.set_ylabel('R² (Val)')
+        ax_r2.legend(fontsize=8)
+
+        width2 = 0.35
+        bars_idle = ax_delta.bar(x_pos - width2 / 2, hw_df['Avg Idle Delta [W]'], width2, label='Idle Delta (실측-Ref)', color=self.ACCENT_GREEN, edgecolor='black', alpha=0.85)
+        bars_paoff = ax_delta.bar(x_pos + width2 / 2, hw_df['Avg PAoff Delta [W]'], width2, label='PAoff Delta (실측-Ref)', color='#8B5CF6', edgecolor='black', alpha=0.85)
         _bar_labels(ax_delta, bars_idle, fmt="{:+.2f}"); _bar_labels(ax_delta, bars_paoff, fmt="{:+.2f}")
         ax_delta.axhline(0, color='black', linewidth=0.8)
-        ax_delta.set_xticks(x_pos); ax_delta.set_xticklabels(hw_df['Board Type'].astype(str), rotation=30)
-        ax_delta.set_title('Board Type별 Idle/PA off 보정폭 (실측 - Reference)', fontweight='bold')
+        ax_delta.set_xticks(x_pos); ax_delta.set_xticklabels(group_labels, rotation=0, fontsize=8)
+        ax_delta.set_title('그룹별 Idle/PA off 보정폭 (실측 - Reference)', fontweight='bold')
         ax_delta.set_ylabel('Delta [W]')
         ax_delta.legend(fontsize=9)
-
-        # [r13] 기울기 분산 진단: RU별 총 nRB vs 기울기(공유여부/HW 구분) + Board Type별 공유 vs 단독 평균 기울기
-        ax_nrb, ax_shared = axes[n_types + 1, 0], axes[n_types + 1, 1]
-        ru_df_all = self.learn_ru_df
-
-        if not ru_df_all.empty and 'Total_nRB' in ru_df_all.columns:
-            bt_list = list(ru_df_all['Board Type'].astype(str).unique())
-            cmap = self._get_qual_cmap('tab10', max(len(bt_list), 1))
-            marker_map = {'Shared (공유)': '^', 'Exclusive (단독)': 'o'}
-            for bt_idx, bt in enumerate(bt_list):
-                sub = ru_df_all[ru_df_all['Board Type'].astype(str) == bt]
-                for shared_label, marker in marker_map.items():
-                    sub2 = sub[sub['Shared'] == shared_label]
-                    if sub2.empty: continue
-                    ax_nrb.scatter(sub2['Total_nRB'], sub2['Slope [W/util]'], color=cmap(bt_idx), marker=marker,
-                                   s=55, alpha=0.85, edgecolor='black', linewidth=0.5, label=f'{bt} - {shared_label}')
-            ax_nrb.set_title('RU별 총 nRB vs 기울기(Slope) — 공유여부 · HW별 (기울기 분산 원인 진단)', fontweight='bold')
-            ax_nrb.set_xlabel('Total nRB (RU path에 연결된 총 자원량, 공유 시 합산)'); ax_nrb.set_ylabel('Slope [W/util]')
-            ax_nrb.legend(fontsize=7, loc='best')
-        else:
-            ax_nrb.set_title('RU별 총 nRB vs 기울기 — 데이터 없음', fontweight='bold')
-
-        hw_shared_df_all = self.learn_hw_shared_df
-        if not hw_shared_df_all.empty:
-            pivot = hw_shared_df_all.pivot(index='Board Type', columns='Shared', values='Avg Slope [W/util]')
-            x_pos2 = np.arange(len(pivot))
-            n_series = max(len(pivot.columns), 1)
-            bw = 0.8 / n_series
-            for j, col in enumerate(pivot.columns):
-                bars = ax_shared.bar(x_pos2 + (j - (n_series - 1) / 2) * bw, pivot[col].values, bw, label=str(col), edgecolor='black', alpha=0.85)
-                _bar_labels(ax_shared, bars, fmt="{:.3g}")
-            ax_shared.set_xticks(x_pos2); ax_shared.set_xticklabels(pivot.index.astype(str), rotation=30)
-            ax_shared.set_title('Board Type별 공유(Shared) vs 단독(Exclusive) 평균 기울기', fontweight='bold')
-            ax_shared.set_ylabel('Slope [W/util]')
-            ax_shared.legend(fontsize=8)
-        else:
-            ax_shared.set_title('공유 vs 단독 비교 — 데이터 없음', fontweight='bold')
 
         plt.tight_layout()
         canvas = FigureCanvasTkAgg(fig, master=self.learning_plot_frame)
