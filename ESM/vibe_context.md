@@ -7,6 +7,7 @@
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
   * Efficiency: Energy Efficiency (EE) = (AirMacDLByte + AirMacULByte) / Consumed [Wh]
+* **버전 파일 관리**: `ESM/esm_r11.py`(안정 버전, 더 이상 수정하지 않음)와 `ESM/esm_r12.py`(최신 개발 버전) 두 파일을 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r12.py`를 복제해 `esm_r13.py`로 이어간다.
 
 ## 2. 핵심 개발 원칙 (Core Rules & Directives)
 1. **아키텍처 보존**: 객체지향형 5단계 상속 구조(`AppBase` -> `AppEditors` -> `AppTraffic` -> `AppDashboard` -> `ESAnalyzerApp`)를 절대 훼손하지 않고 확장한다. (※ 실제 코드 상으로는 `AppTraffic`이 별도 클래스로 분리되어 있지 않고 `ESAnalyzerApp`에 트래픽 패턴 뷰어 메서드가 포함된 4단계 상속: `AppBase` -> `AppEditors` -> `AppDashboard` -> `ESAnalyzerApp` 구조로 실동작 중. 아래 3항 참조.)
@@ -64,12 +65,39 @@
   * **부수적으로 발견/수정한 버그**: `_parse_energy_stat`(現 `_parse_energy_stat_raw`)의 컬럼 매핑에서 `cl.startswith('time')` 조건이 `TIMESTAMP`(소문자 `timestamp`도 `time`으로 시작)까지 잘못 가로채어 `Time` 컬럼으로 바꿔버리는 바람에, 실제 컬럼명이 `TIMESTAMP` 하나로 합쳐진 원본 데이터에서는 날짜/시간 파싱이 실패하던 잠재 버그를 발견. `timestamp`/`datetime`은 먼저 `TIMESTAMP`로 매핑하고, `Time`은 정확히 `time`인 경우에만 매핑하도록 수정(`_parse_energy_stat_raw`, 신규 `_parse_cell_unavail_stat` 양쪽 모두 적용).
   * **검증**: 이 서버 세션에는 pandas/tkinter가 설치되어 있지 않아 실제 GUI 구동 테스트는 불가. 대신 임시 가상환경에 pandas/numpy를 설치하고, 실제 코드와 동일한 컬럼 정규화·병합·회귀 로직을 재현한 스크립트를 작성해 알려진 정답값(true slope/intercept/off-saving)을 가진 합성 데이터로 End-to-End 검증 완료 — 추정된 기울기·절편·OFF 절감량이 시뮬레이션에 설정한 참값과 근사 일치함을 확인함. (실제 GUI 동작 및 실데이터 컬럼명 호환성은 로컬 PC에서 추가 확인 필요.)
 
+* **[v2.0 / esm_r12.py] (2026-07-01) Learning Energy Curve 전면 개편 — Idle/PA off 레퍼런스 보정 + 드래그 앤 드롭 입력**
+  * **파일**: `ESM/esm_r11.py`는 그대로 보존(수정 안 함), 이번 변경은 새로 만든 `ESM/esm_r12.py`에만 반영.
+  * **입력 단순화 + 드래그 앤 드롭**: 기존 r11의 3개 파일(Traffic/Energy Stat/Cell Unavailable) 기반 설계를 폐기하고, **CM(Cell-RU Mapping) + 통합 학습데이터 CSV 1개**로 단순화. 두 입력 모두 Learning Energy Curve 탭 안의 Entry 위젯에 파일을 직접 드래그 앤 드롭할 수 있도록 `AppBase._bind_widget_drop()` 헬퍼를 추가(tkinterdnd2 기반, 위젯 단위 `drop_target_register`). CM 파일을 드롭하면 `_process_cm_ciq_data()`가 자동 실행됨. tkinterdnd2 미설치 환경에서는 기존 '찾기' 버튼으로 자동 대체.
+  * **통합 학습데이터 스키마**: 한 행 = 한 Cell(`Ne unique id` + `Cnum`) × 시간. 컬럼: `Cellunavailabletimedown s`(초), `UsedRB`(총 사용 자원량), `UsedRB_t`(데이터 전송에 사용된 자원량), `nRB`(Cell에 할당된 총 자원량), `Consumed Power`. `_parse_learning_traindata()` 신규 파서로 처리.
+  * **RU 단위 집계 로직** (요청하신 시나리오 그대로 구현):
+    1. CM 정보로 Cell(`Cnum`) → RU path(`Bid`/`RuPort`/`Cascade`) 식별.
+    2. 동일 `Ne unique id` 내에서 같은 RU path를 공유하는 여러 Cell의 값을 RU 단위로 통합: **Consumed Power·Cell off(초)는 산술 평균**, **Loading_traffic = ΣUsedRB_t / ΣnRB**, **Loading_total = ΣUsedRB / ΣnRB** (모두 셀 간 비율의 합으로 계산).
+    3. Cell off 판정(Down 비율 ≥ 임계값, 기본 0.9)으로 RU-시간을 `PA off 구간`(OFF)과 `ON 구간`으로 분리하고, ON 구간을 다시 `Loading_traffic ≈ 0`(Idle 구간)과 `Loading_traffic > 0`(Active 구간)으로 세분.
+  * **3가지 학습/보정 결과** (RU 단위로 개별 산출 후, 같은 Board Type의 RU끼리 평균 → "해당 HW의 평균 성능"):
+    1. **Idle 보정**: Idle 구간 Consumed Power 실측 평균값을 산출하고, RU/MMU Spec 에디터(RU HW DB)의 `Idle` 레퍼런스(Lab test)와 비교해 Delta(실측-Ref) 및 보정 계수(실측/Ref)를 계산.
+    2. **PA off 보정**: OFF 구간 Consumed Power 실측 평균값을 RU HW DB의 `PA off` 레퍼런스와 비교해 동일하게 Delta/보정 계수 산출.
+    3. **Loading에 따른 소비전력 모델링**: Active 구간 데이터를 Train 8 : Val 1 : Test 1로 분할(seed 고정)하여 `Consumed Power = 기울기 × Loading_traffic + 절편` 1차 회귀 학습, R²(Val/Test)로 검증.
+  * **치명적 버그 수정 (r11에도 있던 문제, r12에서 최초로 발견/수정)**: r11의 Learning Energy Curve는 RU를 `ru-board-id/ru-port-id/ru-cascade-id`만으로 식별하고 **`eNB_ID`(Ne unique id)를 키에서 빠뜨렸음**. Bid/RuPort/Cascade 번호는 eNB(사이트) 내부에서만 유일하므로, 서로 다른 사이트의 RU가 우연히 같은 번호 조합을 쓰면 서로 다른 물리 RU가 하나로 잘못 합쳐질 위험이 있었음. r12에서는 `ru_path_keys = ['eNB_ID'] + [ru-board-id, ru-port-id, ru-cascade-id]`로 전 구간(CM 매핑, RU 단위 집계, 회귀 학습 loop)을 통일해 수정. (r11 파일 자체는 과거 버전 보존 차원에서 수정하지 않음 — 사용법에서 r11의 Learning Energy Curve 탭은 이 문제를 인지하고 사용할 것.)
+  * **시각화 개편**: Board Type별로 (a) Loading_traffic-Consumed Power 산점도 + 평균 회귀선 + 실측 Idle 평균선, (b) Idle/PA off Reference vs 실측 보정값 막대 비교를 표시하고, 하단 요약으로 (c) Board Type별 평균 기울기 막대, (d) Board Type별 Idle/PA off 보정폭(Delta) 막대를 추가.
+  * **활용처**: 여기서 학습된 Idle/PA off 보정값과 Loading 기울기는 Energy Dashboard의 절감 예측 정확도를 높이는 데 사용할 수 있음(사용자 요청사항, 다음 라운드에 Energy Dashboard 연동 검토 필요).
+  * **검증**: 이번에도 이 서버 세션엔 pandas/tkinter가 없어 GUI 구동은 불가. 임시 가상환경에 pandas/numpy를 설치하고 실제 코드와 동일한 로직을 재현한 스크립트로, 두 개의 서로 다른 eNB가 **일부러 동일한 Bid/RuPort/Cascade 번호(1/1/0)를 사용**하도록 합성 데이터를 만들어 검증 — RU가 올바르게 분리되어 유지됨을 확인(위 eNB_ID 버그 수정 검증)하고, 각 RU의 학습된 Slope/Intercept/Idle Measured/Idle Delta/PAoff Measured/PAoff Delta 값이 시뮬레이션에 설정한 참값과 근사 일치함을 확인함.
+
+* **[v2.1 / esm_r12.py] (2026-07-01) Learning Energy Curve 결과 다운로드 + 시각화에 예측값/모델식 명시**
+  * **CSV 다운로드 버튼 추가**: 학습 실행 버튼 아래에 "💾 RU 단위 상세 결과 CSV 다운로드"와 "💾 HW(Board Type) 요약 CSV 다운로드" 버튼을 추가(`_download_learn_result`). `self.learn_ru_df`/`self.learn_hw_df`를 그대로 CSV로 저장하며, 학습 실행 전에는 경고 메시지 표시.
+  * **시각화에 예측값/모델식 명시**: 기존엔 그래프만 있고 수치가 눈에 잘 안 보였음 → 개선:
+    - Loading_traffic vs Consumed Power 산점도에 학습된 Energy Curve 수식을 텍스트 박스로 직접 표시: `P ≈ {절편} + {기울기} × Loading_traffic, R²(Val)={값}`.
+    - Idle/PA off Reference vs 실측 보정값 막대 위에 실제 수치(W) 라벨 표시.
+    - 하단 요약의 Board Type별 평균 기울기 막대, Idle/PA off 보정폭(Delta) 막대에도 수치 라벨 표시(양수/음수 모두 라벨 위치 자동 조정).
+  * **Energy Dashboard 연동은 보류**: 사용자 확인 결과, 학습 결과의 유의미성(실데이터 검증)을 먼저 확인한 뒤 적용 방법을 결정하기로 함 — 이번 라운드에는 연동하지 않음.
+  * **검증**: matplotlib을 설치한 임시 가상환경에서 Agg(헤드리스) 백엔드로 신규 라벨/수식 텍스트 렌더링 로직만 별도 재현해 실행 — NaN 값이 섞인 Board Type(레퍼런스 데이터 일부 누락 케이스), 양/음수가 혼재된 Delta 막대 등 엣지 케이스에서도 예외 없이 렌더링됨을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v1.5 - Learning Energy Curve 탭 신규 구현 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.1(`esm_r12.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드 + 시각화 수치/모델식 라벨링 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
-  1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 이번 세션엔 스킵 요청, 추후 처리 방법 논의 필요.
-  2. 실제 Cell Unavailable Time CSV의 실제 컬럼명(예: `cellunavailableTimeDown`, `NE unique id`, `Date`/`Time` 등)이 파서의 컬럼 매핑 규칙과 맞는지 실데이터로 확인 필요.
-  3. GUI 환경에서 실제 파일로 "학습 실행" 버튼 동작 확인 (로컬 PC 필요).
+  1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
+  2. 실제 통합 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_traindata()`의 매핑 규칙과 맞는지 실데이터로 확인 필요.
+  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
+  4. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
 ---
