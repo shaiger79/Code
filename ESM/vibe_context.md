@@ -82,13 +82,22 @@
   * **활용처**: 여기서 학습된 Idle/PA off 보정값과 Loading 기울기는 Energy Dashboard의 절감 예측 정확도를 높이는 데 사용할 수 있음(사용자 요청사항, 다음 라운드에 Energy Dashboard 연동 검토 필요).
   * **검증**: 이번에도 이 서버 세션엔 pandas/tkinter가 없어 GUI 구동은 불가. 임시 가상환경에 pandas/numpy를 설치하고 실제 코드와 동일한 로직을 재현한 스크립트로, 두 개의 서로 다른 eNB가 **일부러 동일한 Bid/RuPort/Cascade 번호(1/1/0)를 사용**하도록 합성 데이터를 만들어 검증 — RU가 올바르게 분리되어 유지됨을 확인(위 eNB_ID 버그 수정 검증)하고, 각 RU의 학습된 Slope/Intercept/Idle Measured/Idle Delta/PAoff Measured/PAoff Delta 값이 시뮬레이션에 설정한 참값과 근사 일치함을 확인함.
 
+* **[v2.1 / esm_r12.py] (2026-07-01) Learning Energy Curve 결과 다운로드 + 시각화에 예측값/모델식 명시**
+  * **CSV 다운로드 버튼 추가**: 학습 실행 버튼 아래에 "💾 RU 단위 상세 결과 CSV 다운로드"와 "💾 HW(Board Type) 요약 CSV 다운로드" 버튼을 추가(`_download_learn_result`). `self.learn_ru_df`/`self.learn_hw_df`를 그대로 CSV로 저장하며, 학습 실행 전에는 경고 메시지 표시.
+  * **시각화에 예측값/모델식 명시**: 기존엔 그래프만 있고 수치가 눈에 잘 안 보였음 → 개선:
+    - Loading_traffic vs Consumed Power 산점도에 학습된 Energy Curve 수식을 텍스트 박스로 직접 표시: `P ≈ {절편} + {기울기} × Loading_traffic, R²(Val)={값}`.
+    - Idle/PA off Reference vs 실측 보정값 막대 위에 실제 수치(W) 라벨 표시.
+    - 하단 요약의 Board Type별 평균 기울기 막대, Idle/PA off 보정폭(Delta) 막대에도 수치 라벨 표시(양수/음수 모두 라벨 위치 자동 조정).
+  * **Energy Dashboard 연동은 보류**: 사용자 확인 결과, 학습 결과의 유의미성(실데이터 검증)을 먼저 확인한 뒤 적용 방법을 결정하기로 함 — 이번 라운드에는 연동하지 않음.
+  * **검증**: matplotlib을 설치한 임시 가상환경에서 Agg(헤드리스) 백엔드로 신규 라벨/수식 텍스트 렌더링 로직만 별도 재현해 실행 — NaN 값이 섞인 Board Type(레퍼런스 데이터 일부 누락 케이스), 양/음수가 혼재된 Delta 막대 등 엣지 케이스에서도 예외 없이 렌더링됨을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.0(`esm_r12.py`) - Learning Energy Curve 전면 개편 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.1(`esm_r12.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드 + 시각화 수치/모델식 라벨링 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 통합 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_traindata()`의 매핑 규칙과 맞는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
-  4. 학습된 Idle/PA off 보정값·Loading 기울기를 Energy Dashboard의 절감 예측(`_calc_all_savings` 등)에 실제로 반영할지 여부 — 사용자 확인 후 다음 라운드에 진행.
+  4. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
 ---

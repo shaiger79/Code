@@ -2147,6 +2147,13 @@ class ESAnalyzerApp(AppDashboard):
         self.learn_status_label = tk.Label(row3, text="Ready...", fg="#6B7280", bg=self.BG_COLOR)
         self.learn_status_label.pack(side=tk.LEFT, padx=15)
 
+        row4 = ttk.Frame(ctrl_frame)
+        row4.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(row4, text="💾 RU 단위 상세 결과 CSV 다운로드",
+                   command=lambda: self._download_learn_result(self.learn_ru_df, "LearningEnergyCurve_RU_Detail.csv")).pack(side=tk.LEFT, padx=5)
+        ttk.Button(row4, text="💾 HW(Board Type) 요약 CSV 다운로드",
+                   command=lambda: self._download_learn_result(self.learn_hw_df, "LearningEnergyCurve_HW_Summary.csv")).pack(side=tk.LEFT, padx=5)
+
         result_notebook = ttk.Notebook(self.frame_learning)
         result_notebook.pack(fill=tk.BOTH, expand=True, pady=10)
 
@@ -2170,6 +2177,14 @@ class ESAnalyzerApp(AppDashboard):
         plot_canvas.configure(yscrollcommand=plot_scroll.set)
         plot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         plot_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _download_learn_result(self, df, default_name):
+        if df is None or df.empty:
+            return messagebox.showwarning("경고", "먼저 '학습 실행'을 눌러 결과를 생성해주세요.")
+        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile=default_name)
+        if filepath:
+            df.to_csv(filepath, index=False)
+            messagebox.showinfo("저장 완료", f"결과가 저장되었습니다:\n{filepath}")
 
     def _parse_learning_traindata(self):
         """[r12] 통합 학습 데이터 CSV 파서.
@@ -2414,6 +2429,14 @@ class ESAnalyzerApp(AppDashboard):
         axes = np.atleast_2d(axes)
         self._apply_plot_style(fig, axes.flatten())
 
+        def _bar_labels(ax, bars, fmt="{:.2f}"):
+            for b in bars:
+                h = b.get_height()
+                if pd.isna(h): continue
+                ax.annotate(fmt.format(h), xy=(b.get_x() + b.get_width() / 2, h),
+                            xytext=(0, 3 if h >= 0 else -12), textcoords="offset points",
+                            ha='center', va='bottom' if h >= 0 else 'top', fontsize=8)
+
         for i, bt in enumerate(board_types):
             ax_scatter, ax_bar = axes[i, 0], axes[i, 1]
             row = hw_df[hw_df['Board Type'].astype(str) == bt].iloc[0]
@@ -2427,33 +2450,41 @@ class ESAnalyzerApp(AppDashboard):
                     slope, intercept = row['Avg Slope [W/util]'], row['Avg Intercept [W]']
                     x_line = np.linspace(0, x_all.max(), 50)
                     y_line = slope * x_line + intercept
-                    ax_scatter.plot(x_line, y_line, color='#EF4444', linewidth=2, label=f'평균 HW 곡선 (기울기={slope:.3g})')
+                    ax_scatter.plot(x_line, y_line, color='#EF4444', linewidth=2, label='학습된 평균 HW Energy Curve')
+                    r2 = row['Avg R2 (Val)']
+                    r2_txt = f", R²(Val)={r2:.3f}" if pd.notna(r2) else ""
+                    formula = f"P ≈ {intercept:.3g} + {slope:.3g} × Loading_traffic{r2_txt}"
+                    ax_scatter.text(0.02, 0.98, formula, transform=ax_scatter.transAxes, fontsize=9,
+                                     ha='left', va='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor=self.GRID_COLOR))
             if pd.notna(row['Avg Idle Measured [W]']):
                 ax_scatter.axhline(row['Avg Idle Measured [W]'], color=self.ACCENT_GREEN, linestyle='--', linewidth=1.5,
                                     label=f"실측 Idle 평균={row['Avg Idle Measured [W]']:.2f}W")
-            ax_scatter.set_title(f'[{bt}] Loading_traffic vs Consumed Power', fontweight='bold')
+            ax_scatter.set_title(f'[{bt}] Loading_traffic vs Consumed Power (Energy Curve 모델)', fontweight='bold')
             ax_scatter.set_xlabel('Loading_traffic (=ΣUsedRB_t/ΣnRB)'); ax_scatter.set_ylabel('Consumed Power [W]')
-            ax_scatter.legend(fontsize=8)
+            ax_scatter.legend(fontsize=8, loc='lower right')
 
             labels, vals, colors = [], [], []
             for lbl, v, c in [('Idle\nRef', row['Idle Reference [W]'], '#94A3B8'), ('Idle\nMeasured', row['Avg Idle Measured [W]'], '#3B82F6'),
                                ('PAoff\nRef', row['PAoff Reference [W]'], '#CBD5E1'), ('PAoff\nMeasured', row['Avg PAoff Measured [W]'], '#8B5CF6')]:
                 if pd.notna(v): labels.append(lbl); vals.append(v); colors.append(c)
             if vals:
-                ax_bar.bar(labels, vals, color=colors, edgecolor='black', alpha=0.9)
-                ax_bar.set_title(f'[{bt}] Idle/PA off: Reference vs 실측 보정값', fontweight='bold')
+                bars = ax_bar.bar(labels, vals, color=colors, edgecolor='black', alpha=0.9)
+                _bar_labels(ax_bar, bars, fmt="{:.2f}W")
+                ax_bar.set_title(f'[{bt}] Idle/PA off 소비전력 예측값: Reference vs 실측 보정값', fontweight='bold')
                 ax_bar.set_ylabel('Power [W]')
 
         ax_slope, ax_delta = axes[n_types, 0], axes[n_types, 1]
-        ax_slope.bar(hw_df['Board Type'].astype(str), hw_df['Avg Slope [W/util]'], color='#8B5CF6', edgecolor='black', alpha=0.85)
-        ax_slope.set_title('Board Type별 평균 Loading-Power 기울기', fontweight='bold')
+        bars_slope = ax_slope.bar(hw_df['Board Type'].astype(str), hw_df['Avg Slope [W/util]'], color='#8B5CF6', edgecolor='black', alpha=0.85)
+        _bar_labels(ax_slope, bars_slope, fmt="{:.3g}")
+        ax_slope.set_title('Board Type별 평균 Loading-Power 기울기 (Energy Curve 기울기)', fontweight='bold')
         ax_slope.set_ylabel('Slope [W/util]')
         ax_slope.tick_params(axis='x', rotation=30)
 
         width = 0.35
         x_pos = np.arange(len(hw_df))
-        ax_delta.bar(x_pos - width / 2, hw_df['Avg Idle Delta [W]'], width, label='Idle Delta (실측-Ref)', color=self.ACCENT_GREEN, edgecolor='black', alpha=0.85)
-        ax_delta.bar(x_pos + width / 2, hw_df['Avg PAoff Delta [W]'], width, label='PAoff Delta (실측-Ref)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        bars_idle = ax_delta.bar(x_pos - width / 2, hw_df['Avg Idle Delta [W]'], width, label='Idle Delta (실측-Ref)', color=self.ACCENT_GREEN, edgecolor='black', alpha=0.85)
+        bars_paoff = ax_delta.bar(x_pos + width / 2, hw_df['Avg PAoff Delta [W]'], width, label='PAoff Delta (실측-Ref)', color='#8B5CF6', edgecolor='black', alpha=0.85)
+        _bar_labels(ax_delta, bars_idle, fmt="{:+.2f}"); _bar_labels(ax_delta, bars_paoff, fmt="{:+.2f}")
         ax_delta.axhline(0, color='black', linewidth=0.8)
         ax_delta.set_xticks(x_pos); ax_delta.set_xticklabels(hw_df['Board Type'].astype(str), rotation=30)
         ax_delta.set_title('Board Type별 Idle/PA off 보정폭 (실측 - Reference)', fontweight='bold')
