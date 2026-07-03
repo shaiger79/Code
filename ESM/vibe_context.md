@@ -7,7 +7,7 @@
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
   * Efficiency: Energy Efficiency (EE) = (AirMacDLByte + AirMacULByte) / Consumed [Wh]
-* **버전 파일 관리**: `ESM/esm_r11.py`(안정 버전, 더 이상 수정하지 않음)와 `ESM/esm_r12.py`(최신 개발 버전) 두 파일을 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r12.py`를 복제해 `esm_r13.py`로 이어간다.
+* **버전 파일 관리**: `ESM/esm_r11.py`, `ESM/esm_r12.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r13.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r13.py`를 복제해 `esm_r14.py`로 이어간다.
 
 ## 2. 핵심 개발 원칙 (Core Rules & Directives)
 1. **아키텍처 보존**: 객체지향형 5단계 상속 구조(`AppBase` -> `AppEditors` -> `AppTraffic` -> `AppDashboard` -> `ESAnalyzerApp`)를 절대 훼손하지 않고 확장한다. (※ 실제 코드 상으로는 `AppTraffic`이 별도 클래스로 분리되어 있지 않고 `ESAnalyzerApp`에 트래픽 패턴 뷰어 메서드가 포함된 4단계 상속: `AppBase` -> `AppEditors` -> `AppDashboard` -> `ESAnalyzerApp` 구조로 실동작 중. 아래 3항 참조.)
@@ -101,13 +101,23 @@
   * **PA-shared-cell 기반 RU path 보정 (신규 `_resolve_pa_shared_ru_paths`)**: CM에 있는 `PA-shared-cell` 컬럼은 해당 Cell이 다른 어떤 Cell과 PA(RU path)를 공유하는지 알려줌(`-1`이면 공유하는 Cell 없음). Union-Find로 PA를 공유하는 Cell들을 하나의 그룹으로 묶고, 그룹 내에서 Bid/RuPort/Cascade가 채워진 값을 대표값으로 삼아 그룹 전체에 적용 — 이렇게 하면 자기 자신의 Bid/RuPort/Cascade가 비어 있는 Cell(다른 Cell과 PA를 공유하기 때문에 별도 RU path가 없는 경우)도 올바른 RU path로 귀속되어 Loading 집계에서 누락되지 않음.
   * **검증**: 임시 가상환경에서, 한 eNB 안에 Cell 2개(20010은 자체 Bid/RuPort/Cascade=(5,1,0) 보유, 20011은 CM에 Bid/RuPort/Cascade가 비어 있고 `PA-shared-cell=20010`으로 20010과 공유) 시나리오를 합성 데이터로 만들어 검증 — PA-shared-cell 해석 후 두 Cell이 동일 RU path로 정확히 병합됨을 assert로 확인했고, Cell 파일(Loading/Cell off)과 RU 파일(Consumed Power)이 올바르게 merge되어 학습된 Slope/Intercept/Idle/PAoff 값이 설정한 참값과 근사 일치함을 확인함.
 
+* **[v2.3 / esm_r13.py] (2026-07-03) 기울기(Slope) 분산 원인 진단용 세분화 분석 추가**
+  * **배경**: 사용자가 실데이터로 학습을 돌려보니 같은 Board Type(RU HW) 안에서도 기울기가 RU마다 크게 갈리는 경우가 많다고 확인 — 원인 후보 2가지를 제시하고, 아직 어느 쪽이 맞는지 결론이 안 나서 우선 둘 다 분석/시각화해 비교할 수 있게 해달라는 요청.
+  * **1) RU path 공유(Shared) vs 단독(Exclusive) 비교**: CM(`cm_by_cell`)에서 RU path(eNB_ID+Bid/RuPort/Cascade)별로 매핑된 Cell 개수를 세어, 2개 이상이면 `Shared (공유)`, 1개면 `Exclusive (단독)`으로 분류. Board Type × Shared 조합으로 그룹핑해 평균 기울기/절편/R² 등을 별도 집계(`hw_shared_df`, 신규 트리뷰 탭 "[r13] 공유여부별 비교").
+  * **2) RU path 총 nRB 구간별 비교**: RU path에 실제 연결된 총 nRB(공유 시 여러 Cell의 nRB 합산값, `ru_dataset`의 `nRB_sum` 중앙값)를 RU별로 산출(`Total_nRB`)하고, Board Type별로 분위수 기반 구간(최대 3구간, 구간을 나눌 만큼 값이 다양하지 않으면 'All' 하나로)으로 나누어 평균 기울기 등을 집계(`hw_nrb_df`, 신규 `_assign_nrb_buckets()`, 신규 트리뷰 탭 "[r13] nRB 구간별 비교").
+  * **시각화 추가**: 기존 Board Type별 요약 막대 아래에 한 행을 추가 — (a) RU별 (Total_nRB, Slope) 산점도(Board Type별 색상, 공유여부별 마커 모양 구분)로 기울기 분산이 nRB 규모나 공유여부와 관련 있는지 한눈에 확인 가능, (b) Board Type별 공유 vs 단독 평균 기울기 그룹 막대.
+  * **결과물 다운로드**: "💾 공유여부별 비교 CSV 다운로드", "💾 nRB 구간별 비교 CSV 다운로드" 버튼 추가.
+  * **검증**: 임시 가상환경에서, 같은 Board Type(TypeD)에 RU 3개(A: 단독·nRB=100·true slope=20, B: 단독·nRB=100·true slope=20, C: 2개 Cell이 공유·합산 nRB=200·true slope=40)를 합성해 검증 — 기존 방식대로 Board Type 하나로 뭉뚱그려 평균 내면 26.65로 어느 쪽 실제 값과도 다르게 왜곡되지만, r13의 공유여부별 분리 집계는 Exclusive=20.00(참값 일치), Shared=39.95(참값 40 근접)로 정확히 분리해 보여줌을 확인 — 이번에 추가한 세분화 분석이 실제로 "기울기가 여러 개로 갈리는" 원인을 진단하는 데 유효함을 검증함.
+  * **주의**: 아직 사용자가 실데이터로 두 가지 방식(공유여부 vs nRB 구간) 중 어느 쪽이 더 설명력이 좋은지 판단 전 단계 — 다음 라운드에서 결과를 보고 하나로 확정하거나 두 기준을 조합하는 방향으로 더 세분화할 수 있음.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.2(`esm_r12.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.3(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 기울기 분산 진단(공유여부/nRB 구간별 세분화)까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
-  4. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
+  4. **다음 결정 대기**: 실데이터로 "[r13] 공유여부별 비교"/"[r13] nRB 구간별 비교" 결과를 보고, 기울기 분산을 더 잘 설명하는 기준을 하나 채택하거나 두 기준을 조합해 더 세분화할지 결정.
+  5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
 ---
