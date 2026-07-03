@@ -52,6 +52,8 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
+plt.rcParams['font.family'] = 'Malgun Gothic'
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
 
