@@ -86,7 +86,11 @@ class AppBase(BaseTk):
         self.show_advanced = False
 
         # [Learning Energy Curve, r12] RU HW 단위 loading-energy 회귀 + Idle/PA off 보정 학습 관련 상태
-        self.learn_traindata_file = tk.StringVar()  # 통합 학습데이터 CSV (Consumed Power/CellUnavailableTimeDown/UsedRB,UsedRB_t,nRB)
+        # [r12-update] 학습데이터는 index(집계 단위)가 달라 파일이 2개로 분리됨:
+        #   - learn_cell_file: Cell(Ne unique id + Cnum) 단위 (CellUnavailableTimeDown/UsedRB/UsedRB_t/nRB)
+        #   - learn_ru_file:   RU path(Ne unique id + Bid/RuPort/Cascade) 단위 (Consumed Power)
+        self.learn_cell_file = tk.StringVar()
+        self.learn_ru_file = tk.StringVar()
         self.learn_down_ratio_th = tk.DoubleVar(value=0.9)
         self.learn_min_samples = tk.IntVar(value=10)
         self.learn_ru_df = pd.DataFrame()
@@ -208,18 +212,22 @@ class AppBase(BaseTk):
         except: pass
 
     def _bind_widget_drop(self, widget, target_var, on_drop=None):
-        """[r12] 특정 위젯(주로 Entry) 위에 파일을 직접 드래그 앤 드롭하면 target_var에 경로를 채워주는 헬퍼.
+        """[r12] 특정 위젯(주로 Entry) 위에 파일을 직접 드래그 앤 드롭하면 target_var에 첫 번째 파일 경로를
+        채워주는 헬퍼. 한 번에 여러 파일을 드롭할 수도 있으며, 이 경우 전체 경로 목록이 on_drop(paths)로
+        전달되므로 종류별 자동 분류 등 커스텀 처리가 가능하다. target_var=None이면 자동 채움 없이
+        on_drop에서만 처리한다(예: 파일 내용을 보고 분류해야 하는 경우).
         tkinterdnd2가 없는 환경에서는 조용히 무시하고 기존 '찾기' 버튼(browse_file)만 동작한다."""
         if not HAS_DND: return
         try:
             widget.drop_target_register(DND_FILES)
 
             def _on_drop(event):
-                paths = self.tk.splitlist(event.data)
+                paths = list(self.tk.splitlist(event.data))
                 if not paths: return
-                target_var.set(paths[0])
+                if target_var is not None:
+                    target_var.set(paths[0])
                 if on_drop:
-                    try: on_drop(paths[0])
+                    try: on_drop(paths)
                     except Exception as e: messagebox.showerror("오류", f"드롭 처리 중 오류가 발생했습니다.\n{e}")
 
             widget.dnd_bind('<<Drop>>', _on_drop)
@@ -2115,23 +2123,36 @@ class ESAnalyzerApp(AppDashboard):
         ttk.Button(row0, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.cm_file)).pack(side=tk.LEFT, padx=2)
         ttk.Button(row0, text="🔄 CM 로드", command=self._process_cm_ciq_data).pack(side=tk.LEFT, padx=2)
 
-        def _on_cm_drop(path):
+        def _on_cm_drop(paths):
             try: self._process_cm_ciq_data()
             except Exception: pass
 
         self._bind_widget_drop(entry_cm, self.cm_file, on_drop=_on_cm_drop)
 
-        row1 = ttk.Frame(ctrl_frame)
-        row1.pack(fill=tk.X, pady=2)
-        ttk.Label(row1, text="학습 데이터 (CSV: Consumed Power / CellUnavailableTimeDown / UsedRB,UsedRB_t,nRB):",
+        # [r12-update] 학습데이터는 집계 단위(index)가 달라 파일이 2개(Cell 단위 / RU path 단위)로 분리됨.
+        # 두 파일 모두 CSV 헤더를 보고 자동 분류하므로, 어느 입력창에 드롭하든(또는 한 번에 2개를 같이
+        # 드롭하거나 파일 대화상자에서 2개를 동시에 선택해도) 알맞은 변수에 채워진다.
+        row1a = ttk.Frame(ctrl_frame)
+        row1a.pack(fill=tk.X, pady=2)
+        ttk.Label(row1a, text="Cell 단위 학습데이터 (CSV: CellUnavailableTimeDown/UsedRB/UsedRB_t/nRB, Cnum 기준):",
                   font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-        entry_train = ttk.Entry(row1, textvariable=self.learn_traindata_file, width=42)
-        entry_train.pack(side=tk.LEFT, padx=5)
-        ttk.Button(row1, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.learn_traindata_file)).pack(side=tk.LEFT, padx=2)
-        self._bind_widget_drop(entry_train, self.learn_traindata_file)
+        entry_cell_train = ttk.Entry(row1a, textvariable=self.learn_cell_file, width=32)
+        entry_cell_train.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row1a, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.learn_cell_file)).pack(side=tk.LEFT, padx=2)
+        self._bind_widget_drop(entry_cell_train, None, on_drop=self._classify_learning_files_drop)
+
+        row1b = ttk.Frame(ctrl_frame)
+        row1b.pack(fill=tk.X, pady=2)
+        ttk.Label(row1b, text="RU 단위 학습데이터 (CSV: Consumed Power, Bid/RuPort/Cascade 기준):",
+                  font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
+        entry_ru_train = ttk.Entry(row1b, textvariable=self.learn_ru_file, width=32)
+        entry_ru_train.pack(side=tk.LEFT, padx=5)
+        ttk.Button(row1b, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.learn_ru_file)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(row1b, text="📁 두 파일 한번에 선택", command=self._browse_learning_files_multi).pack(side=tk.LEFT, padx=8)
+        self._bind_widget_drop(entry_ru_train, None, on_drop=self._classify_learning_files_drop)
 
         if not HAS_DND:
-            ttk.Label(ctrl_frame, text="(※ tkinterdnd2 미설치 환경이라 드래그 앤 드롭은 비활성화되어 있습니다. '찾기' 버튼을 사용해주세요.)",
+            ttk.Label(ctrl_frame, text="(※ tkinterdnd2 미설치 환경이라 드래그 앤 드롭은 비활성화되어 있습니다. '찾기'/'두 파일 한번에 선택' 버튼을 사용해주세요.)",
                       foreground="gray").pack(fill=tk.X, padx=5, pady=(0, 5))
 
         row2 = ttk.Frame(ctrl_frame)
@@ -2186,11 +2207,52 @@ class ESAnalyzerApp(AppDashboard):
             df.to_csv(filepath, index=False)
             messagebox.showinfo("저장 완료", f"결과가 저장되었습니다:\n{filepath}")
 
-    def _parse_learning_traindata(self):
-        """[r12] 통합 학습 데이터 CSV 파서.
-        Cell(eNB_ID+cell-num) 단위 행: CellUnavailableTimeDown[sec], UsedRB, UsedRB_t, nRB, Consumed Power."""
-        filepath = self.learn_traindata_file.get()
-        if not filepath: raise ValueError("학습 데이터 (CSV)를 선택해주세요.")
+    def _browse_learning_files_multi(self):
+        paths = filedialog.askopenfilenames(filetypes=[("CSV Files", "*.csv")])
+        if paths: self._classify_learning_files_drop(list(paths))
+
+    def _classify_learning_files_drop(self, paths):
+        """[r12-update] 드롭(또는 다중 선택)된 CSV 파일들을 헤더 컬럼을 보고
+        Cell 단위 학습데이터(learn_cell_file) / RU 단위 학습데이터(learn_ru_file)로 자동 분류한다."""
+        unclassified = []
+        for p in paths:
+            if os.path.splitext(p)[1].lower() != '.csv':
+                unclassified.append(p); continue
+            try:
+                header = pd.read_csv(p, nrows=0, encoding='utf-8-sig').columns
+                if len(header) == 1 and '\t' in header[0]:
+                    header = pd.read_csv(p, nrows=0, encoding='utf-8-sig', sep='\t').columns
+            except Exception:
+                unclassified.append(p); continue
+
+            norm = [str(c).strip().lower().replace('_', '').replace('-', '').replace(' ', '') for c in header]
+            is_cell_file = any(c in ['cnum', 'cellid', 'cellnum'] for c in norm) and any(c == 'usedrb' for c in norm)
+            is_ru_file = any(c.startswith('consumedpower') for c in norm)
+
+            if is_cell_file:
+                self.learn_cell_file.set(p)
+            elif is_ru_file:
+                self.learn_ru_file.set(p)
+            else:
+                unclassified.append(p)
+
+        if unclassified:
+            messagebox.showwarning("알 수 없는 파일 형식",
+                                    "다음 파일은 Cell 단위/RU 단위 학습데이터로 자동 인식되지 않았습니다:\n" +
+                                    "\n".join(unclassified) + "\n\n각 입력창의 '찾기' 버튼으로 직접 선택해주세요.")
+
+    def _parse_learning_timestamp(self, df):
+        if 'Date' in df.columns and 'Time' in df.columns:
+            return pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str), errors='coerce')
+        elif 'TIMESTAMP' in df.columns:
+            return pd.to_datetime(df['TIMESTAMP'], errors='coerce')
+        raise ValueError("학습 데이터에 Date/Time 컬럼이 없습니다.")
+
+    def _parse_learning_cell_file(self):
+        """[r12-update] Cell(Ne unique id + Cnum) 단위 학습데이터 CSV 파서.
+        CellUnavailableTimeDown[sec] / UsedRB / UsedRB_t / nRB."""
+        filepath = self.learn_cell_file.get()
+        if not filepath: raise ValueError("Cell 단위 학습 데이터 (CSV)를 선택해주세요.")
 
         df = self._read_csv_auto(filepath)
         rename_map = {}
@@ -2202,33 +2264,110 @@ class ESAnalyzerApp(AppDashboard):
             elif cl == 'usedrbt': rename_map[c] = 'UsedRB_t'
             elif cl == 'usedrb': rename_map[c] = 'UsedRB'
             elif cl == 'nrb': rename_map[c] = 'nRB'
+            elif cl in ['timestamp', 'datetime']: rename_map[c] = 'TIMESTAMP'
+            elif cl.startswith('date'): rename_map[c] = 'Date'
+            elif cl == 'time': rename_map[c] = 'Time'
+        df.rename(columns=rename_map, inplace=True)
+
+        required = ['eNB_ID', 'cell-num', 'CellUnavailTimeDown_sec', 'UsedRB', 'UsedRB_t', 'nRB']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Cell 단위 학습 데이터에 다음 컬럼을 찾을 수 없습니다: {', '.join(missing)}")
+
+        df['eNB_ID'] = self._extract_int_id(df['eNB_ID'])
+        df['cell-num'] = self._extract_int_id(df['cell-num'])
+        for col in ['CellUnavailTimeDown_sec', 'UsedRB', 'UsedRB_t', 'nRB']:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+        df['Timestamp'] = self._parse_learning_timestamp(df)
+        df = df.dropna(subset=['Timestamp'])
+        if df.empty: raise ValueError("Cell 단위 학습 데이터의 Date/Time 정보를 해석할 수 없습니다.")
+        df['Hourly_TS'] = df['Timestamp'].dt.floor('h')
+        return df
+
+    def _parse_learning_ru_file(self):
+        """[r12-update] RU path(Ne unique id + Bid/RuPort/Cascade) 단위 학습데이터 CSV 파서. Consumed Power."""
+        filepath = self.learn_ru_file.get()
+        if not filepath: raise ValueError("RU 단위 학습 데이터 (CSV)를 선택해주세요.")
+
+        df = self._read_csv_auto(filepath)
+        rename_map = {}
+        for c in df.columns:
+            cl = str(c).strip().lower().replace('_', '').replace('-', '').replace(' ', '')
+            if cl in ['neuniqueid', 'enodebid', 'nodeid', 'neid', 'enbid', 'systemid']: rename_map[c] = 'eNB_ID'
+            elif cl == 'bid': rename_map[c] = 'ru-board-id'
+            elif cl == 'ruport': rename_map[c] = 'ru-port-id'
+            elif cl == 'cascade': rename_map[c] = 'ru-cascade-id'
             elif cl.startswith('consumedpower'): rename_map[c] = 'Consumed_Power'
             elif cl in ['timestamp', 'datetime']: rename_map[c] = 'TIMESTAMP'
             elif cl.startswith('date'): rename_map[c] = 'Date'
             elif cl == 'time': rename_map[c] = 'Time'
         df.rename(columns=rename_map, inplace=True)
 
-        required = ['eNB_ID', 'cell-num', 'CellUnavailTimeDown_sec', 'UsedRB', 'UsedRB_t', 'nRB', 'Consumed_Power']
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            raise ValueError(f"학습 데이터에 다음 컬럼을 찾을 수 없습니다: {', '.join(missing)}")
+        ru_keys = ['ru-board-id', 'ru-port-id', 'ru-cascade-id']
+        file_avail_keys = [k for k in ru_keys if k in df.columns]
+        if 'eNB_ID' not in df.columns or 'Consumed_Power' not in df.columns or not file_avail_keys:
+            raise ValueError("RU 단위 학습 데이터에 필요한 컬럼(eNB_ID/Bid,RuPort,Cascade/Consumed Power)을 찾을 수 없습니다.")
 
         df['eNB_ID'] = self._extract_int_id(df['eNB_ID'])
-        df['cell-num'] = self._extract_int_id(df['cell-num'])
-        for col in ['CellUnavailTimeDown_sec', 'UsedRB', 'UsedRB_t', 'nRB', 'Consumed_Power']:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        for k in file_avail_keys: df[k] = self._extract_int_id(df[k])
+        df['Consumed_Power'] = pd.to_numeric(df['Consumed_Power'], errors='coerce').fillna(0)
 
-        if 'Date' in df.columns and 'Time' in df.columns:
-            df['Timestamp'] = pd.to_datetime(df['Date'].astype(str) + ' ' + df['Time'].astype(str), errors='coerce')
-        elif 'TIMESTAMP' in df.columns:
-            df['Timestamp'] = pd.to_datetime(df['TIMESTAMP'], errors='coerce')
-        else:
-            raise ValueError("학습 데이터에 Date/Time 컬럼이 없습니다.")
-
+        df['Timestamp'] = self._parse_learning_timestamp(df)
         df = df.dropna(subset=['Timestamp'])
-        if df.empty: raise ValueError("학습 데이터의 Date/Time 정보를 해석할 수 없습니다.")
+        if df.empty: raise ValueError("RU 단위 학습 데이터의 Date/Time 정보를 해석할 수 없습니다.")
         df['Hourly_TS'] = df['Timestamp'].dt.floor('h')
         return df
+
+    def _resolve_pa_shared_ru_paths(self, cm_map, avail_keys):
+        """[r12-update] CM의 'PA-shared-cell' 정보로 동일 PA(RU path)를 공유하는 Cell들을 하나의
+        RU path로 묶는다. PA-shared-cell 값이 -1(또는 미기재)이면 공유되는 cell이 없다는 뜻이므로
+        해당 행 자신의 Bid/RuPort/Cascade를 그대로 사용한다."""
+        pa_col = next((c for c in cm_map.columns
+                       if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['pasharedcell', 'sharedcell']), None)
+        if pa_col is None or 'cell-num' not in cm_map.columns:
+            return cm_map
+
+        cm_map = cm_map.reset_index(drop=True).copy()
+        pa_num = pd.to_numeric(cm_map[pa_col], errors='coerce')
+
+        parent = {}
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb: parent[ra] = rb
+
+        for i, row in cm_map.iterrows():
+            key = (row['eNB_ID'], row['cell-num'])
+            find(key)
+            shared = pa_num.iloc[i]
+            if pd.notna(shared) and shared >= 0:
+                union(key, (row['eNB_ID'], str(int(shared))))
+
+        # 그룹(=PA 공유 클러스터)별 대표 RU path/BoardType: 그룹 내에서 값이 채워진 첫 행을 채택
+        group_repr = {}
+        for _, row in cm_map.iterrows():
+            root = find((row['eNB_ID'], row['cell-num']))
+            if root in group_repr: continue
+            vals = tuple(row[k] for k in avail_keys)
+            if all(v != '' for v in vals):
+                group_repr[root] = (vals, row.get('BoardType', ''))
+
+        def _resolved_vals(row):
+            root = find((row['eNB_ID'], row['cell-num']))
+            if root in group_repr: return group_repr[root]
+            return (tuple(row[k] for k in avail_keys), row.get('BoardType', ''))
+
+        resolved = cm_map.apply(_resolved_vals, axis=1)
+        for i, k in enumerate(avail_keys):
+            cm_map[k] = resolved.apply(lambda r: r[0][i])
+        cm_map['BoardType'] = resolved.apply(lambda r: r[1])
+        return cm_map
 
     def _run_energy_curve_learning(self):
         try:
@@ -2258,44 +2397,57 @@ class ESAnalyzerApp(AppDashboard):
             if cm_map.empty:
                 raise ValueError("CM 데이터에 유효한 RU 식별자를 가진 행이 없습니다.")
 
+            # [r12-update] CM의 PA-shared-cell 정보로 동일 PA(RU path)를 공유하는 Cell을 하나로 묶는다.
+            cm_map = self._resolve_pa_shared_ru_paths(cm_map, avail_keys)
             cm_by_cell = cm_map[['eNB_ID', 'cell-num'] + avail_keys].drop_duplicates()
             ru_boardtype = cm_map[ru_path_keys + ['BoardType']].drop_duplicates(subset=ru_path_keys, keep='first')
 
-            # --- 1. 학습 데이터 파싱 후 Cell(eNB_ID+cell-num) 단위로 시간 granularity 통일 ---
-            df_train = self._parse_learning_traindata()
-            cell_hourly = df_train.groupby(['eNB_ID', 'cell-num', 'Hourly_TS'], observed=True).agg(
+            # --- 1. Cell 단위 학습데이터 파싱 후 Cell(eNB_ID+cell-num) 단위로 시간 granularity 통일 ---
+            df_cell = self._parse_learning_cell_file()
+            cell_hourly = df_cell.groupby(['eNB_ID', 'cell-num', 'Hourly_TS'], observed=True).agg(
                 CellUnavailTimeDown_sec=('CellUnavailTimeDown_sec', 'sum'),
                 UsedRB=('UsedRB', 'sum'), UsedRB_t=('UsedRB_t', 'sum'), nRB=('nRB', 'sum'),
-                Consumed_Power=('Consumed_Power', 'mean'),
             ).reset_index()
 
             # --- 2. CM 정보로 Cell(Cnum) -> RU path(Bid/RuPort/Cascade) 식별 ---
             cell_ru = pd.merge(cell_hourly, cm_by_cell, on=['eNB_ID', 'cell-num'], how='inner')
             if cell_ru.empty:
-                raise ValueError("학습 데이터와 CM(Cell-RU Mapping) 정보의 eNB_ID/Cnum이 일치하지 않습니다.")
+                raise ValueError("Cell 단위 학습 데이터와 CM(Cell-RU Mapping) 정보의 eNB_ID/Cnum이 일치하지 않습니다.")
 
             # --- 3. 동일 RU path를 공유하는 다수 Cell을 RU 단위로 집계 ---
-            #   - Consumed Power / Cell off(초): cell의 산술 평균
+            #   - Cell off(초): cell의 산술 평균
             #   - Loading_traffic = ΣUsedRB_t / ΣnRB, Loading_total = ΣUsedRB / ΣnRB (비율의 합)
-            ru_hourly = cell_ru.groupby(ru_path_keys + ['Hourly_TS'], observed=True).agg(
-                Consumed_Power=('Consumed_Power', 'mean'),
+            ru_loading_hourly = cell_ru.groupby(ru_path_keys + ['Hourly_TS'], observed=True).agg(
                 CellOff_sec=('CellUnavailTimeDown_sec', 'mean'),
                 UsedRB_t_sum=('UsedRB_t', 'sum'), UsedRB_sum=('UsedRB', 'sum'), nRB_sum=('nRB', 'sum'),
             ).reset_index()
 
-            ru_hourly['Loading_traffic'] = np.where(ru_hourly['nRB_sum'] > 0, ru_hourly['UsedRB_t_sum'] / ru_hourly['nRB_sum'], 0.0)
-            ru_hourly['Loading_total'] = np.where(ru_hourly['nRB_sum'] > 0, ru_hourly['UsedRB_sum'] / ru_hourly['nRB_sum'], 0.0)
+            ru_loading_hourly['Loading_traffic'] = np.where(ru_loading_hourly['nRB_sum'] > 0, ru_loading_hourly['UsedRB_t_sum'] / ru_loading_hourly['nRB_sum'], 0.0)
+            ru_loading_hourly['Loading_total'] = np.where(ru_loading_hourly['nRB_sum'] > 0, ru_loading_hourly['UsedRB_sum'] / ru_loading_hourly['nRB_sum'], 0.0)
 
             down_th = self.learn_down_ratio_th.get()
-            ru_hourly['Down_Ratio'] = (ru_hourly['CellOff_sec'] / 3600.0).clip(upper=1.0)
-            ru_hourly['Cell_State'] = np.where(ru_hourly['Down_Ratio'] >= down_th, 'OFF', 'ON')
+            ru_loading_hourly['Down_Ratio'] = (ru_loading_hourly['CellOff_sec'] / 3600.0).clip(upper=1.0)
+            ru_loading_hourly['Cell_State'] = np.where(ru_loading_hourly['Down_Ratio'] >= down_th, 'OFF', 'ON')
 
-            ru_dataset = pd.merge(ru_hourly, ru_boardtype, on=ru_path_keys, how='left')
+            # --- 4. RU 단위 학습데이터(Consumed Power)는 이미 Bid/RuPort/Cascade 단위로 집계되어 있으므로
+            #    Cell처럼 평균낼 필요 없이 RU path + 시간 기준으로 바로 병합한다 ---
+            df_ru_power = self._parse_learning_ru_file()
+            ru_file_avail_keys = [k for k in avail_keys if k in df_ru_power.columns]
+            if len(ru_file_avail_keys) != len(avail_keys):
+                raise ValueError("RU 단위 학습 데이터의 RU 식별자 컬럼이 CM 데이터와 일치하지 않습니다.")
+
+            ru_power_hourly = df_ru_power.groupby(ru_path_keys + ['Hourly_TS'], observed=True)['Consumed_Power'].mean().reset_index()
+
+            ru_dataset = pd.merge(ru_loading_hourly, ru_power_hourly, on=ru_path_keys + ['Hourly_TS'], how='inner')
+            if ru_dataset.empty:
+                raise ValueError("Cell 단위 학습 데이터(Loading/Cell off)와 RU 단위 학습 데이터(Consumed Power)의 RU path/시간대가 겹치지 않습니다.")
+
+            ru_dataset = pd.merge(ru_dataset, ru_boardtype, on=ru_path_keys, how='left')
             ru_dataset['BoardType'] = ru_dataset['BoardType'].fillna('Unknown')
             if ru_dataset.empty:
                 raise ValueError("RU 단위로 집계된 학습 데이터가 없습니다.")
 
-            # --- 4. RU HW DB(RU/MMU Spec 에디터)에서 Board Type별 Idle/PA off 레퍼런스(Lab test) 조회 ---
+            # --- 5. RU HW DB(RU/MMU Spec 에디터)에서 Board Type별 Idle/PA off 레퍼런스(Lab test) 조회 ---
             spec_bcol = next((c for c in self.ru_spec_df_internal.columns
                                if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
             ref_lookup = {}
