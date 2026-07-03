@@ -154,6 +154,16 @@ class AppBase(BaseTk):
             ax.set_facecolor(self.AXES_BG)
             ax.grid(True, linestyle='--', alpha=0.7, color=self.GRID_COLOR)
 
+    def _get_qual_cmap(self, name, n):
+        """[r13] matplotlib 버전에 관계없이 동작하는 컬러맵 조회 헬퍼.
+        matplotlib 3.9+에서 plt.cm.get_cmap()이 제거되어 'module matplotlib.cm has no
+        attribute get_cmap' 오류가 발생하는 문제를 해결한다."""
+        n = max(int(n), 1)
+        try:
+            return plt.colormaps[name].resampled(n)
+        except Exception:
+            return plt.cm.get_cmap(name, n)
+
     def _draw_time_x_axis(self, ax, dates_list, is_last_graph=False):
         if not dates_list: return
         ax.xaxis.set_major_locator(mdates.HourLocator(byhour=[0, 6, 12, 18]))
@@ -1778,7 +1788,7 @@ class ESAnalyzerApp(AppDashboard):
 
         fig, ax = plt.subplots(figsize=(12, 6))
         self._apply_plot_style(fig, ax)
-        if max_n > 0: colors = plt.cm.get_cmap('tab10', max_n)
+        if max_n > 0: colors = self._get_qual_cmap('tab10', max_n)
 
         for n in range(max_n, 0, -1):
             target_cells = self._get_target_cells_str([positive_bands_names[n-1]], carrier_df, target_col)
@@ -2721,7 +2731,7 @@ class ESAnalyzerApp(AppDashboard):
 
         if not ru_df_all.empty and 'Total_nRB' in ru_df_all.columns:
             bt_list = list(ru_df_all['Board Type'].astype(str).unique())
-            cmap = plt.cm.get_cmap('tab10', max(len(bt_list), 1))
+            cmap = self._get_qual_cmap('tab10', max(len(bt_list), 1))
             marker_map = {'Shared (공유)': '^', 'Exclusive (단독)': 'o'}
             for bt_idx, bt in enumerate(bt_list):
                 sub = ru_df_all[ru_df_all['Board Type'].astype(str) == bt]
