@@ -91,15 +91,25 @@
   * **Energy Dashboard 연동은 보류**: 사용자 확인 결과, 학습 결과의 유의미성(실데이터 검증)을 먼저 확인한 뒤 적용 방법을 결정하기로 함 — 이번 라운드에는 연동하지 않음.
   * **검증**: matplotlib을 설치한 임시 가상환경에서 Agg(헤드리스) 백엔드로 신규 라벨/수식 텍스트 렌더링 로직만 별도 재현해 실행 — NaN 값이 섞인 Board Type(레퍼런스 데이터 일부 누락 케이스), 양/음수가 혼재된 Delta 막대 등 엣지 케이스에서도 예외 없이 렌더링됨을 확인.
 
+* **[v2.2 / esm_r12.py] (2026-07-03) 학습데이터 2-파일 분리 + PA-shared-cell 기반 RU path 보정**
+  * **학습데이터 파일 2개로 분리**: 실제 데이터는 집계 단위(index)가 서로 달라 파일이 1개가 아니라 2개임을 확인 — 반영.
+    - **Cell 단위 학습데이터** (`self.learn_cell_file`): `Ne unique id` + `Cnum` 기준. `Cellunavailabletimedown s`(초), `UsedRB`, `UsedRB_t`, `nRB`.
+    - **RU 단위 학습데이터** (`self.learn_ru_file`): `Ne unique id` + `Bid`/`RuPort`/`Cascade` 기준. `Consumed Power`.
+    - 두 파일 모두 CSV 헤더를 보고 자동 분류하는 `_classify_learning_files_drop()`을 추가해, 두 입력창 중 어디에 드롭하든(한 번에 2개를 같이 드롭해도) 알맞은 변수에 채워지도록 구현. `_bind_widget_drop()`도 다중 파일 드롭(`on_drop(paths: list)`)을 지원하도록 확장. "📁 두 파일 한번에 선택" 버튼으로 파일 대화상자에서도 2개를 한 번에 선택 가능.
+    - 이에 따라 Consumed Power는 더 이상 Cell 단위로 평균 낼 필요 없이(원래부터 RU path 단위로 이미 집계되어 있으므로) RU path + 시간 기준으로 바로 병합하도록 단순화(`_parse_learning_ru_file` → `ru_power_hourly` → 직접 merge). Cell off(초)/Loading_traffic/Loading_total만 여전히 "동일 RU path를 공유하는 Cell들의 평균/비율의 합"으로 집계.
+  * **컬럼 매핑 확인**: `Ne unique id`는 `"ENB_1001"`처럼 접두어가 붙어도 기존 `_extract_int_id`(정규식으로 숫자만 추출)가 그대로 처리 가능함을 확인(추가 수정 불필요). `Cnum`=CM의 `cell-num`, `Bid/RuPort/Cascade`=CM의 `ru-board-id/ru-port-id/ru-cascade-id`, RU HW 종류는 CM의 `ru-board-type` 컬럼(정규화 시 `ruboardtype`으로 매칭되어 기존 로직이 이미 지원).
+  * **PA-shared-cell 기반 RU path 보정 (신규 `_resolve_pa_shared_ru_paths`)**: CM에 있는 `PA-shared-cell` 컬럼은 해당 Cell이 다른 어떤 Cell과 PA(RU path)를 공유하는지 알려줌(`-1`이면 공유하는 Cell 없음). Union-Find로 PA를 공유하는 Cell들을 하나의 그룹으로 묶고, 그룹 내에서 Bid/RuPort/Cascade가 채워진 값을 대표값으로 삼아 그룹 전체에 적용 — 이렇게 하면 자기 자신의 Bid/RuPort/Cascade가 비어 있는 Cell(다른 Cell과 PA를 공유하기 때문에 별도 RU path가 없는 경우)도 올바른 RU path로 귀속되어 Loading 집계에서 누락되지 않음.
+  * **검증**: 임시 가상환경에서, 한 eNB 안에 Cell 2개(20010은 자체 Bid/RuPort/Cascade=(5,1,0) 보유, 20011은 CM에 Bid/RuPort/Cascade가 비어 있고 `PA-shared-cell=20010`으로 20010과 공유) 시나리오를 합성 데이터로 만들어 검증 — PA-shared-cell 해석 후 두 Cell이 동일 RU path로 정확히 병합됨을 assert로 확인했고, Cell 파일(Loading/Cell off)과 RU 파일(Consumed Power)이 올바르게 merge되어 학습된 Slope/Intercept/Idle/PAoff 값이 설정한 참값과 근사 일치함을 확인함.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.1(`esm_r12.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드 + 시각화 수치/모델식 라벨링 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.2(`esm_r12.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
-  2. 실제 통합 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_traindata()`의 매핑 규칙과 맞는지 실데이터로 확인 필요.
-  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
+  2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
+  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요.
   4. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, Loading 기울기)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
 * 다음 대기 작업: (사용자 요청 대기 중)
 
 ---
-*Last Updated: 2026-07-01*
+*Last Updated: 2026-07-03*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
