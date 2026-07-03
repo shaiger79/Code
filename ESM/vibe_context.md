@@ -110,6 +110,11 @@
   * **검증**: 임시 가상환경에서, 같은 Board Type(TypeD)에 RU 3개(A: 단독·nRB=100·true slope=20, B: 단독·nRB=100·true slope=20, C: 2개 Cell이 공유·합산 nRB=200·true slope=40)를 합성해 검증 — 기존 방식대로 Board Type 하나로 뭉뚱그려 평균 내면 26.65로 어느 쪽 실제 값과도 다르게 왜곡되지만, r13의 공유여부별 분리 집계는 Exclusive=20.00(참값 일치), Shared=39.95(참값 40 근접)로 정확히 분리해 보여줌을 확인 — 이번에 추가한 세분화 분석이 실제로 "기울기가 여러 개로 갈리는" 원인을 진단하는 데 유효함을 검증함.
   * **주의**: 아직 사용자가 실데이터로 두 가지 방식(공유여부 vs nRB 구간) 중 어느 쪽이 더 설명력이 좋은지 판단 전 단계 — 다음 라운드에서 결과를 보고 하나로 확정하거나 두 기준을 조합하는 방향으로 더 세분화할 수 있음.
 
+* **[v2.3.1 / esm_r13.py] (2026-07-03) 핫픽스: `module 'matplotlib.cm' has no attribute 'get_cmap'`**
+  * **원인**: 사용자 로컬 환경의 matplotlib 버전(3.9+, 실제 확인된 버전 3.11)에서 `matplotlib.cm.get_cmap`(= `plt.cm.get_cmap`)이 완전히 제거됨. 코드 내 2곳(`_generate_core_policy`의 ES 산점도 색상 - Optimizer 탭, 원래 r11부터 있던 코드; r13에서 신규 추가한 `_render_learning_plots`의 Total_nRB vs Slope 진단 산점도)에서 이 API를 사용하고 있어 실행 시 즉시 오류 발생.
+  * **수정**: `AppBase`에 `_get_qual_cmap(name, n)` 헬퍼를 추가 — 신형 API(`plt.colormaps[name].resampled(n)`, matplotlib 3.6+)를 우선 시도하고, 실패 시 구형 API(`plt.cm.get_cmap`)로 자동 폴백하여 신/구 matplotlib 버전 모두에서 동작하도록 함. 기존 2곳의 호출을 모두 이 헬퍼로 교체.
+  * **검증**: 실제 오류를 재현한 matplotlib 3.11.0 가상환경에서 신형 API 경로가 정상 동작하고 기존과 동일하게 정수 인덱스로 색상을 얻을 수 있음을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 * 현재 상태: v2.3(`esm_r13.py`) - Learning Energy Curve 전면 개편 + 결과 CSV 다운로드/시각화 라벨링 + 학습데이터 2-파일 분리 + PA-shared-cell 보정 + 기울기 분산 진단(공유여부/nRB 구간별 세분화)까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
