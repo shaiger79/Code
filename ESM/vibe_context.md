@@ -7,7 +7,7 @@
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
   * Efficiency: Energy Efficiency (EE) = (AirMacDLByte + AirMacULByte) / Consumed [Wh]
-* **버전 파일 관리**: `ESM/esm_r11.py`, `ESM/esm_r12.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r13.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r13.py`를 복제해 `esm_r14.py`로 이어간다.
+* **버전 파일 관리**: `ESM/esm_r11.py`, `ESM/esm_r12.py`, `ESM/esm_r13.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r14.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r14.py`를 복제해 `esm_r15.py`로 이어간다.
 
 ## 2. 핵심 개발 원칙 (Core Rules & Directives)
 1. **아키텍처 보존**: 객체지향형 5단계 상속 구조(`AppBase` -> `AppEditors` -> `AppTraffic` -> `AppDashboard` -> `ESAnalyzerApp`)를 절대 훼손하지 않고 확장한다. (※ 실제 코드 상으로는 `AppTraffic`이 별도 클래스로 분리되어 있지 않고 `ESAnalyzerApp`에 트래픽 패턴 뷰어 메서드가 포함된 4단계 상속: `AppBase` -> `AppEditors` -> `AppDashboard` -> `ESAnalyzerApp` 구조로 실동작 중. 아래 3항 참조.)
@@ -136,6 +136,8 @@
   * **시각화**: 그래프 범례에 각 모델의 R²와 MSE를 함께 표시하고, 추천된 모델은 굵은 선(★ 표시)으로 강조. 그래프 제목에도 "— 추천: {모델명}"을 표시. 하단 요약 R² 비교 막대그래프에는 그룹별로 추천된 모델 위치에 ★ 표시를 얹어 한눈에 확인 가능.
   * **검증**: sklearn을 설치한 임시 가상환경에서 3가지 서로 다른 참값 형태(① 로그형 체감곡선 → Log 추천, ② 순수 선형 → Linear 추천(단순함 우선 규칙 확인), ③ 계단형(선형·로그 어느 쪽도 잘 안 맞는 형태) → Isotonic 추천)로 각각 합성 데이터를 만들어 추천 로직이 실제 곡선 형태에 맞게 정확히 동작함을 확인함.
 
+*(아래 v2.6까지는 `esm_r13.py` 기준, v2.7부터는 새로 분기한 `esm_r14.py` 기준)*
+
 * **[v2.6 / esm_r13.py] (2026-07-03) 시각화 UI 개선 + 로그모델 → 지수포화(ExpSat) 모델 교체 + Sector 내 Cell수 그룹핑 추가 + 한글 폰트 커밋 검토**
   * **배경**: 사용자가 한 턴에 4가지를 동시에 요청 — ① 시각화 탭 마우스 스크롤 미작동/그래프 크기 고정/간격 협소/라벨 겹침 UI 문제, ② 로그스케일 모델 제외하고 더 나은(복잡해도 무방한) 모델 추가, ③ Sector(=Cnum%10) 내 Cell수를 기준으로 한 세 번째 학습 그룹핑 축 추가(예: 3-Cell Sector끼리만 모아 학습 vs 1-Cell Sector끼리만 모아 학습), ④ 사용자가 직접 커밋한 한글 폰트 설정 코드 리뷰 및 보완.
   * **① 시각화 UI 개선**:
@@ -147,16 +149,34 @@
   * **④ 한글 폰트 커밋 검토/보완**: 사용자가 직접 커밋한 `plt.rcParams['font.family'] = 'Malgun Gothic'`은 Windows 전용 폰트만 지정하고 `axes.unicode_minus` 설정이 빠져 있어, macOS/Linux 환경에서는 한글이 깨지고 음수 부호(-)도 깨질 위험이 있었음 → `_KOREAN_FONT_CANDIDATES`(Malgun Gothic/AppleGothic/NanumGothic/Noto Sans CJK KR/Noto Sans KR) 리스트로 교체해 `matplotlib.font_manager`에서 실제 설치된 폰트를 확인 후 우선순위대로 선택하고, 하나도 없으면 경고 로그만 남기고 넘어가도록(크래시 방지) 수정. `axes.unicode_minus = False`도 함께 추가.
   * **검증**: 임시 가상환경(scipy/sklearn/numpy/pandas 설치)에서 4가지 모두 로직 단위 검증 — (a) 참값이 지수포화 곡선인 합성 데이터에서 `curve_fit`이 실제 a/b/k 값을 15% 오차 이내로 정확히 복원하고 R²(Val)가 Linear(0.76)보다 크게 높음(0.996)을 확인, (b) 참값이 순수 선형인 데이터에서는 여전히 Linear가 추천됨(오컴의 면도날 규칙 유지 확인), (c) 데이터가 3개 미만이거나 상수인 퇴화 케이스에서 `_fit_exp_saturation`이 예외 없이 `None`을 반환함을 확인, (d) `Cnum % 10` 기준 Sector 그룹핑이 3-Cell/1-Cell Sector를 정확히 구분하고 `Board Type × Shared × Sector Group` 3축 groupby가 그룹을 올바르게 분리 유지함을 확인. matplotlib UI 변경(스크롤/리사이즈/간격)은 앞선 라운드에서 이미 matplotlib 3.11 환경으로 렌더링 검증 완료된 패턴을 그대로 재사용.
 
+* **[v2.7 / esm_r14.py] (2026-07-06) Linear/ExpSat 모델을 "수식(Formula)" 표로 정리 + 다운로드, Sector Group 일반화 방향 논의**
+  * **배경**: 사용자가 시각화(그래프)로만 보던 Learning Energy Curve 결과를, loading 값만 넣으면 바로 ConsumedPower를 계산할 수 있는 "사용 가능한" 형태(수식/표)로 가져가고 싶다고 요청. 또한 Sector Group(1Cell/Sector vs 3Cell/Sector 등)에 따라 결과가 갈리는 문제를 더 일반적인 형태로 개선할 아이디어를 요청(사용자 제안: UsedRB당 소모전력 지표, 또는 nRB에 대한 함수로 표현).
+  * **버전 분기**: 핵심 개발 원칙(2항)에 따라 `esm_r13.py`(과거 버전, 더 이상 수정 안 함)를 그대로 복제해 `esm_r14.py`(신규 최신 개발 버전)로 시작. 이번 라운드부터 모든 변경은 `esm_r14.py`에만 반영.
+  * **Energy Curve 수식(Formula) 표 추가** (사용자 요청 1번):
+    - 신규 `_build_formula_df(hw_df)`: HW(Board Type × Shared × Sector Group) 요약(`hw_df`)의 Linear/ExpSat 계수를, `ConsumedPower = 절편 + 기울기 × Loading_traffic`(Linear) / `ConsumedPower = a − b × exp(−k × Loading_traffic)`(ExpSat) 형태의 텍스트 수식 문자열로 변환한 `self.learn_formula_df`를 생성. Board Type/Shared/Sector Group/RU Count/Recommended Model과 함께 R²·MSE·MAE(Val), 원본 계수(Slope/Intercept, a/b/k)도 그대로 포함해 사람이 읽는 수식과 프로그램적으로 재사용 가능한 계수를 한 표에서 모두 제공.
+    - Isotonic은 계수가 없는 비모수(non-parametric) 모델이라 닫힌 형태 수식으로 표현할 수 없으므로 이 표에는 포함하지 않고, 해당 그룹의 `Recommended Model`이 Isotonic이면 `Note` 컬럼에 "수식 없음 — RU 단위 상세 결과/시각화의 곡선 참고" 안내만 표시.
+    - Learning Energy Curve 결과 탭에 " 📐 Energy Curve 수식(Formula) " 탭을 신규 추가(RU 단위 상세 / HW 요약 / **수식(Formula)** / 시각화, 총 4개 탭)하고, `Loading_traffic = ΣUsedRB_t/ΣnRB` 정의를 안내 문구로 표시. "💾 Energy Curve 수식(Formula) CSV 다운로드" 버튼 추가.
+  * **Sector Group 일반화 — Active_RB(절대 활성 RB) 축 병행 진단 추가** (사용자 요청 2번, 사용자가 "지금 병행 진단 추가"를 선택해 바로 구현):
+    - 현재 `Loading_traffic`은 RU path에 연결된 총 nRB로 나눈 **비율(0~1)** 이라, 셀 1개짜리 RU path와 3개짜리(3Cell/Sector) RU path가 같은 Loading_traffic 값이어도 실제로 구동되는 절대 RB 개수(및 PA/캐리어 개수)는 서로 다름 — 이 절대 규모 차이가 Sector Group별 기울기/ExpSat 곡선이 갈리는 주된 원인으로 추정.
+    - 사용자 제안 ① "UsedRB당 소모전력"은 Loading이 0에 가까울 때 분모가 0에 가까워져 값이 발산하므로 회귀의 x/y축으로는 채택하지 않음(향후 별도 효율 KPI로는 유효할 수 있음, 이번 라운드에는 미구현).
+    - 사용자 제안 ② "nRB에 대한 함수로 표현"을 채택 — 비율(`Loading_traffic`) 외에 **`Active_RB`(=ΣUsedRB_t, 나누기 전 절대 활성 RB 수)** 를 두 번째 회귀 입력 축으로 신규 추가하고, 기존 축(비율)은 그대로 유지한 채 두 축을 **나란히 병행 학습**하도록 구현(v2.3→v2.4의 "공유여부 vs nRB구간" 진단과 동일한 패턴).
+    - **구현 상세**: 기존 per-RU 학습 로직(Linear/ExpSat/Isotonic 3종 모델 적합 + 지표 계산)을 신규 헬퍼 `_fit_three_models(x_train,y_train,x_val,y_val,x_test,y_test)`로 추출해, `Loading_traffic`(비율)과 `Active_RB`(절대, `ru_loading_hourly['Active_RB'] = UsedRB_t_sum`) 양쪽에 **동일한 Train/Val/Test 분할**을 재사용해 공정 비교. RU 단위 결과(`ru_df`)에 `RB Linear/ExpSat/Isotonic *`, `RB Recommended Model` 컬럼을 추가하고, HW 요약(`hw_df`)에도 동일하게 `RB Avg *` 컬럼과 `RB Recommended Model`을 추가. 그룹별로 두 축 중 어느 쪽 최고 R²(Val)가 더 높은지 비교하는 `Best R2 (Loading_traffic 비율)` / `Best R2 (Active_RB 절대)` / `Better Axis (R² 기준)`(차이 ≤0.02면 "유사") 컬럼을 신규 추가해, 실데이터에서 어느 축이 Sector Group 차이를 더 잘 흡수하는지 한눈에 판단할 수 있게 함.
+    - **수식 표 확장**: `_build_formula_df`에 `Linear/ExpSat Formula (Active_RB)` 컬럼과 `Better Axis` 컬럼을 추가해, 두 축의 수식을 한 표에서 비교 가능.
+    - **시각화 확장**: 기존 산점도+3모델 그리기 로직을 `_plot_axis_models()` 공용 헬퍼로 추출해 두 축(비율/절대)에 재사용. 그룹당 그래프 배치를 2열→3열(① Loading_traffic 산점도 ② Active_RB 산점도 ③ Idle/PA off 막대)로 확장하고, 하단 요약도 R²비교 막대를 축별로 하나씩(비율/절대) 나란히 표시.
+    - **다음 단계**: 실데이터로 학습을 돌려 `Better Axis` 컬럼과 두 산점도(비율 vs 절대)를 비교해, Active_RB 축이 Sector Group 차이를 뚜렷하게 줄여준다면 다음 라운드(`esm_r15.py`)에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 정리하는 것을 검토.
+  * **검증**: pandas/numpy만 설치된 환경(scipy/sklearn 미설치, `HAS_SCIPY=False`/`HAS_SKLEARN=False` 상태)에서 (a) `_build_formula_df`를 합성 `hw_df`(양/음의 기울기, ExpSat 계수 NaN 케이스, Isotonic 추천 케이스 포함)로 단위 테스트해 수식 문자열 포맷·부호 처리·N/A 처리·Note 안내가 모두 올바름을 확인, (b) 실제 GUI 앱(`ESAnalyzerApp`)을 기동해 신규 "수식(Formula)" 탭/Treeview가 정상 생성됨을 확인, (c) CM(단독 RU path 1개, nRB_sum=100 + 공유 RU path 1개, nRB_sum=200, 참값 slope=50/intercept=110)과 Cell/RU 단위 학습데이터를 합성해 `_run_energy_curve_learning()`을 실제로 실행 — 복원된 Linear 계수(비율 축 slope≈50.2/49.6, intercept≈109.8/110.0)가 참값과 근접했고, **비율 축과 Active_RB 축의 계수가 수학적으로 정확히 일치**함을 확인(`RB Linear Slope × nRB_sum` = 비율 축 slope, 두 RU path 모두 오차 0.01 이내), `learn_formula_df`의 두 축 수식 문자열이 각 계수와 일치함을 확인(scipy 미설치라 ExpSat 결과는 예상대로 N/A로 표시됨), (d) 시각화 렌더링(matplotlib 3.10, 3열×(그룹수+1)행 그리드)이 예외 없이 완료되고 캔버스 위젯이 정상 생성됨을 확인 — 렌더링 과정에서 컬럼명 접두어 순서 버그(`Avg RB ...` vs `RB Avg ...`) 1건을 발견해 즉시 수정함. GUI 드래그앤드롭/실데이터 컬럼명 호환은 이전 라운드와 동일하게 로컬 PC 확인 필요.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.6(`esm_r13.py`) - Learning Energy Curve 시각화 UI(스크롤/반응형 크기/간격) 개선 + 로그모델을 지수포화(ExpSat, scipy curve_fit) 모델로 교체 + Sector(Cnum%10) 내 Cell수를 세 번째 그룹핑 축으로 추가 + 한글 폰트 크로스플랫폼 보완까지 완료 (로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.7(`esm_r14.py`) - Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리 완료. Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
-  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 이번 라운드의 스크롤/리사이즈 UI와 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
-  4. **다음 결정 대기**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정. Sector Group 세분화로 그룹 수가 늘어나 일부 그룹은 표본 수(`min_samples`) 미달로 모델 적합이 안 될 수 있으므로 실데이터 확인 필요.
-  5. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
-* 다음 대기 작업: (사용자 요청 대기 중)
+  3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 신규 "수식(Formula)" 탭/다운로드, 3열로 넓어진 시각화 탭(가로 스크롤 필요할 수 있음)과 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
+  4. **다음 결정 대기(기존)**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
+  5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드(`esm_r15.py`)에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정. 반대로 차이가 없거나 Active_RB 축도 여전히 Sector Group별로 갈린다면 Sector Group 축을 유지하고 다른 원인(예: Board Type 내 세부 HW 리비전 차이 등)을 살펴봐야 함.
+  6. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
+* 다음 대기 작업: (사용자 요청 대기 중 — 실데이터로 Better Axis 비교 결과를 보고 Sector Group 축 유지/대체 여부 확정 시 `esm_r15.py`에서 반영)
 
 ---
-*Last Updated: 2026-07-03*
+*Last Updated: 2026-07-06*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
