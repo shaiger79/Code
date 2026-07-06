@@ -30,6 +30,10 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
   - [버그 수정] CSV 다운로드 시 한글/특수문자(×, - 등)가 엑셀에서 깨지는 문제 수정: 인코딩을 지정하지
     않으면 BOM 없는 UTF-8로 저장되어 엑셀이 시스템 기본 코드페이지(CP949 등)로 잘못 해석했다. 모든
     CSV 저장 지점(to_csv)에 encoding='utf-8-sig'를 지정해 엑셀이 UTF-8임을 인식하도록 수정.
+  - [버그 수정] Data I/O & CM 탭에 Traffic Data/Energy Stat Data CSV를 드래그 앤 드롭하면 항상 Energy
+    Stat Data로 잘못 설정되는 문제 수정: 기존 Energy Stat 판정 키워드('stat', 'pm')가 너무 포괄적이라
+    Traffic 파일까지 오분류했다. 파일명에 'power'/'ru'가 있으면 Energy Stat Data로, 'traffic'/'sector'/
+    'group'이 있으면 Traffic Data로 명확히 구분하도록 `handle_file_drop` 수정.
 """
 
 import tkinter as tk
@@ -261,11 +265,18 @@ class AppBase(BaseTk):
                 except: pass
 
     def handle_file_drop(self, event):
+        """[r14] Traffic Data와 Energy Stat Data가 둘 다 CSV라 확장자만으로는 구분이 안 된다.
+        기존에는 Energy Stat 판정 키워드에 'stat'/'pm'처럼 너무 포괄적인 단어가 섞여 있어, PM(Performance
+        Monitoring)으로 불리는 Traffic 파일까지 Energy Stat Data로 잘못 분류되는 문제가 있었다.
+        파일명에 'power'/'ru'(RU)가 있으면 Energy Stat Data로, 'traffic'/'sector'/'group'이 있으면
+        Traffic Data로 명확히 구분하고, 둘 다 해당 없는 파일은 기존과 동일하게 Traffic Data로 간주한다."""
         files = self.tk.splitlist(event.data)
         for f in files:
             ext, fname = os.path.splitext(f)[1].lower(), os.path.basename(f).lower()
             if ext == '.csv':
-                if any(k in fname for k in ['energy', 'stat', 'power', 'pm', 'ru']): self.energy_stat_file.set(f)
+                is_energy_stat = any(k in fname for k in ['energy', 'power', 'ru'])
+                is_traffic = any(k in fname for k in ['traffic', 'sector', 'group'])
+                if is_energy_stat and not is_traffic: self.energy_stat_file.set(f)
                 else: self.traffic_file.set(f)
             elif ext in ['.xlsx', '.xls']: self.cm_file.set(f)
         try: self.status_label.config(text="파일이 드롭되었습니다.", fg=self.ACCENT_GREEN)

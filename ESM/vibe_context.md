@@ -172,8 +172,13 @@
   * **수정**: `_download_learn_result`(RU 상세/HW 요약/**Formula** CSV 다운로드 공용 함수), `_download_energy_intermediate`, Sector 결과 CSV 저장(`save_csv`), 최종 결과 파일 저장(`save_files`, `ESMOutput_Result*.csv` 3종) 등 파일 내 모든 `to_csv()` 호출에 `encoding='utf-8-sig'`(UTF-8 + BOM)를 추가 — Excel이 BOM을 보고 UTF-8임을 올바르게 인식해 한글/특수문자가 정상 표시됨.
   * **검증**: 로컬 PC 실행 환경에서 실제로 Excel/메모장으로 열어 한글·`×`·`-` 표시를 확인하는 것을 권장(이 세션에는 Excel 실행 환경이 없어 코드 레벨 수정만 확인).
 
+* **[v2.9 / esm_r14.py] (2026-07-06) 버그 수정: Data I/O & CM 탭 드래그 앤 드롭 시 Traffic Data가 Energy Stat Data로 오분류**
+  * **배경**: 사용자가 "Data I/O & CM" 탭에 CSV를 드래그 앤 드롭하면 Traffic Data 파일도 항상 Energy Stat Data 입력란에 채워지는 오류를 보고. 두 파일 모두 확장자가 `.csv`라 `handle_file_drop`이 파일명 키워드만으로 구분하는데, 기존 Energy Stat 판정 키워드 목록(`['energy', 'stat', 'power', 'pm', 'ru']`)의 `'stat'`/`'pm'`이 너무 포괄적이어서(PM=Performance Monitoring으로 흔히 불리는 Traffic 파일명에도 자주 포함) Traffic 파일까지 Energy Stat으로 잘못 분류되고 있었음.
+  * **수정**: `AppBase.handle_file_drop`을 두 개의 명확한 키워드 세트로 교체 — 파일명에 `'energy'`/`'power'`/`'ru'`가 있으면 Energy Stat Data, `'traffic'`/`'sector'`/`'group'`이 있으면 Traffic Data로 분류(둘 다 매치되거나 둘 다 매치 안 되면 기존과 동일하게 Traffic Data로 기본 처리).
+  * **검증**: 분류 로직만 별도로 추출해 `PM_Traffic_*.csv`(→Traffic), `RU_Power_Stat_*.csv`(→Energy), `Sector_Group_Traffic.csv`(→Traffic), `EnergyStat.csv`/`RUPowerData.csv`(→Energy), 키워드 없는 파일명(→Traffic, 기존 기본값 유지) 등 대표 케이스로 단위 테스트해 의도대로 분류됨을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.8(`esm_r14.py`) - CSV 다운로드 인코딩(`utf-8-sig`) 버그 수정 완료. 이전 v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.9(`esm_r14.py`) - Data I/O & CM 탭 드래그 앤 드롭 파일 분류(Traffic vs Energy Stat) 버그 수정 완료. 이전 v2.8에서 CSV 다운로드 인코딩(`utf-8-sig`) 버그를 수정했고, v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
