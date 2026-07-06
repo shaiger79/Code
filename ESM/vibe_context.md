@@ -166,8 +166,14 @@
     - **다음 단계**: 실데이터로 학습을 돌려 `Better Axis` 컬럼과 두 산점도(비율 vs 절대)를 비교해, Active_RB 축이 Sector Group 차이를 뚜렷하게 줄여준다면 다음 라운드(`esm_r15.py`)에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 정리하는 것을 검토.
   * **검증**: pandas/numpy만 설치된 환경(scipy/sklearn 미설치, `HAS_SCIPY=False`/`HAS_SKLEARN=False` 상태)에서 (a) `_build_formula_df`를 합성 `hw_df`(양/음의 기울기, ExpSat 계수 NaN 케이스, Isotonic 추천 케이스 포함)로 단위 테스트해 수식 문자열 포맷·부호 처리·N/A 처리·Note 안내가 모두 올바름을 확인, (b) 실제 GUI 앱(`ESAnalyzerApp`)을 기동해 신규 "수식(Formula)" 탭/Treeview가 정상 생성됨을 확인, (c) CM(단독 RU path 1개, nRB_sum=100 + 공유 RU path 1개, nRB_sum=200, 참값 slope=50/intercept=110)과 Cell/RU 단위 학습데이터를 합성해 `_run_energy_curve_learning()`을 실제로 실행 — 복원된 Linear 계수(비율 축 slope≈50.2/49.6, intercept≈109.8/110.0)가 참값과 근접했고, **비율 축과 Active_RB 축의 계수가 수학적으로 정확히 일치**함을 확인(`RB Linear Slope × nRB_sum` = 비율 축 slope, 두 RU path 모두 오차 0.01 이내), `learn_formula_df`의 두 축 수식 문자열이 각 계수와 일치함을 확인(scipy 미설치라 ExpSat 결과는 예상대로 N/A로 표시됨), (d) 시각화 렌더링(matplotlib 3.10, 3열×(그룹수+1)행 그리드)이 예외 없이 완료되고 캔버스 위젯이 정상 생성됨을 확인 — 렌더링 과정에서 컬럼명 접두어 순서 버그(`Avg RB ...` vs `RB Avg ...`) 1건을 발견해 즉시 수정함. GUI 드래그앤드롭/실데이터 컬럼명 호환은 이전 라운드와 동일하게 로컬 PC 확인 필요.
 
+* **[v2.8 / esm_r14.py] (2026-07-06) 버그 수정: CSV 다운로드 시 한글/특수문자 깨짐(엑셀 인코딩 오인식)**
+  * **배경**: 사용자가 Energy Curve 수식(Formula) CSV를 다운로드해 열어보니 `-` 기호와 한글 내용이 깨져 보인다고 보고. 사용자는 "저장 폰트"를 맑은 고딕 같은 일반 폰트로 바꿔달라고 표현했지만, CSV는 폰트 정보를 갖지 않는 순수 텍스트 파일이라 실제 원인은 폰트가 아니라 **인코딩**이었음.
+  * **원인**: 모든 `to_csv()` 호출이 인코딩을 지정하지 않아 BOM 없는 UTF-8로 저장됨. Excel은 BOM이 없는 CSV를 열 때 파일 내용을 UTF-8이 아니라 OS의 로컬 코드페이지(한국어 Windows 기준 CP949/EUC-KR)로 오인식하므로, UTF-8로 인코딩된 한글과 일부 특수문자(수식 문자열의 `×`, 음수 부호 등)가 깨져 보임.
+  * **수정**: `_download_learn_result`(RU 상세/HW 요약/**Formula** CSV 다운로드 공용 함수), `_download_energy_intermediate`, Sector 결과 CSV 저장(`save_csv`), 최종 결과 파일 저장(`save_files`, `ESMOutput_Result*.csv` 3종) 등 파일 내 모든 `to_csv()` 호출에 `encoding='utf-8-sig'`(UTF-8 + BOM)를 추가 — Excel이 BOM을 보고 UTF-8임을 올바르게 인식해 한글/특수문자가 정상 표시됨.
+  * **검증**: 로컬 PC 실행 환경에서 실제로 Excel/메모장으로 열어 한글·`×`·`-` 표시를 확인하는 것을 권장(이 세션에는 Excel 실행 환경이 없어 코드 레벨 수정만 확인).
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.7(`esm_r14.py`) - Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리 완료. Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v2.8(`esm_r14.py`) - CSV 다운로드 인코딩(`utf-8-sig`) 버그 수정 완료. 이전 v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
