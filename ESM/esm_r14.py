@@ -38,16 +38,21 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
 [r15] Optimizer 신규 Advanced Settings 파라미터 + ESM Output Result 열 구성 변경 + Energy Dashboard용
 24시간 Rawdata 추가:
   - Advanced Settings에 RB Threshold Margin_LTE(15)/Required IP Tput Low Util_LTE(1)/
-    N_allowedEScell_LTE(6) 3개 파라미터 신규 추가(모두 configurable). 뒤 2개는 이번 라운드 계산 로직에는
-    아직 연결하지 않고 설정값만 추가함(사용자가 다음 라운드에 구체적 활용 방식을 요청할 예정).
+    N_allowedEScell_LTE(6) 3개 파라미터 신규 추가(모두 configurable).
   - 기존 Optimizer 파라미터 라벨에 향후 NR 등 다른 RAT과 구분하기 위한 "_LTE" 태그 추가(최소보장 목표
     IP Tput/IP Tput Margin/Guarantee Ratio/Threshold RBlowutil/Coe_low/RBLow Multiplier).
   - ESM Output Result의 'PRBusage Threshold' 열을 Entering/Leaving Th_PRB(RB 사용률 기준, 신규
     `_build_th_cols` 헬퍼) + Entering/Leaving Th_Tput(IP Tput 기준) 4개 열로 확장:
     Entering Th_PRB=RBThreshold/total_rb*100(기존과 동일), Leaving Th_PRB=(RBThreshold+RB Threshold
-    Margin_LTE)/total_rb/0.01(진입/이탈 임계값 사이 히스테리시스), Entering Th_Tput=최소보장 목표 IP
-    Tput_LTE+IP Tput Margin_LTE(=기존 t_target), Leaving Th_Tput=최소보장 목표 IP Tput_LTE. ES Level 7
-    (정책 없음, RBThreshold=-1)에서는 4개 모두 -1로 '해당 없음' 표시.
+    Margin_LTE)/total_rb/0.01(진입/이탈 임계값 사이 히스테리시스). Entering/Leaving Th_Tput은 일반 ES
+    Level이면 최소보장 목표 IP Tput_LTE+IP Tput Margin_LTE(Entering)/최소보장 목표 IP Tput_LTE(Leaving,
+    =기존 t_target 기준)를 쓰고, Low Util 윈도우(`is_low_util=True`)면 대신 Required IP Tput Low
+    Util_LTE+IP Tput Margin_LTE(Entering)/Required IP Tput Low Util_LTE(Leaving)를 씀(Low Util 구간은
+    별도의 IP Tput 요구치를 쓴다는 사용자 확인 반영). ES Level 7(정책 없음, RBThreshold=-1)에서는 4개
+    모두 -1로 '해당 없음' 표시.
+  - `N_allowedEScell_LTE`로 Max ES Level 상한 제한: 셀별로 실제 할당 가능한 ES level(=양수 밴드 개수,
+    `max_n`)이 이 값보다 크면 `max_n = min(max_n, N_allowedEScell_LTE)`로 낮춰서, 상위 레벨(더 많은
+    밴드를 끄는 레벨)은 아예 산출하지 않도록 함(run_analysis에서 max_n 산출 직후 적용).
   - Energy Dashboard가 참조할 24시간 전체 Rawdata 신규 추가(`_build_window_rawdata`, ES 윈도우로 필터링
     되지 않은 원본 `group` 전체 사용): 'Time' 다음 열에 그 시간에 적용되는 ES operation window index를
     추가(자동 모드는 카테고리 번호 1/2/3, 수동 모드는 항상 1, 어떤 윈도우에도 속하지 않는 시간은 0)하고,
@@ -148,9 +153,9 @@ class AppBase(BaseTk):
         self.time_hours, self.exclude_dates_str = tk.StringVar(value="0,1,2,3,4,5"), tk.StringVar(value="")
 
         # [r15] Advanced Settings 신규 파라미터(LTE 전용 Optimizer 임계값 - 향후 NR 등 다른 RAT과 구분하기 위해
-        # "_LTE" 태그를 붙임). RB Threshold Margin_LTE는 ESM Output Result의 Leaving Th_PRB 계산에 바로 쓰이지만,
-        # Required IP Tput Low Util_LTE / N_allowedEScell_LTE는 이번 라운드에는 계산 로직에 아직 연결하지 않고
-        # 설정값만 추가함(사용자가 다음 라운드에 구체적인 활용 방식을 요청할 예정).
+        # "_LTE" 태그를 붙임). RB Threshold Margin_LTE는 ESM Output Result의 Leaving Th_PRB 계산에,
+        # Required IP Tput Low Util_LTE는 Low Util 윈도우의 Entering/Leaving Th_Tput 계산에 사용되고,
+        # N_allowedEScell_LTE는 Max ES Level의 상한(할당 가능한 ES level이 이보다 크면 이 값으로 제한)으로 사용된다.
         self.rb_threshold_margin_lte = tk.DoubleVar(value=15)
         self.req_ip_tput_low_util_lte = tk.DoubleVar(value=1)
         self.n_allowed_escell_lte = tk.IntVar(value=6)
@@ -1822,25 +1827,32 @@ class ESAnalyzerApp(AppDashboard):
 
         return cat1, cat2, cat3
 
-    def _build_th_cols(self, rb_threshold, total_rb, t_target):
+    def _build_th_cols(self, rb_threshold, total_rb, t_target, is_low_util=False):
         """[r15] ESM Output Result의 'PRBusage Threshold' 한 열을 Entering/Leaving Th_PRB(RB 사용률 기준)
         + Entering/Leaving Th_Tput(IP Tput 기준) 4개 열로 정리한다.
         - Entering Th_PRB: 기존 PRBusage Threshold와 동일(=RBThreshold/total_rb*100, ES가 진입하는 시점).
         - Leaving Th_PRB: RBThreshold에 RB Threshold Margin_LTE(히스테리시스 여유분)를 더해 ES를 벗어나는
           시점을 더 높게 잡음(=(RBThreshold + RB Threshold Margin_LTE)/total_rb/0.01).
-        - Entering/Leaving Th_Tput: 최소보장 목표 IP Tput_LTE에 IP Tput Margin_LTE를 더하거나(Entering) 더하지
-          않은(Leaving) 값 — t_target이 이미 tput_threshold+tput_margin이므로 그대로 사용.
+        - Entering/Leaving Th_Tput: is_low_util=False(일반 ES Level)이면 최소보장 목표 IP Tput_LTE 기준
+          (t_target=tput_threshold+tput_margin을 그대로 사용), is_low_util=True(Low Util 윈도우)이면 대신
+          Required IP Tput Low Util_LTE + IP Tput Margin_LTE(Entering) / Required IP Tput Low Util_LTE
+          (Leaving) 기준 — 사용자 확인: Low Util 구간은 별도의(대개 더 낮은) IP Tput 요구치를 쓴다.
         RBThreshold가 -1(ES Level 7, 정책 없음)이거나 total_rb가 0이면 4개 모두 -1로 '해당 없음'을 표시."""
         if rb_threshold is None or rb_threshold < 0 or total_rb <= 0:
             return {'Entering Th_PRB': -1, 'Leaving Th_PRB': -1, 'Entering Th_Tput': -1, 'Leaving Th_Tput': -1}
         margin = self.rb_threshold_margin_lte.get()
         entering_prb = (rb_threshold / total_rb) * 100
         leaving_prb = ((rb_threshold + margin) / total_rb) / 0.01
+        if is_low_util:
+            leaving_tput = self.req_ip_tput_low_util_lte.get()
+            entering_tput = leaving_tput + self.tput_margin.get()
+        else:
+            entering_tput, leaving_tput = t_target, self.tput_threshold.get()
         return {
             'Entering Th_PRB': round(entering_prb, 2),
             'Leaving Th_PRB': round(leaving_prb, 2),
-            'Entering Th_Tput': round(t_target, 2),
-            'Leaving Th_Tput': round(self.tput_threshold.get(), 2),
+            'Entering Th_Tput': round(entering_tput, 2),
+            'Leaving Th_Tput': round(leaving_tput, 2),
         }
 
     def _generate_core_policy(self, group, enodeb, sector, max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, is_low_util, hours_str, suffix, plot_dir):
@@ -1859,7 +1871,7 @@ class ESAnalyzerApp(AppDashboard):
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': alpha,
                     'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells, 'DRBn': drb_n,
                     'RBlow': rb_low, 'RBThreshold': fixed_rb_threshold,
-                    **self._build_th_cols(fixed_rb_threshold, total_rb, t_target),
+                    **self._build_th_cols(fixed_rb_threshold, total_rb, t_target, is_low_util=True),
                     'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': active_samples
                 })
                 group[f'DRB_L{n}'] = drb_n
@@ -2161,6 +2173,8 @@ class ESAnalyzerApp(AppDashboard):
                 positive_bands_values = positive_bands_series.values
                 positive_bands_names = positive_bands_series.index.tolist()
                 max_n = len(positive_bands_values)
+                n_allowed = self.n_allowed_escell_lte.get()
+                if n_allowed > 0: max_n = min(max_n, n_allowed)  # [r15] N_allowedEScell_LTE로 Max ES Level 상한 제한
 
                 group = group.copy()
                 group['UsedRB_t_adj'] = np.where(group['UsedRB_t'] == 0, group['UsedRB'], group['UsedRB_t'])
