@@ -27,6 +27,9 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
     (Isotonic은 계수가 없는 비모수 모델이라 닫힌 형태 수식으로 표현 불가 -> 이 표에서는 제외하고,
     추천 모델이 Isotonic인 그룹은 Note 컬럼에 안내만 표시)
   - CSV 다운로드 버튼 추가.
+  - [버그 수정] CSV 다운로드 시 한글/특수문자(×, - 등)가 엑셀에서 깨지는 문제 수정: 인코딩을 지정하지
+    않으면 BOM 없는 UTF-8로 저장되어 엑셀이 시스템 기본 코드페이지(CP949 등)로 잘못 해석했다. 모든
+    CSV 저장 지점(to_csv)에 encoding='utf-8-sig'를 지정해 엑셀이 UTF-8임을 인식하도록 수정.
 """
 
 import tkinter as tk
@@ -1033,7 +1036,7 @@ class AppDashboard(AppEditors):
             filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv"), ("Parquet Files", "*.parquet")], initialfile="Energy_Intermediate.csv")
             if filepath:
                 if filepath.endswith('.parquet'): final_df.to_parquet(filepath, index=False)
-                else: final_df.to_csv(filepath, index=False)
+                else: final_df.to_csv(filepath, index=False, encoding='utf-8-sig')
                 messagebox.showinfo("저장 완료", f"상세 데이터가 저장되었습니다:\n{filepath}")
 
             self.status_label.config(text="Intermediate 다운로드 완료", fg=self.ACCENT_GREEN)
@@ -1527,7 +1530,7 @@ class ESAnalyzerApp(AppDashboard):
         def save_csv():
             filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="Predicted_Energy_Sector_Summary.csv")
             if filepath:
-                self.pred_df_sec.to_csv(filepath, index=False)
+                self.pred_df_sec.to_csv(filepath, index=False, encoding='utf-8-sig')
                 messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}")
 
         ttk.Button(bot_frame, text="💾 Sector 결과 CSV 다운로드", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
@@ -2150,9 +2153,9 @@ class ESAnalyzerApp(AppDashboard):
 
         def save_files():
             try:
-                result_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result.csv"), index=False)
-                if not inter_df.empty: inter_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result_Intermediate.csv"), index=False)
-                if eval_df is not None and not eval_df.empty: eval_df.to_csv(os.path.join(base_out_dir, "ESMOutput_AutoTime_Eval.csv"), index=False)
+                result_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result.csv"), index=False, encoding='utf-8-sig')
+                if not inter_df.empty: inter_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result_Intermediate.csv"), index=False, encoding='utf-8-sig')
+                if eval_df is not None and not eval_df.empty: eval_df.to_csv(os.path.join(base_out_dir, "ESMOutput_AutoTime_Eval.csv"), index=False, encoding='utf-8-sig')
                 messagebox.showinfo("저장 완료", f"결과 파일들이 저장되었습니다.\n\n{base_out_dir}")
             except Exception as e: messagebox.showerror("저장 오류", f"파일 저장 중 오류가 발생했습니다.\n{e}")
 
@@ -2328,7 +2331,7 @@ class ESAnalyzerApp(AppDashboard):
             return messagebox.showwarning("경고", "먼저 '학습 실행'을 눌러 결과를 생성해주세요.")
         filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile=default_name)
         if filepath:
-            df.to_csv(filepath, index=False)
+            df.to_csv(filepath, index=False, encoding='utf-8-sig')
             messagebox.showinfo("저장 완료", f"결과가 저장되었습니다:\n{filepath}")
 
     def _browse_learning_files_multi(self):
