@@ -7,7 +7,7 @@
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
   * Efficiency: Energy Efficiency (EE) = (AirMacDLByte + AirMacULByte) / Consumed [Wh]
-* **버전 파일 관리**: `ESM/esm_r11.py`, `ESM/esm_r12.py`, `ESM/esm_r13.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r14.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r14.py`를 복제해 `esm_r15.py`로 이어간다.
+* **버전 파일 관리**: `ESM/esm_r11.py` ~ `ESM/esm_r14.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r15.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r15.py`를 복제해 `esm_r16.py`로 이어간다.
 
 ## 2. 핵심 개발 원칙 (Core Rules & Directives)
 1. **아키텍처 보존**: 객체지향형 5단계 상속 구조(`AppBase` -> `AppEditors` -> `AppTraffic` -> `AppDashboard` -> `ESAnalyzerApp`)를 절대 훼손하지 않고 확장한다. (※ 실제 코드 상으로는 `AppTraffic`이 별도 클래스로 분리되어 있지 않고 `ESAnalyzerApp`에 트래픽 패턴 뷰어 메서드가 포함된 4단계 상속: `AppBase` -> `AppEditors` -> `AppDashboard` -> `ESAnalyzerApp` 구조로 실동작 중. 아래 3항 참조.)
@@ -26,7 +26,7 @@
 2. ⚙️ DB Editors — CarrierConf/SectorList/RU Spec/CIQ 편집
 3. ✨ Optimizer — ES 임계조건 산출 (Manual/Auto 운영시간)
 4. 📊 Traffic Pattern — Interactive/Batch 트래픽 시각화
-5. ⚡ Energy Dashboard — 소모 에너지 분석, 절감 예측 팝업(Gamma)
+5. ⚡ Energy Dashboard — 소모 에너지 분석, 절감 예측 팝업(Gamma), **ES Level 시간별(15분 단위) IIR 시뮬레이션 팝업(v4.0/esm_r15.py 신규)**
 6. **📈 Learning Energy Curve (신규, v1.5)** — 아래 4항 참조
 
 ## 4. 최근 작업 히스토리 및 주요 업데이트 (History)
@@ -204,16 +204,34 @@
   * **N_allowedEScell_LTE**: "Max ES Level 상한" 파라미터로 확정 — 셀에 실제 할당 가능한 ES level(양수 밴드 개수, `max_n`)이 이 값보다 크면 `max_n = min(max_n, N_allowedEScell_LTE)`로 낮춤(`run_analysis`에서 `max_n` 산출 직후 적용). 예: 밴드가 6개라 원래 6레벨까지 나올 수 있어도 N_allowedEScell_LTE=4면 ES Level은 최대 4까지만 산출.
   * **검증**: 가짜 self로 `_build_th_cols(..., is_low_util=True)`가 Required IP Tput Low Util_LTE(1.0)+IP Tput Margin_LTE(1.0)=2.0(Entering)/1.0(Leaving)을 반환하고 `is_low_util=False`(기본값)는 기존 t_target/tput_threshold 기준을 그대로 반환함을 확인. 실제 GUI 앱으로 양수 밴드 3개(B1/B2/B3)를 가진 셀에 `N_allowedEScell_LTE=2`를 설정해 `run_analysis()`를 실행 — 결과의 `Max ES Level`이 3이 아닌 2로 나오고 `ES Level` 값도 {1,2}만 존재(3이 산출되지 않음)함을 확인.
 
+*(v3.1까지는 `esm_r14.py` 기준, v4.0부터는 새로 분기한 `esm_r15.py` 기준)*
+
+* **[v4.0 / esm_r15.py] (2026-07-06) Energy Dashboard 신규 기능: ES Level 시간별(15분 단위) IIR 시뮬레이션**
+  * **배경**: 기존 에너지 절감 예측(`_calc_all_savings`)은 분포 특성(Nc2, 시간대별 누적 카운트) 기반 추정이라 "시간의 흐름에 따라 ES level이 실제로 어떻게 변하는지"를 반영하지 못해 오차가 있음 — 사용자가 정확도를 높이기 위해 시간 흐름에 따라 ES 적용 조건을 실제로 시뮬레이션하는 기능을 요청. 버전 분기 원칙(1항)에 따라 `esm_r14.py`를 복제해 `esm_r15.py`로 시작(이번 라운드부터 모든 변경은 `esm_r15.py`에만 반영). `esm_r14.py`에 있던 관련 코드 주석의 "[r15]" 태그는 실제로는 `esm_r14.py`에서 작업했던 것이라 "[r14]"로 정정.
+  * **신규 Advanced Settings**: `IIR Filter Coefficient Tput_LTE`/`IIR Filter Coefficient PRB_LTE`(둘 다 기본값 0.25) 추가 — cmIPTput/UsedRB_t_adj를 15분마다 지수평활(EWMA)해 순간적인 튐으로 ES level이 매 스텝 널뛰는 것을 방지.
+  * **Rawdata 재사용/재생성 로직** (신규 `_get_cell_window_defs` + `_build_rawdata_for_period`): Energy Dashboard에 새 "⏱ ES Level 시간별 시뮬레이션" 버튼(팝업)을 추가하고, 팝업 안에서 시뮬레이션 대상 기간(날짜 범위)을 지정할 수 있게 함.
+    - Optimizer 실행 시 사용한 기간을 `run_analysis`에서 `self.latest_optimizer_period = (start_date, end_date, exclude_dates_str)`로 기록해두고, 시뮬레이션 기간이 이와 완전히 같으면(시작일=종료일=제외 날짜 모두 동일) `self.latest_optimizer_rawdata`를 그대로 재사용.
+    - 다르면 **Optimizer를 재실행하지 않고** 트래픽 데이터만 새로 읽어, 이미 도출된 ES 윈도우/레벨 정의(어느 시간이 어느 윈도우인지는 `self.latest_optimizer_rawdata`의 시간→`ES_Window_Index` 매핑에서, 레벨별 DRBn/RBThreshold/Entering·Leaving Th_PRB·Th_Tput은 `self.latest_optimizer_results`에서 각각 복원)를 그대로 적용해 새 Rawdata를 생성. 이렇게 하면 Optimizer 결과물(ES level 대상 target cell, DRB 등)을 재사용하면서도 다른 기간의 실제 트래픽에 대한 Rawdata를 얻을 수 있음.
+  * **Rawdata 스키마 확장**(`_build_window_rawdata` 수정): 기존 `DRB_L{n}`/`RB_Threshold_L{n}`/`Alpha`에 더해, 레벨별 `Entering/Leaving Th_PRB_L{n}`·`Th_Tput_L{n}`(ESM Output Result와 동일 값)과 그 시점 raw 트래픽 기준 `Pred_IPTput_Mbps_L{n}`/`Raw_RB_Margin_L{n}`(Low Util 윈도우도 Alpha=1로 동일 공식 적용)을 모든 레벨에 열로 추가 — 시뮬레이션이 매 스텝 다음 레벨의 임계값/예측치를 열 조회만으로 즉시 얻을 수 있게 함.
+  * **핵심 시뮬레이션 엔진**(신규 `_run_es_level_simulation`): (eNodeBID, Sector) 셀 단위로 15분 스텝마다—
+    1. ES_Window_Index==0(운영 윈도우 밖)이거나 직전 스텝과 윈도우가 바뀌면 Level을 Initial level(0, 하드코딩 — 추후 최적화 기능으로 발전 예정)로 재시작하고 IIR만 raw 값으로 계속 갱신(레벨 결정 로직은 건너뜀).
+    2. 같은 윈도우 안이면: **감소** — `cmIPTput_iir(n) < Leaving Th_Tput(Curr)` 또는 `UsedRB_t_adj_iir(n) > Leaving Th_PRB(Curr)`면 `Next=max(Curr-1,0)`(Tput 조건으로 감소한 경우는 IP Tput 불만족으로 별도 누적) → 아니면 **증가** — `Pred_IPTput_Mbps_L(Curr+1)`(raw, 그 시점 원본 UsedRB_t_adj/SP 기준)이 `Entering Th_Tput(Curr+1)` 이상이고 `UsedRB_t_adj_iir(n)`이 `Entering Th_PRB(Curr+1)` 이하면 `Next=min(Curr+1,max_n)` → 아니면 **유지**.
+    3. 결정된 Next 레벨에 따라 다음 스텝의 cmIPTput 입력을 갱신 — Next=0이면 raw 그대로, Next>0이면 `max(raw_cmIPTput*(1-DRB_L(Next)/(total_rb-raw_UsedRB)),0)`로 보정(전력 절감의 반사실적 효과 반영, UsedRB_t_adj는 항상 raw 사용) — 이 값이 다음 IIR 입력이 됨.
+  * **결과물**: 셀별 요약(레벨 0..max_n 누적 스텝 카운트, IP Tput 불만족 누적 카운트, 총/ES 활성 스텝 수)과 15분 단위 상세 타임라인(Applied_ES_Level/cmIPTput_IIR/UsedRB_t_adj_IIR/cmIPTput_Simulated/Tput_Violation)을 팝업 표 + CSV(요약+타임라인 2개 파일) 다운로드로 제공. **Watt-hour 절감량 환산은 이번 라운드에는 미구현** — 사용자가 이 시뮬레이션 결과(레벨 궤적, 불만족 발생 빈도)의 타당성을 먼저 확인한 뒤 다음 라운드에 반영 여부/방법을 결정하기로 함.
+  * **사용자 확인 완료 사항**(구현 전 3가지 질문 → 모두 "권장안대로" 확정): (a) `Pred_IPTput_Mbps_L(Curr+1)` 계산은 raw(비-IIR) UsedRB_t_adj/SP 사용. (b) "동일 기간" 판정은 시작일/종료일/제외 날짜 모두 일치. (c) 결과는 Energy Dashboard의 새 버튼+팝업으로 표시(기존 "Energy Saving Prediction" 팝업과는 별도).
+  * **검증**: `_run_es_level_simulation`을 가짜 self(iir 계수만 있는 객체)와 손으로 설계한 6-스텝 합성 Rawdata(윈도우 내내 유리한 조건→0→1→2 증가, PRB Leaving 조건으로 2→1 감소, Tput Leaving 조건으로 1→0 감소(Tput_Violation 플래그 확인), 마지막 스텝은 윈도우 이탈로 0 유지)로 단위 테스트해 레벨 궤적 `[0,1,2,1,0,0]`과 IIR 값이 손계산과 소수점까지 정확히 일치함을 확인. 실제 GUI 앱으로 3일치 15분 단위 합성 트래픽에 Optimizer를 실행한 뒤, Optimizer와 동일 기간을 넣으면 `reused=True`로 기존 Rawdata를 그대로 반환하고, 다른 날짜(Optimizer 실행에 없던 3일차)를 넣으면 `reused=False`로 Optimizer를 재실행하지 않고 트래픽만 다시 읽어 15분 간격(하루 96행) Rawdata를 새로 만들며 `ES_Window_Index`/`DRB_L`/`Entering Th_PRB` 등이 기존 학습된 윈도우 정의와 정확히 일치함을 확인 — 이 Rawdata로 시뮬레이션까지 오류 없이 실행됨을 확인. `python -m py_compile` 통과.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v3.1(`esm_r14.py`) - Optimizer Advanced Settings 파라미터 3개 전부 계산 로직에 연결 완료(RB Threshold Margin_LTE→Leaving Th_PRB, Required IP Tput Low Util_LTE→Low Util Entering/Leaving Th_Tput, N_allowedEScell_LTE→Max ES Level 상한). ES_Window_Index 설계(카테고리 번호=윈도우 인덱스)는 사용자 확정 완료. 이전 v3.0에서 기존 파라미터 "_LTE" 라벨 태그 + ESM Output Result의 Entering/Leaving Th_PRB·Th_Tput 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`)를 신규 생성했고, v2.9에서 Data I/O & CM 탭 드래그 앤 드롭 파일 분류(Traffic vs Energy Stat) 버그를 수정했고, v2.8에서 CSV 다운로드 인코딩(`utf-8-sig`) 버그를 수정했고, v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료.
+* 현재 상태: v4.0(`esm_r15.py`) - Energy Dashboard에 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능 신규 추가 완료(로직 단위 테스트 + 실제 GUI 앱 End-to-End 검증 완료). 이전 v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개(RB Threshold Margin_LTE/Required IP Tput Low Util_LTE/N_allowedEScell_LTE) 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 신규 "수식(Formula)" 탭/다운로드, 3열로 넓어진 시각화 탭(가로 스크롤 필요할 수 있음)과 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
   4. **다음 결정 대기(기존)**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
-  5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드(`esm_r15.py`)에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정. 반대로 차이가 없거나 Active_RB 축도 여전히 Sector Group별로 갈린다면 Sector Group 축을 유지하고 다른 원인(예: Board Type 내 세부 HW 리비전 차이 등)을 살펴봐야 함.
-  6. **Energy Dashboard 연동 보류 중**: 사용자가 실데이터로 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)의 유의미성을 먼저 검증한 뒤, `_calc_all_savings` 등 절감 예측 로직에 어떻게 반영할지 결정하기로 함 — 다음 라운드 대기.
-* 다음 대기 작업: (사용자 요청 대기 중 — 실데이터로 Better Axis 비교 결과를 보고 Sector Group 축 유지/대체 여부 확정 시 `esm_r15.py`에서 반영)
+  5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
+  6. **다음 결정 대기(v4.0)**: 사용자가 실제 데이터로 ES Level 시뮬레이션 결과(레벨 궤적, IP Tput 불만족 빈도)를 검토한 뒤 — (a) Watt-hour 절감량 환산(RU HW Idle/PAoff 전력차와 결합) 반영 여부/방법, (b) Initial level을 0이 아닌 값으로 최적화하는 기능, (c) 기존 Nc2 기반 예측(`_calc_all_savings`)과의 비교/교체 여부를 다음 라운드에 결정.
+  7. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
+* 다음 대기 작업: (사용자가 ES Level 시뮬레이션 결과를 실데이터로 확인한 뒤 Watt-hour 환산 등 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
 
 ---
 *Last Updated: 2026-07-06*
