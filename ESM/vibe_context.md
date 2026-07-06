@@ -177,8 +177,35 @@
   * **수정**: `AppBase.handle_file_drop`을 두 개의 명확한 키워드 세트로 교체 — 파일명에 `'energy'`/`'power'`/`'ru'`가 있으면 Energy Stat Data, `'traffic'`/`'sector'`/`'group'`이 있으면 Traffic Data로 분류(둘 다 매치되거나 둘 다 매치 안 되면 기존과 동일하게 Traffic Data로 기본 처리).
   * **검증**: 분류 로직만 별도로 추출해 `PM_Traffic_*.csv`(→Traffic), `RU_Power_Stat_*.csv`(→Energy), `Sector_Group_Traffic.csv`(→Traffic), `EnergyStat.csv`/`RUPowerData.csv`(→Energy), 키워드 없는 파일명(→Traffic, 기존 기본값 유지) 등 대표 케이스로 단위 테스트해 의도대로 분류됨을 확인.
 
+* **[v3.0 / esm_r14.py] (2026-07-06) Optimizer 기능 확장: Advanced Settings 파라미터 추가 + ESM Output Result 열 재구성 + Energy Dashboard용 24시간 Rawdata**
+  * **배경**: 사용자가 Optimizer 결과(ESM Output Result)의 RB/PRB 임계값 표현을 더 세밀하게(진입/이탈 히스테리시스) 다듬고, Energy Dashboard가 하루 24시간 전체를 놓고 절감량을 계산할 수 있도록 ES 윈도우 밖 시간까지 포함한 원본 데이터를 만들어달라고 요청. 4가지를 한 번에 요청: (1) Advanced Settings 파라미터 3개 추가, (2) 기존 파라미터 이름에 "_LTE" 태그, (3) ESM Output Result 열 구성 변경, (4) Energy Dashboard용 24시간 Rawdata 추가.
+  * **(1) Advanced Settings 신규 파라미터 3개** (`_build_main_ui`, 모두 configurable):
+    - `RB Threshold Margin_LTE`(기본값 15) — Leaving Th_PRB 계산에 바로 사용(아래 (3) 참조).
+    - `Required IP Tput Low Util_LTE`(기본값 1), `N_allowedEScell_LTE`(기본값 6) — 이번 라운드에는 설정값만 추가하고 계산 로직에는 아직 연결하지 않음(사용자 요청 문구가 "코드 수정이 다 끝나면 신규 기능에 대해 요청할게"였기 때문에, 이 두 파라미터의 구체적 활용 방식은 다음 라운드 요청을 기다리는 중).
+  * **(2) 기존 파라미터 라벨에 "_LTE" 태그 추가**: 최소보장 목표 IP Tput/IP Tput Margin/Guarantee Ratio/Threshold RBlowutil/Coe_low/RBLow Multiplier 6개 라벨에 "_LTE" 접미사 추가(향후 NR 등 다른 RAT 파라미터와 구분하기 위한 태그, 내부 변수명(`self.tput_threshold` 등)은 변경하지 않고 UI 라벨 텍스트만 수정).
+  * **(3) ESM Output Result 열 재구성**: 'PRBusage Threshold' 한 열을 4개 열로 확장(신규 `_build_th_cols` 헬퍼, `_generate_core_policy` 내 5곳 모두 적용):
+    - `Entering Th_PRB` = RBThreshold/total_rb*100 (기존 PRBusage Threshold와 동일한 계산).
+    - `Leaving Th_PRB` = (RBThreshold + RB Threshold Margin_LTE)/total_rb/0.01 — Entering보다 더 높은 RB 사용률에서 ES를 벗어나도록 하는 히스테리시스 여유분.
+    - `Entering Th_Tput` = 최소보장 목표 IP Tput_LTE + IP Tput Margin_LTE (기존에 이미 `t_target`으로 계산되던 값).
+    - `Leaving Th_Tput` = 최소보장 목표 IP Tput_LTE.
+    - ES Level 7(정책 없음, RBThreshold=-1)이거나 total_rb=0이면 4개 모두 -1로 '해당 없음' 표시(기존 -1 컨벤션 유지).
+  * **(4) Energy Dashboard용 24시간 Rawdata 신규 추가** (신규 `_build_window_rawdata`): 기존 Optimizer의 "Intermediate Data"는 ES 운영시간 윈도우로 필터링된 시간만 포함했는데, Energy Dashboard가 하루 전체(윈도우 밖 시간 포함)를 봐야 하므로 필터링 이전의 전체 `group`을 기반으로 새 데이터셋을 만듦:
+    - `Time` 다음 열에 `ES_Window_Index`를 추가 — 해당 시간이 속한 ES operation window를 식별(자동 모드는 카테고리 번호 1(Low Util)/2(ES Level2)/3(ES Level1)를 그대로 사용, 수동 모드는 윈도우가 하나뿐이라 항상 1, 어떤 윈도우에도 속하지 않는 시간(No ES 시간대 등)은 0).
+    - `Alpha`/`DRB_L{n}`/`RB_Threshold_L{n}`을 해당 윈도우에서 학습된 값으로 채움(윈도우가 다르면 값도 다름 — 사용자가 기대한 대로 윈도우별로 다른 DRB_L/RB Threshold가 적용됨). 윈도우 밖 시간은 ES 정책이 없으므로 NaN.
+    - `_do_manual_mode`/`_do_auto_mode`가 이제 `(results, intermediates, raw_df)` 3-tuple을 반환하도록 변경, `run_analysis`에서 취합해 `self.latest_optimizer_rawdata`에 보관.
+    - **Optimizer 탭에는 표시하지 않음**(사용자 요청) — `show_results_window`의 트리뷰 탭 구성(ESM Output Result/Intermediate Data/Auto Time Eval O/X)은 그대로 유지하고, raw_df는 "💾 최종 결과 파일(CSV) 저장" 클릭 시 `ESMOutput_RawData_EnergyDashboard.csv`로만 함께 저장.
+    - Energy Dashboard 쪽 코드에서 향후 "Rawdata"라고 언급되면 이 `self.latest_optimizer_rawdata`(=`ESMOutput_RawData_EnergyDashboard.csv`)를 가리키는 것으로 이해하고 작업하기로 함.
+  * **검증**: pandas/numpy만으로 `_build_th_cols`/`_build_window_rawdata`를 가짜 self(간단한 `.get()` 속성만 가진 객체)로 단위 테스트 — Entering/Leaving Th_PRB·Th_Tput 계산값이 손계산과 일치하고 ES Level 7의 -1 처리가 정확함을 확인했고, 2개 윈도우(0~3시=Cat1, 20~23시=Cat3)로 구성한 24시간 합성 데이터에서 `ES_Window_Index`/`Alpha`/`DRB_L{n}`/`RB_Threshold_L{n}`이 각 윈도우 안에서는 그 윈도우의 값으로, 윈도우 밖(4~19시)에서는 0/NaN으로 정확히 채워짐을 확인. `python -m py_compile` 통과. GUI 실행(Advanced Settings 새 항목 표출, 실제 트래픽 데이터로 ESM Output Result의 4개 신규 열/저장되는 RawData CSV 확인)은 로컬 PC에서 추가 확인 필요.
+  * **사용자 확인 요청 사항**: 사용자가 "맞게 동작하는 거지? 확인해줘"라고 명시적으로 질문한 부분 — (a) `ES_Window_Index`를 자동 모드 카테고리 번호(1/2/3)로, 수동 모드는 항상 1로 정한 것이 맞는지 → **사용자가 "맞음, 이대로 사용" 확정**. (b) 윈도우 밖 시간의 DRB_L/RB_Threshold_L을 NaN(정책 없음)으로 둔 것 → 별도 이견 없이 유지. (c) `Required IP Tput Low Util_LTE`/`N_allowedEScell_LTE` 활용 방식 → 아래 v3.1에서 확정.
+
+* **[v3.1 / esm_r14.py] (2026-07-06) 후속 확인: Required IP Tput Low Util_LTE / N_allowedEScell_LTE 계산 로직 연결**
+  * **배경**: v3.0에서 두 파라미터를 설정값만 추가하고 계산에 연결하지 않았던 것에 대해 사용자가 구체적 활용 방식을 알려줌.
+  * **Required IP Tput Low Util_LTE**: Low Util 윈도우(`is_low_util=True`)의 Entering/Leaving Th_Tput은 일반 ES Level과 달리 최소보장 목표 IP Tput_LTE가 아니라 이 파라미터를 기준으로 계산 — Entering Th_Tput = Required IP Tput Low Util_LTE + IP Tput Margin_LTE, Leaving Th_Tput = Required IP Tput Low Util_LTE. `_build_th_cols`에 `is_low_util` 인자를 추가해 분기 처리(일반 ES Level 호출부는 그대로, Low Util 분기의 두 호출부 중 성공 케이스에 `is_low_util=True` 전달; ES Level 7(-1) 케이스는 어차피 4열 모두 -1로 조기 반환되어 플래그가 결과에 영향 없음).
+  * **N_allowedEScell_LTE**: "Max ES Level 상한" 파라미터로 확정 — 셀에 실제 할당 가능한 ES level(양수 밴드 개수, `max_n`)이 이 값보다 크면 `max_n = min(max_n, N_allowedEScell_LTE)`로 낮춤(`run_analysis`에서 `max_n` 산출 직후 적용). 예: 밴드가 6개라 원래 6레벨까지 나올 수 있어도 N_allowedEScell_LTE=4면 ES Level은 최대 4까지만 산출.
+  * **검증**: 가짜 self로 `_build_th_cols(..., is_low_util=True)`가 Required IP Tput Low Util_LTE(1.0)+IP Tput Margin_LTE(1.0)=2.0(Entering)/1.0(Leaving)을 반환하고 `is_low_util=False`(기본값)는 기존 t_target/tput_threshold 기준을 그대로 반환함을 확인. 실제 GUI 앱으로 양수 밴드 3개(B1/B2/B3)를 가진 셀에 `N_allowedEScell_LTE=2`를 설정해 `run_analysis()`를 실행 — 결과의 `Max ES Level`이 3이 아닌 2로 나오고 `ES Level` 값도 {1,2}만 존재(3이 산출되지 않음)함을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v2.9(`esm_r14.py`) - Data I/O & CM 탭 드래그 앤 드롭 파일 분류(Traffic vs Energy Stat) 버그 수정 완료. 이전 v2.8에서 CSV 다운로드 인코딩(`utf-8-sig`) 버그를 수정했고, v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료(로직 End-to-End 합성 데이터 검증 완료, GUI 실행 테스트는 로컬 확인 필요).
+* 현재 상태: v3.1(`esm_r14.py`) - Optimizer Advanced Settings 파라미터 3개 전부 계산 로직에 연결 완료(RB Threshold Margin_LTE→Leaving Th_PRB, Required IP Tput Low Util_LTE→Low Util Entering/Leaving Th_Tput, N_allowedEScell_LTE→Max ES Level 상한). ES_Window_Index 설계(카테고리 번호=윈도우 인덱스)는 사용자 확정 완료. 이전 v3.0에서 기존 파라미터 "_LTE" 라벨 태그 + ESM Output Result의 Entering/Leaving Th_PRB·Th_Tput 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`)를 신규 생성했고, v2.9에서 Data I/O & CM 탭 드래그 앤 드롭 파일 분류(Traffic vs Energy Stat) 버그를 수정했고, v2.8에서 CSV 다운로드 인코딩(`utf-8-sig`) 버그를 수정했고, v2.7에서 Learning Energy Curve의 Linear/ExpSat 모델을 "수식(Formula)" 표(+CSV 다운로드)로 정리했고, Sector Group 일반화를 위해 `Active_RB`(절대 활성 RB) 축을 기존 `Loading_traffic`(비율) 축과 나란히 병행 학습/시각화/수식화하는 진단 기능까지 구현 완료.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.

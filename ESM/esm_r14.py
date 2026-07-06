@@ -34,6 +34,36 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
     Stat Data로 잘못 설정되는 문제 수정: 기존 Energy Stat 판정 키워드('stat', 'pm')가 너무 포괄적이라
     Traffic 파일까지 오분류했다. 파일명에 'power'/'ru'가 있으면 Energy Stat Data로, 'traffic'/'sector'/
     'group'이 있으면 Traffic Data로 명확히 구분하도록 `handle_file_drop` 수정.
+
+[r15] Optimizer 신규 Advanced Settings 파라미터 + ESM Output Result 열 구성 변경 + Energy Dashboard용
+24시간 Rawdata 추가:
+  - Advanced Settings에 RB Threshold Margin_LTE(15)/Required IP Tput Low Util_LTE(1)/
+    N_allowedEScell_LTE(6) 3개 파라미터 신규 추가(모두 configurable).
+  - 기존 Optimizer 파라미터 라벨에 향후 NR 등 다른 RAT과 구분하기 위한 "_LTE" 태그 추가(최소보장 목표
+    IP Tput/IP Tput Margin/Guarantee Ratio/Threshold RBlowutil/Coe_low/RBLow Multiplier).
+  - ESM Output Result의 'PRBusage Threshold' 열을 Entering/Leaving Th_PRB(RB 사용률 기준, 신규
+    `_build_th_cols` 헬퍼) + Entering/Leaving Th_Tput(IP Tput 기준) 4개 열로 확장:
+    Entering Th_PRB=RBThreshold/total_rb*100(기존과 동일), Leaving Th_PRB=(RBThreshold+RB Threshold
+    Margin_LTE)/total_rb/0.01(진입/이탈 임계값 사이 히스테리시스). Entering/Leaving Th_Tput은 일반 ES
+    Level이면 최소보장 목표 IP Tput_LTE+IP Tput Margin_LTE(Entering)/최소보장 목표 IP Tput_LTE(Leaving,
+    =기존 t_target 기준)를 쓰고, Low Util 윈도우(`is_low_util=True`)면 대신 Required IP Tput Low
+    Util_LTE+IP Tput Margin_LTE(Entering)/Required IP Tput Low Util_LTE(Leaving)를 씀(Low Util 구간은
+    별도의 IP Tput 요구치를 쓴다는 사용자 확인 반영). ES Level 7(정책 없음, RBThreshold=-1)에서는 4개
+    모두 -1로 '해당 없음' 표시.
+  - `N_allowedEScell_LTE`로 Max ES Level 상한 제한: 셀별로 실제 할당 가능한 ES level(=양수 밴드 개수,
+    `max_n`)이 이 값보다 크면 `max_n = min(max_n, N_allowedEScell_LTE)`로 낮춰서, 상위 레벨(더 많은
+    밴드를 끄는 레벨)은 아예 산출하지 않도록 함(run_analysis에서 max_n 산출 직후 적용).
+  - Energy Dashboard가 참조할 24시간 전체 Rawdata 신규 추가(`_build_window_rawdata`, ES 윈도우로 필터링
+    되지 않은 원본 `group` 전체 사용): 'Time' 다음 열에 그 시간에 적용되는 ES operation window index를
+    추가(자동 모드는 카테고리 번호 1/2/3, 수동 모드는 항상 1, 어떤 윈도우에도 속하지 않는 시간은 0)하고,
+    Alpha/DRB_L{n}/RB_Threshold_L{n}을 해당 윈도우에서 학습된 값으로 채움(윈도우 밖 시간은 NaN — ES
+    정책이 적용되지 않으므로). Optimizer 결과 뷰어(ESM Output Result/Intermediate Data 탭)에는 표시하지
+    않고 `self.latest_optimizer_rawdata`에만 보관하며, "최종 결과 파일(CSV) 저장" 클릭 시
+    ESMOutput_RawData_EnergyDashboard.csv로 함께 저장. 이후 Energy Dashboard 기능에서 "Rawdata"로 참조.
+  - 검증: `_build_th_cols`/`_build_window_rawdata`를 가짜 self(간단한 .get() 객체)로 단위 테스트 —
+    Entering/Leaving Th_PRB·Th_Tput 계산값과 ES Level 7의 -1 처리, 그리고 2개 윈도우(예: 0~3시=Cat1,
+    20~23시=Cat3)로 구성한 24시간 합성 데이터에서 ES_Window_Index/Alpha/DRB_L/RB_Threshold_L이 윈도우
+    안에서는 해당 윈도우 값으로, 윈도우 밖(4~19시)에서는 0/NaN으로 정확히 채워짐을 확인.
 """
 
 import tkinter as tk
@@ -122,6 +152,14 @@ class AppBase(BaseTk):
         self.threshold_rblowutil, self.coe_low, self.rblow_multiplier = tk.DoubleVar(value=0.8), tk.DoubleVar(value=1.0), tk.DoubleVar(value=0.5)
         self.time_hours, self.exclude_dates_str = tk.StringVar(value="0,1,2,3,4,5"), tk.StringVar(value="")
 
+        # [r15] Advanced Settings 신규 파라미터(LTE 전용 Optimizer 임계값 - 향후 NR 등 다른 RAT과 구분하기 위해
+        # "_LTE" 태그를 붙임). RB Threshold Margin_LTE는 ESM Output Result의 Leaving Th_PRB 계산에,
+        # Required IP Tput Low Util_LTE는 Low Util 윈도우의 Entering/Leaving Th_Tput 계산에 사용되고,
+        # N_allowedEScell_LTE는 Max ES Level의 상한(할당 가능한 ES level이 이보다 크면 이 값으로 제한)으로 사용된다.
+        self.rb_threshold_margin_lte = tk.DoubleVar(value=15)
+        self.req_ip_tput_low_util_lte = tk.DoubleVar(value=1)
+        self.n_allowed_escell_lte = tk.IntVar(value=6)
+
         self.auto_optimize_time = tk.BooleanVar(value=False)
         self.max_time_windows = tk.IntVar(value=1)
         self.no_es_hours = tk.StringVar(value="11,12,13,14")
@@ -134,6 +172,7 @@ class AppBase(BaseTk):
         self.cm_map_df_full = pd.DataFrame()
         self.hourly_eval_records = []
         self.latest_optimizer_results = None
+        self.latest_optimizer_rawdata = None  # [r15] Energy Dashboard용 24시간 전체 Rawdata(ES 윈도우 밖 시간 포함)
         self.show_advanced = False
 
         # [Learning Energy Curve, r12] RU HW 단위 loading-energy 회귀 + Idle/PA off 보정 학습 관련 상태
@@ -426,7 +465,7 @@ class AppBase(BaseTk):
         self.entry_time = ttk.Entry(param_frame, textvariable=self.time_hours, width=20)
         self.entry_time.grid(row=4, column=1, sticky=tk.W, padx=10)
 
-        self.lbl_tput_th = ttk.Label(param_frame, text="최소보장 목표 IP Tput (Mbps):", style='Card.TLabel', font=('Segoe UI', 10, 'bold'))
+        self.lbl_tput_th = ttk.Label(param_frame, text="최소보장 목표 IP Tput_LTE (Mbps):", style='Card.TLabel', font=('Segoe UI', 10, 'bold'))
         self.lbl_tput_th.grid(row=5, column=0, sticky=tk.W, pady=8)
         ttk.Entry(param_frame, textvariable=self.tput_threshold, width=15).grid(row=5, column=1, sticky=tk.W, padx=10)
 
@@ -434,18 +473,24 @@ class AppBase(BaseTk):
         self.advanced_btn.pack(pady=5)
 
         self.advanced_frame = ttk.Frame(self.frame_main, style='Card.TFrame', padding=10)
-        ttk.Label(self.advanced_frame, text="IP Tput Margin:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.advanced_frame, text="IP Tput Margin_LTE:").grid(row=0, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.tput_margin, width=15).grid(row=0, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="Guarantee Ratio:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.advanced_frame, text="Guarantee Ratio_LTE:").grid(row=1, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.guarantee_ratio, width=15).grid(row=1, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="Threshold RBlowutil:").grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.advanced_frame, text="Threshold RBlowutil_LTE:").grid(row=2, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.threshold_rblowutil, width=15).grid(row=2, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="Coe_low:").grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.advanced_frame, text="Coe_low_LTE:").grid(row=3, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.coe_low, width=15).grid(row=3, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="RBLow Multiplier:").grid(row=4, column=0, sticky=tk.W, pady=5)
+        ttk.Label(self.advanced_frame, text="RBLow Multiplier_LTE:").grid(row=4, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.rblow_multiplier, width=15).grid(row=4, column=1, sticky=tk.W, padx=10)
         ttk.Label(self.advanced_frame, text="Low Util Window 활성화:").grid(row=5, column=0, sticky=tk.W, pady=5)
         ttk.Checkbutton(self.advanced_frame, text="On", variable=self.low_util_window_on).grid(row=5, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="RB Threshold Margin_LTE:").grid(row=6, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.rb_threshold_margin_lte, width=15).grid(row=6, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="Required IP Tput Low Util_LTE:").grid(row=7, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.req_ip_tput_low_util_lte, width=15).grid(row=7, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="N_allowedEScell_LTE:").grid(row=8, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.n_allowed_escell_lte, width=15).grid(row=8, column=1, sticky=tk.W, padx=10)
 
         bottom_frame = ttk.Frame(self.frame_main)
         bottom_frame.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM)
@@ -1782,6 +1827,34 @@ class ESAnalyzerApp(AppDashboard):
 
         return cat1, cat2, cat3
 
+    def _build_th_cols(self, rb_threshold, total_rb, t_target, is_low_util=False):
+        """[r15] ESM Output Result의 'PRBusage Threshold' 한 열을 Entering/Leaving Th_PRB(RB 사용률 기준)
+        + Entering/Leaving Th_Tput(IP Tput 기준) 4개 열로 정리한다.
+        - Entering Th_PRB: 기존 PRBusage Threshold와 동일(=RBThreshold/total_rb*100, ES가 진입하는 시점).
+        - Leaving Th_PRB: RBThreshold에 RB Threshold Margin_LTE(히스테리시스 여유분)를 더해 ES를 벗어나는
+          시점을 더 높게 잡음(=(RBThreshold + RB Threshold Margin_LTE)/total_rb/0.01).
+        - Entering/Leaving Th_Tput: is_low_util=False(일반 ES Level)이면 최소보장 목표 IP Tput_LTE 기준
+          (t_target=tput_threshold+tput_margin을 그대로 사용), is_low_util=True(Low Util 윈도우)이면 대신
+          Required IP Tput Low Util_LTE + IP Tput Margin_LTE(Entering) / Required IP Tput Low Util_LTE
+          (Leaving) 기준 — 사용자 확인: Low Util 구간은 별도의(대개 더 낮은) IP Tput 요구치를 쓴다.
+        RBThreshold가 -1(ES Level 7, 정책 없음)이거나 total_rb가 0이면 4개 모두 -1로 '해당 없음'을 표시."""
+        if rb_threshold is None or rb_threshold < 0 or total_rb <= 0:
+            return {'Entering Th_PRB': -1, 'Leaving Th_PRB': -1, 'Entering Th_Tput': -1, 'Leaving Th_Tput': -1}
+        margin = self.rb_threshold_margin_lte.get()
+        entering_prb = (rb_threshold / total_rb) * 100
+        leaving_prb = ((rb_threshold + margin) / total_rb) / 0.01
+        if is_low_util:
+            leaving_tput = self.req_ip_tput_low_util_lte.get()
+            entering_tput = leaving_tput + self.tput_margin.get()
+        else:
+            entering_tput, leaving_tput = t_target, self.tput_threshold.get()
+        return {
+            'Entering Th_PRB': round(entering_prb, 2),
+            'Leaving Th_PRB': round(leaving_prb, 2),
+            'Entering Th_Tput': round(entering_tput, 2),
+            'Leaving Th_Tput': round(leaving_tput, 2),
+        }
+
     def _generate_core_policy(self, group, enodeb, sector, max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, is_low_util, hours_str, suffix, plot_dir):
         sector_results = []
         if is_low_util:
@@ -1792,13 +1865,13 @@ class ESAnalyzerApp(AppDashboard):
             for n in range(max_n, 0, -1):
                 target_cells = self._get_target_cells_str([positive_bands_names[n-1]], carrier_df, target_col)
                 drb_n = positive_bands_values[:n].sum()
-                prb_th = (fixed_rb_threshold / total_rb) * 100 if total_rb > 0 else 0
                 est_saving = self._calculate_est_saving(enodeb, target_cells, active_samples)
 
                 sector_results.append({
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': alpha,
                     'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells, 'DRBn': drb_n,
-                    'RBlow': rb_low, 'RBThreshold': fixed_rb_threshold, 'PRBusage Threshold': round(prb_th, 2),
+                    'RBlow': rb_low, 'RBThreshold': fixed_rb_threshold,
+                    **self._build_th_cols(fixed_rb_threshold, total_rb, t_target, is_low_util=True),
                     'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': active_samples
                 })
                 group[f'DRB_L{n}'] = drb_n
@@ -1810,7 +1883,9 @@ class ESAnalyzerApp(AppDashboard):
                     sector_results.append({
                         'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': alpha,
                         'Max ES Level': max_n, 'ES Level': 7, 'Target Cell Num': es7_target_cells, 'DRBn': 0,
-                        'RBlow': rb_low, 'RBThreshold': -1, 'PRBusage Threshold': -1, 'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
+                        'RBlow': rb_low, 'RBThreshold': -1,
+                        **self._build_th_cols(-1, total_rb, t_target),
+                        'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
                     })
 
             fig, ax = plt.subplots(figsize=(10, 6))
@@ -1862,14 +1937,14 @@ class ESAnalyzerApp(AppDashboard):
                     n_c2 = mask_c2.sum()
                     if n_c2 / n_c1 >= self.guarantee_ratio.get():
                         th_n = t_n_search = v
-                        prb_th = (th_n / total_rb) * 100 if total_rb > 0 else 0
                         est_saving = self._calculate_est_saving(enodeb, target_cells, n_c2)
 
                         sector_results.append({
                             'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6),
                             'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells,
                             'DRBn': drb_n, 'RBlow': rb_low, 'RBThreshold': th_n,
-                            'PRBusage Threshold': round(prb_th, 2), 'Est. Saving': est_saving, 'Nc1': n_c1, 'Nc2': n_c2
+                            **self._build_th_cols(th_n, total_rb, t_target),
+                            'Est. Saving': est_saving, 'Nc1': n_c1, 'Nc2': n_c2
                         })
                         found_th = True
                         ax.axvline(x=th_n, color=colors(n-1), linestyle='--', linewidth=2, label=f'Th_{n}={th_n}')
@@ -1881,14 +1956,14 @@ class ESAnalyzerApp(AppDashboard):
                     target_row = min(valid_higher_levels, key=lambda x: x['ES Level'])
                     inherited_th, nc2 = target_row['RBThreshold'], target_row['Nc2']
                     t_n_search = inherited_th
-                    prb_th = (inherited_th / total_rb) * 100 if total_rb > 0 else 0
                     est_saving = self._calculate_est_saving(enodeb, target_cells, nc2)
 
                     sector_results.append({
                         'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6),
                         'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells,
                         'DRBn': drb_n, 'RBlow': rb_low, 'RBThreshold': inherited_th,
-                        'PRBusage Threshold': round(prb_th, 2), 'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': nc2
+                        **self._build_th_cols(inherited_th, total_rb, t_target),
+                        'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': nc2
                     })
                 else:
                     failed_es_bands.append(positive_bands_names[n-1])
@@ -1900,7 +1975,8 @@ class ESAnalyzerApp(AppDashboard):
                 sector_results.append({
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6), 'Max ES Level': max_n, 'ES Level': 7,
                     'Target Cell Num': es7_target_cells, 'DRBn': 0, 'RBlow': rb_low, 'RBThreshold': -1,
-                    'PRBusage Threshold': -1, 'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
+                    **self._build_th_cols(-1, total_rb, t_target),
+                    'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
                 })
 
         ax.axhline(y=t_target, color='#EF4444', linestyle='-', linewidth=2, label=f'Target (t)={t_target}')
@@ -1912,19 +1988,50 @@ class ESAnalyzerApp(AppDashboard):
         fig.savefig(os.path.join(plot_dir, f"ES_plot_{enodeb}_{sector}{suffix}.png"), dpi=150)
         return sector_results, [group]
 
+    def _build_window_rawdata(self, full_group, window_map, max_n, total_rb):
+        """[r15] Energy Dashboard가 참조할 'Rawdata'(24시간 전체, ES 윈도우 밖 시간 포함)를 만든다.
+        window_map = {window_index: (hours_list, sector_results_of_that_window)}. 'Time' 다음 열에 그 시간에
+        적용되는 ES operation window index(윈도우 밖이면 0)를 넣고, Alpha/DRB_L{n}/RB_Threshold_L{n}은 해당
+        시간이 속한 윈도우에서 학습된 값을 그대로 채운다(윈도우 밖 시간은 ES 정책이 없으므로 NaN).
+        Optimizer 탭(ESM Output Result/Intermediate Data)에는 표시하지 않고 self.latest_optimizer_rawdata에만
+        보관한다 -> 이후 Energy Dashboard 기능에서 'Rawdata'로 참조."""
+        raw = full_group.copy()
+        if 'Time' in raw.columns:
+            raw.insert(raw.columns.get_loc('Time') + 1, 'ES_Window_Index', 0)
+        else:
+            raw['ES_Window_Index'] = 0
+        raw['Max_ES_Level'], raw['Total_RB'], raw['Alpha'] = max_n, total_rb, np.nan
+        for n in range(1, max_n + 1):
+            raw[f'DRB_L{n}'] = np.nan
+            raw[f'RB_Threshold_L{n}'] = np.nan
+
+        for window_idx, (hours_list, res) in window_map.items():
+            if not res: continue
+            level_rows = {r['ES Level']: r for r in res if r.get('ES Level') != 7}
+            alpha_val = res[0].get('Alpha', np.nan)
+            mask = raw['Time'].dt.hour.isin(hours_list)
+            raw.loc[mask, 'ES_Window_Index'] = window_idx
+            raw.loc[mask, 'Alpha'] = alpha_val
+            for n, r in level_rows.items():
+                raw.loc[mask, f'DRB_L{n}'] = r.get('DRBn', np.nan)
+                raw.loc[mask, f'RB_Threshold_L{n}'] = r.get('RBThreshold', np.nan)
+        return raw
+
     def _do_manual_mode(self, group, enodeb, sector, max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir):
         hours = [int(h.strip()) for h in self.time_hours.get().split(",")]
         sub_group = group[group['Time'].dt.hour.isin(hours)].copy()
-        if sub_group.empty: return [], []
+        if sub_group.empty: return [], [], pd.DataFrame()
         hours_str = ",".join(map(str, sorted(hours)))
         sub_group['Is_Low_Utilized'] = sub_group['UsedRB'] <= rb_low
         is_low_util = (sub_group['Is_Low_Utilized'].sum() / len(sub_group)) >= self.threshold_rblowutil.get()
 
-        return self._generate_core_policy(
+        res, inter = self._generate_core_policy(
             sub_group, enodeb, sector, max_n, total_rb, positive_bands_names,
             positive_bands_values, negative_bands_names, carrier_df, target_col,
             rb_low, t_target, is_low_util, hours_str, suffix="", plot_dir=plot_dir
         )
+        raw = self._build_window_rawdata(group, {1: (hours, res)}, max_n, total_rb)
+        return res, inter, raw
 
     def _do_auto_mode(self, group, enodeb, sector, max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir):
         max_win, low_on = self.max_time_windows.get(), self.low_util_window_on.get()
@@ -1964,7 +2071,7 @@ class ESAnalyzerApp(AppDashboard):
                 final_sets[cat] = valid_hours
                 remaining_hours -= set(valid_hours)
 
-        results, intermediates = [], []
+        results, intermediates, window_map = [], [], {}
         for cat, hours_list in final_sets.items():
             sub_group = group[group['Time'].dt.hour.isin(hours_list)].copy()
             if sub_group.empty: continue
@@ -1976,8 +2083,10 @@ class ESAnalyzerApp(AppDashboard):
                 rb_low, t_target, is_low_util, hours_str, suffix=f"_Cat{cat}", plot_dir=plot_dir
             )
             results.extend(res); intermediates.extend(inter)
+            window_map[cat] = (hours_list, res)
 
-        return results, intermediates
+        raw = self._build_window_rawdata(group, window_map, max_n, total_rb)
+        return results, intermediates, raw
 
     def run_analysis(self):
         if not self.traffic_file.get(): return messagebox.showerror("오류", "Traffic Data 파일을 선택해주세요.")
@@ -2024,7 +2133,7 @@ class ESAnalyzerApp(AppDashboard):
             if 'UsedRB_t' in traffic_df.columns: traffic_df['UsedRB_t'] = np.ceil(traffic_df['UsedRB_t'])
 
             sector_map = {0: 'cell-num-A', 1: 'cell-num-B', 2: 'cell-num-C', 3: 'cell-num-D'}
-            output_results, intermediate_data_list = [], []
+            output_results, intermediate_data_list, rawdata_list = [], [], []
 
             current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
             base_out_dir = os.path.join(os.getcwd(), "Output", current_time_str)
@@ -2064,6 +2173,8 @@ class ESAnalyzerApp(AppDashboard):
                 positive_bands_values = positive_bands_series.values
                 positive_bands_names = positive_bands_series.index.tolist()
                 max_n = len(positive_bands_values)
+                n_allowed = self.n_allowed_escell_lte.get()
+                if n_allowed > 0: max_n = min(max_n, n_allowed)  # [r15] N_allowedEScell_LTE로 Max ES Level 상한 제한
 
                 group = group.copy()
                 group['UsedRB_t_adj'] = np.where(group['UsedRB_t'] == 0, group['UsedRB'], group['UsedRB_t'])
@@ -2085,12 +2196,13 @@ class ESAnalyzerApp(AppDashboard):
                 group['InitEstIPTput'] = (total_rb - group['UsedRB_t_adj']) * group['SP']
 
                 if self.auto_optimize_time.get():
-                    res, inter = self._do_auto_mode(group, str(enodeb), str(sector), max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir)
+                    res, inter, raw = self._do_auto_mode(group, str(enodeb), str(sector), max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir)
                 else:
-                    res, inter = self._do_manual_mode(group, str(enodeb), str(sector), max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir)
+                    res, inter, raw = self._do_manual_mode(group, str(enodeb), str(sector), max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir)
 
                 output_results.extend(res)
                 intermediate_data_list.extend(inter)
+                if raw is not None and not raw.empty: rawdata_list.append(raw)
 
             if output_results:
                 out_df = pd.DataFrame(output_results)
@@ -2110,8 +2222,16 @@ class ESAnalyzerApp(AppDashboard):
                 eval_df = pd.DataFrame(self.hourly_eval_records) if self.auto_optimize_time.get() and self.hourly_eval_records else None
                 if eval_df is not None and 'eNB_ID' in eval_df.columns: eval_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)
 
+                # [r15] Energy Dashboard가 참조할 24시간 전체 Rawdata(ES 윈도우 밖 시간 포함) - Optimizer 탭에는
+                # 표시하지 않고 self.latest_optimizer_rawdata에 보관, "최종 결과 파일 저장" 시 CSV로만 함께 저장.
+                raw_df = pd.DataFrame()
+                if rawdata_list:
+                    raw_df = pd.concat(rawdata_list, ignore_index=True)
+                    if 'eNB_ID' in raw_df.columns: raw_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)
+                self.latest_optimizer_rawdata = raw_df
+
                 self.status_label.config(text="분석 완료. 화면에 결과를 표시합니다.", fg=self.ACCENT_GREEN)
-                self.show_results_window(out_df, inter_df, eval_df, base_out_dir, plot_dir)
+                self.show_results_window(out_df, inter_df, eval_df, raw_df, base_out_dir, plot_dir)
             else:
                 messagebox.showwarning("Warning", "출력할 결과물이 없습니다.")
                 self.status_label.config(text="No results.", fg="red")
@@ -2121,7 +2241,7 @@ class ESAnalyzerApp(AppDashboard):
             messagebox.showerror("Error", f"An error occurred:\n{e}")
             self.status_label.config(text="Error occurred", fg="red")
 
-    def show_results_window(self, result_df, inter_df, eval_df, base_out_dir, plot_dir):
+    def show_results_window(self, result_df, inter_df, eval_df, raw_df, base_out_dir, plot_dir):
         viewer = tk.Toplevel(self)
         viewer.title("Analysis Results Viewer")
         viewer.geometry("1100x700")
@@ -2167,6 +2287,8 @@ class ESAnalyzerApp(AppDashboard):
                 result_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result.csv"), index=False, encoding='utf-8-sig')
                 if not inter_df.empty: inter_df.to_csv(os.path.join(base_out_dir, "ESMOutput_Result_Intermediate.csv"), index=False, encoding='utf-8-sig')
                 if eval_df is not None and not eval_df.empty: eval_df.to_csv(os.path.join(base_out_dir, "ESMOutput_AutoTime_Eval.csv"), index=False, encoding='utf-8-sig')
+                # [r15] Energy Dashboard용 24시간 전체 Rawdata - Optimizer 탭에는 표시하지 않지만 CSV로는 함께 저장.
+                if raw_df is not None and not raw_df.empty: raw_df.to_csv(os.path.join(base_out_dir, "ESMOutput_RawData_EnergyDashboard.csv"), index=False, encoding='utf-8-sig')
                 messagebox.showinfo("저장 완료", f"결과 파일들이 저장되었습니다.\n\n{base_out_dir}")
             except Exception as e: messagebox.showerror("저장 오류", f"파일 저장 중 오류가 발생했습니다.\n{e}")
 
