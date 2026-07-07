@@ -7,7 +7,7 @@
   * PM: `IP Tput`, `UsedRB`, `AirMacDLByte`, `AirMacULByte`
   * Energy: `RuPowerTot`, `RuPowerCnt` (RU별 시간당 소모 전력)
   * Efficiency: Energy Efficiency (EE) = (AirMacDLByte + AirMacULByte) / Consumed [Wh]
-* **버전 파일 관리**: `ESM/esm_r11.py` ~ `ESM/esm_r14.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r15.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r15.py`를 복제해 `esm_r16.py`로 이어간다.
+* **버전 파일 관리**: `ESM/esm_r11.py` ~ `ESM/esm_r15.py`(모두 과거 버전, 더 이상 수정하지 않음)와 `ESM/esm_r16.py`(최신 개발 버전)를 함께 보관한다. 새 기능/변경은 항상 최신 버전 파일에 반영하고, 이전 버전은 롤백/비교용으로 그대로 남겨둔다. 다음 라운드부터는 `esm_r16.py`를 복제해 `esm_r17.py`로 이어간다.
 
 ## 2. 핵심 개발 원칙 (Core Rules & Directives)
 1. **아키텍처 보존**: 객체지향형 5단계 상속 구조(`AppBase` -> `AppEditors` -> `AppTraffic` -> `AppDashboard` -> `ESAnalyzerApp`)를 절대 훼손하지 않고 확장한다. (※ 실제 코드 상으로는 `AppTraffic`이 별도 클래스로 분리되어 있지 않고 `ESAnalyzerApp`에 트래픽 패턴 뷰어 메서드가 포함된 4단계 상속: `AppBase` -> `AppEditors` -> `AppDashboard` -> `ESAnalyzerApp` 구조로 실동작 중. 아래 3항 참조.)
@@ -243,8 +243,19 @@
   * **Output 폴더 자동 저장**: Optimizer의 "최종 결과 파일 저장"과 동일하게 신규 `_make_output_dir(subfolder)` 헬퍼로 `Output/<timestamp>/<subfolder>/`를 만들어 파일 대화상자 없이 자동 저장하도록 변경 — `_download_energy_intermediate`(`EnergyDashboard/`), `_predict_energy_saving_popup`의 CSV 다운로드(`EnergySavingPrediction/`, 모드에 따라 NC2_Sector.csv/Simulation_Sector.csv/Comparison.csv 중 해당 파일만), ES Level 시뮬레이션 팝업의 CSV 다운로드(`ESLevelSimulation/`, Summary/EnergySaving/Timeline 3종), `_download_learn_result`(Learning Energy Curve RU 상세/HW 요약/Formula 3버튼 공용, `LearningEnergyCurve/`).
   * **검증**: 기존 절감 에너지 단위 테스트(3개 RU, 레벨1/2, 전력차 60W, 카운트 80/50, Gamma2=0.7)에 `Level {L} Hours` 컬럼을 포함한 summary_df로 재실행 — 절감 에너지 1365.0Wh로 기존과 동일함을 재확인(표시용 컬럼 추가가 계산에 영향 없음 확인). `_download_learn_result`를 실제로 호출해 `Output/<timestamp>/LearningEnergyCurve/<파일명>`에 정확히 저장되는 것을 파일시스템에서 직접 확인.
 
+*(v4.3까지는 `esm_r15.py` 기준, v5.0부터는 새로 분기한 `esm_r16.py` 기준)*
+
+* **[v5.0 / esm_r16.py] (2026-07-07) 신규 기능: Deep Sleep**
+  * **배경**: RU HW가 완전히 shutdown되면 Idle→PA off보다 더 깊은 저전력 상태인 Deep Sleep으로 진입 가능한 경우가 있어, ES Level 시뮬레이션의 절감 에너지 계산에 이를 반영해달라는 요청. Deep Sleep은 기상(wake-up) 시간이 5분이라 ES fallback(레벨 감소) 시 즉각적인 Tput 보장이 불가능해지므로 3가지 조건을 모두 만족해야 적용 가능. 버전 분기 원칙(1항)에 따라 `esm_r15.py`를 복제해 `esm_r16.py`로 시작.
+  * **조건 1(HW 지원 여부)**: RU/MMU Spec DB Editor에 신규 `Deep Sleep` 열 추가(Deep Sleep 상태의 Consumed Power[W]) — 값이 0보다 크면 해당 RU HW(board-type)가 Deep Sleep을 지원, 아니면(0/공란) PA off만 적용(기존과 동일). `_add_editor_row('ru_spec')`의 신규 행 기본 컬럼 템플릿에도 `Deep Sleep` 추가.
+  * **조건 2(RU HW의 모든 RU path shutdown)**: RU HW(물리 RU)를 `ru-board-id + ru-cascade-id`로 식별(신규 `_power_deltas_for_level`에서 `ru-port-id`를 그룹핑 키에서 제외) — 지금까지는 RU path(`ru-board-id+ru-port-id+ru-cascade-id`) 단위로만 RU를 식별했는데, 물리적으로 하나의 RU HW가 여러 RU path(포트)를 가질 수 있어(Dual Band RU) Deep Sleep은 그 RU HW의 모든 RU path가 꺼져야 적용 가능. 이번 라운드는 **Single Band RU만 가정**(물리 RU 1개=RU path 1개)하므로 이 식별만으로 충분하고, ES Level의 Target Cell Num이 이미 PA-shared-cell 해석을 거쳐 그 RU path에 연결된 모든 Cell을 포함하도록 구성되어 있어 "모든 RU path shutdown" 조건이 레벨 단위로 자동 충족됨(추가 검증 로직 불필요). Dual Band RU(포트 2개) 지원은 사용자가 추후 방법을 알려줄 예정 — 다음 라운드 대기.
+  * **조건 3(최고 레벨 제외)**: 현재 적용된 ES level(Curr) 자신의 몫으로 꺼진 RU는 Deep Sleep 대상에서 제외(언제든 한 단계 감소(fallback)로 즉시 재점등이 필요할 수 있어 5분 기상 시간을 감당 못 함). Deep Sleep은 Curr보다 낮은 레벨(1..Curr-1)의 RU에만 적용 가능.
+  * **구현**: 시뮬레이션의 레벨 결정 로직(`_run_es_level_simulation`)은 전혀 변경하지 않음 — Deep Sleep은 이미 꺼져 있는 RU를 얼마나 더 깊게 재우는지의 "에너지 계산" 문제일 뿐 트래픽/레벨 전환 판단에는 영향을 주지 않기 때문. `_power_delta_for_cells`를 `_power_deltas_for_level`로 교체 — 레벨별로 `(pa_off_delta, elevated_delta)`를 함께 계산(elevated_delta는 RU HW가 Deep Sleep을 지원하면 Idle-DeepSleep전력 기준, 아니면 pa_off_delta와 동일). `_calc_es_level_simulation_savings`의 절감 에너지 계산을 `Σ_k [ pa_off_delta(k)×count(Level==k)×0.25h + elevated_delta(k)×count(Level>k)×0.25h ] × Gamma2`로 변경(Deep Sleep 미지원 HW는 elevated_delta==pa_off_delta이므로 기존 count(Level>=k) 공식과 완전히 동일하게 귀결 — 하위 호환 보장). 결과 표에 `중 Deep Sleep 추가 절감 [Wh]` 열을 추가.
+  * **동작 확인(사용자 제시 예시로 검증)**: "Curr=3, 레벨1/2는 Deep Sleep 지원 RU, 레벨3은 현재 최고 레벨" 시나리오(카운트 Level1=5/Level2=8/Level3=77)로 계산 — 레벨1/2는 `count(Level>k)` 몫(각각 85, 77스텝)에 Deep Sleep 전력차가 적용되고, 레벨3은 `count(Level==3)` 몫(77스텝, `count(Level>3)`는 항상 0)에 PA off 전력차만 적용됨을 확인 — "레벨2로 fallback하면 레벨2의 Deep Sleep이 즉시 Cell off로 전환되고 레벨3의 RU는 완전히 켜진다"는 시나리오가 매 15분 스텝마다 그 순간의 Applied_ES_Level 값을 기준으로 count_eq_k/count_gt_k를 판정하는 방식으로 자연히 성립됨을 확인(전용 상태 추적 로직 없이도 집계 공식만으로 시나리오가 성립).
+  * **검증**: (a) 위 예시 시나리오에서 절감 에너지 3496.5Wh(Gamma2=0.7 적용 후), Deep Sleep 추가 절감분 850.5Wh가 손계산과 정확히 일치함을 확인, (b) Deep Sleep 미지원 기존 r15 테스트 케이스를 그대로 재실행해 절감 에너지 1365.0Wh/소모 에너지 7200.0Wh/절감률 18.96%/Deep Sleep 추가 절감 0.0Wh로 r15와 완전히 동일한 결과가 나옴을 확인(하위 호환 검증). 실제 GUI 앱으로 RU/MMU Spec 에디터의 '행 추가'가 `Deep Sleep` 열을 포함해 생성됨을 확인하고, Optimizer 실행 → Deep Sleep 지원 RU/MMU Spec 구성 → ES Level 시뮬레이션 → 절감 에너지 계산까지 전체 파이프라인이 오류 없이 동작함을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v4.3(`esm_r15.py`) - 절감 에너지 계산의 시간 단위(count→hour) 환산이 이미 올바르게 되어 있었음을 재확인하고 결과 표에도 명시적으로 드러나도록 개선했으며, Energy Dashboard/Learning Energy Curve의 모든 다운로드가 Optimizer처럼 `Output/<timestamp>/` 폴더에 자동 저장되도록 통일 완료. 이전 v4.2에서 Energy Dashboard의 날짜/시간 필터를 "평가 기간/평가 시간"으로 통합하고 절감효과 예측에 NC2/시뮬레이션/둘다(Mode 1/2/3) 전환 기능과 Mode 3 비교표를 추가했고, ES Level 시뮬레이션의 레벨별 카운트/Tput 위반 집계를 평가 시간으로 한정하는 기능까지 구현했고, v4.1에서 ES Level 시뮬레이션 결과를 실제 절감 에너지[Wh]/절감률로 환산하는 기능을 추가했고, v4.0에서 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능을 신규 추가했고, v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
+* 현재 상태: v5.0(`esm_r16.py`) - ES Level 시뮬레이션의 절감 에너지 계산에 Deep Sleep(RU HW의 더 깊은 저전력 상태) 반영 완료 — HW 지원 여부(RU/MMU Spec 신규 `Deep Sleep` 열)/RU HW 전체 shutdown(Single Band 가정)/최고 레벨 제외라는 3조건을 모두 만족할 때만 적용되도록 구현, 기존(Deep Sleep 미지원) 결과와 완전히 동일하게 귀결되는 하위 호환성까지 검증 완료. 이전 v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Energy Dashboard/Learning Energy Curve 다운로드의 Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + NC2/시뮬레이션/둘다(Mode 1/2/3) 전환, v4.1에서 절감 에너지[Wh] 환산, v4.0에서 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션을 순차적으로 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -252,8 +263,9 @@
   4. **다음 결정 대기(기존)**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
-  7. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 실제 데이터로 Mode 1/2/3 결과를 비교한 뒤 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
+  7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
+  8. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
+* 다음 대기 작업: (사용자가 Dual Band RU 식별/처리 방법을 알려줄 예정 — `esm_r16.py`에서 반영)
 
 ---
 *Last Updated: 2026-07-06*
