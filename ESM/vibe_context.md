@@ -229,17 +229,25 @@
   * **Sector별 소모 대비 절감률**: Energy Stat 데이터를 (Energy Dashboard 탭의 날짜 위젯과 무관하게) 시뮬레이션이 지정한 기간으로 직접 필터링(`_parse_energy_stat_for_range`)하고, CM의 `Sector`열(cell-num%10)로 해당 Sector에 속한 모든 RU path를 찾아 총 소모 에너지를 합산(`_sector_total_energy_wh`, 공유 RU 중복 방지를 위해 RU path 기준 dedupe). ES Level 시뮬레이션 팝업에 "에너지 절감 효과 (Sector별)" 탭을 신규 추가해 Sector별 **소모에너지[Wh] / 절감에너지[Wh] / 절감률(%) / Tput Violation Count / Tput Violation Ratio**(=위반 스텝수/ES Active Steps)를 표로 보여주고, 마지막 행에 전체 사이트 합계를 추가. CSV 다운로드에도 `_EnergySaving.csv`로 함께 포함.
   * **검증**: `_calc_es_level_simulation_savings`를 가짜 self(3개 RU를 가진 Sector, 레벨1/2 각각 고유 대상 셀 1개씩, RU HW Idle-PAoff 전력차 60W, 레벨별 카운트 0/30/50, Energy Stat 24시간치 합성 데이터)로 단위 테스트 — 절감 에너지 1365.0Wh(=60W×80스텝×0.25h + 60W×50스텝×0.25h, Gamma2=0.7 적용), 소모 에너지 7200.0Wh(3개 RU×24시간×100Wh), 절감률 18.96%, Tput Violation Ratio 0.0625가 모두 손계산과 정확히 일치함을 확인. 실제 GUI 앱에서 ES Level 시뮬레이션 팝업이 3개 탭(Sector 요약/에너지 절감 효과/상세 타임라인) 구성으로 오류 없이 열림을 확인.
 
+* **[v4.2 / esm_r15.py] (2026-07-07) Energy Dashboard 필터 통합("평가 기간/평가 시간") + 절감효과 예측 Mode 1/2/3 + 평가 시간 한정 카운트**
+  * **배경**: 사용자가 Energy Dashboard를 정리해달라며 4가지 요청 — (1) 날짜/시간 필터를 "평가 기간/평가 시간"으로 개명하고 Energy Dashboard 전체가 공통으로 참조, (2) 에너지 분석 실행에 절감효과 시각화 추가, (3) 에너지 절감효과 예측 버튼이 NC2/시뮬레이션/둘다(Mode 1/2/3, 기본 2)를 지원하고 Mode 3에서 비교표 제공, (4) 시뮬레이션은 24시간 내내 ES 윈도우를 따라 계속 수행하되 결과에 집계되는 레벨별 카운트/Tput 위반은 평가 시간으로만 한정.
+  * **(1) 필터 통합**: "날짜 범위"/"시간" 라벨을 "평가 기간"/"평가 시간"으로 개명. `_predict_energy_saving_popup`의 자체 시간 필터(`pred_hours_var`)와 ES Level 시뮬레이션 팝업의 자체 날짜 범위 위젯을 모두 제거하고, 신규 `_get_eval_date_range()`/`_parse_eval_hours()` 헬퍼로 Energy Dashboard 상단의 공통 필터를 모든 기능이 함께 참조하도록 통일.
+  * **(2) 에너지 분석 실행에 절감 효과 추가**: `_analyze_energy_stat`에서 대상 eNodeBID/Sector·평가 기간/평가 시간에 대해 ES Level 시뮬레이션 기반 절감 에너지를 계산해 상단 요약 라벨에 "예상 절감 에너지" 표시, 기존 3개 그래프(누적 추이/시간대별/요일별) 아래에 소모/절감/절감 후 예상 소모 3-bar 비교 그래프를 4번째로 추가.
+  * **(3) 절감효과 예측 Mode 1/2/3**: Energy Dashboard Advanced Settings에 `절감효과 예측 Mode`(기본값 2) 신규 추가. `_predict_energy_saving_popup`을 모드에 따라 탭을 동적으로 구성하는 단일 진입점으로 재구성 — Mode 1(NC2 기반)은 기존 3개 탭만, Mode 2(시뮬레이션 기반, 기본값)는 "Sector별 절감 효과" 탭만, Mode 3(둘 다)은 위 모든 탭 + 신규 `_build_mode_comparison_df`로 만든 "Mode 비교(NC2 vs 시뮬레이션)" 탭까지 표시. CSV 다운로드는 현재 모드에 해당하는 표만 저장.
+  * **(4) 평가 시간 한정 카운트**: `_run_es_level_simulation`에 `eval_hours` 인자 추가 — 시뮬레이션 자체(레벨 결정+IIR)는 ES operation window 정의를 따라 24시간 전체 항상 수행(윈도우가 0~5시면 평가 시간과 무관하게 그 5시간 내내 정책 적용)하되, summary_df의 "레벨별 누적 카운트"/"Tput 불만족 카운트"/"ES Active Steps"/"Total Steps"만 평가 시간에 속하는 스텝으로 한정. timeline_df에 `In_Eval_Hours` 열 추가. `_parse_energy_stat_for_range`/`_calc_es_level_simulation_savings`에도 `eval_hours`를 전달해 소모 에너지 계산도 동일하게 한정.
+  * **검증**: 기존 6-스텝 합성 Rawdata(레벨 궤적 `[0,1,2,1,0,0]`)를 `eval_hours=[0]`으로 재실행 — 전체 궤적은 그대로 유지된 채(윈도우는 계속 시뮬레이션됨) summary만 앞 4스텝(0시)으로 한정되어 Total Steps=4/ES Active Steps=4/Tput Violation Count=1/Level 0,1,2 Count=1,2,1로 정확히 집계됨을 확인. 실제 GUI 앱으로 Optimizer 실행 후 Mode 1/2/3 팝업, ES Level 시뮬레이션 팝업, 절감 효과 시각화가 추가된 `_analyze_energy_stat`이 모두 오류 없이 실행됨을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v4.1(`esm_r15.py`) - ES Level 시뮬레이션 결과를 실제 절감 에너지[Wh]/절감률/소모에너지 대비 비교까지 환산 완료, IIR 계수 Advanced Settings 위치 버그 수정, Gamma2 보정 계수 추가. 이전 v4.0에서 Energy Dashboard에 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능(레벨 궤적/누적 카운트만) 신규 추가했고, v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
+* 현재 상태: v4.2(`esm_r15.py`) - Energy Dashboard의 날짜/시간 필터를 "평가 기간/평가 시간"으로 통합하고, 절감효과 예측에 NC2/시뮬레이션/둘다(Mode 1/2/3) 전환 기능과 Mode 3 비교표를 추가했고, ES Level 시뮬레이션의 레벨별 카운트/Tput 위반 집계를 평가 시간으로 한정하는 기능까지 구현 완료(로직 단위 테스트 + 실제 GUI 앱 End-to-End 검증 완료). 이전 v4.1에서 ES Level 시뮬레이션 결과를 실제 절감 에너지[Wh]/절감률로 환산하는 기능을 추가했고, v4.0에서 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능을 신규 추가했고, v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 신규 "수식(Formula)" 탭/다운로드, 3열로 넓어진 시각화 탭(가로 스크롤 필요할 수 있음)과 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
   4. **다음 결정 대기(기존)**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
-  6. **다음 결정 대기(v4.1)**: 사용자가 실제 데이터로 Sector별 절감 에너지/절감률 결과를 검토한 뒤 — (a) Initial level을 0이 아닌 값으로 최적화하는 기능, (b) 기존 Nc2 기반 예측(`_calc_all_savings`)과의 비교/교체 여부를 다음 라운드에 결정.
+  6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 실제 데이터로 Sector별 절감 에너지 결과를 확인한 뒤 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
+* 다음 대기 작업: (사용자가 실제 데이터로 Mode 1/2/3 결과를 비교한 뒤 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
 
 ---
 *Last Updated: 2026-07-06*
