@@ -199,6 +199,30 @@ Energy Dashboard 상단의 공통 "평가 기간/평가 시간"은 결과 집계
 기간 전체에 대해 항상 실행하고 summary_df 집계만 평가 기간(날짜)+평가 시간(시간)으로 한정(표시용 열도
 `In_Eval_Hours` -> `In_Eval_Window`로 개명). 이 파일에는 Deep Sleep 기능이 없으므로(esm_r16.py 전용)
 그 부분은 제외하고 기간 분리 수정만 포팅. 상세 배경/검증은 esm_r16.py의 "[r16-후속]" 항목 참조.
+
+[r15-후속3] 버그 수정: IpThruThpDLTime<=0/NaN 행이 통째로 제외되어 15분 간격이 끊기던 문제 +
+그로 인해 특정 Sector의 ES level 적용 횟수가 0으로 나오던 문제:
+  - **배경**: 사용자가 시뮬레이션 상세 타임라인을 직접 검토하다가, IIR을 손으로 재현해도 Entering
+    조건(Tput/UsedRB_t)이 만족되는 것처럼 보이는데 실제 시뮬레이션 결과는 특정 Sector에서 레벨 적용
+    횟수가 0으로 나오는 것을 발견 — "이상하다"고 보고. 원인 조사 결과, `run_analysis`/
+    `_build_rawdata_for_period` 양쪽 모두 `IpThruThpDLTime > 0`을 만족하지 못하는 행(트래픽 통계가
+    0초/NaN으로 잡힌 구간)을 valid_mask에서 통째로 제외하고 있었음 — 이러면 15분 간격의 연속 스텝이라는
+    시뮬레이션의 기본 가정이 깨져서, 그 사이 시간대의 행이 사라진 채로 "다음" 스텝이 실제로는 30분·1시간
+    뒤의 데이터를 이어붙인 것처럼 처리됨. 특정 Sector가 이런 결측 구간이 많으면 윈도우 진입마다 Initial
+    level(0)로 재시작하는 로직과 맞물려 레벨이 오를 기회 자체가 거의 없어져 "적용 횟수 0"으로 보였을 것.
+  - **수정**: valid_mask에서 `IpThruThpDLTime > 0` 조건을 제거해 그런 행도 더 이상 통째로 버리지 않고
+    유지하되(15분 간격 연속성 보존), `cmIPTput`만 해당 행에서 NaN으로 계산되도록 함(`IpThruThpDLTime`가
+    0/NaN인 분모를 `.where()`로 NaN 처리 후 나눗셈 — SP/InitEstIPTput은 IpThruThpDLTime과 무관하므로
+    영향 없음). `_run_es_level_simulation`에 예외 처리 추가: 그 스텝의 rawdata `cmIPTput`이 NaN이면
+    (윈도우 진입/이탈 판정을 포함해) 레벨 결정 자체를 보류하고 이전 스텝의 ES level/IIR 상태를 그대로
+    승계(freeze-forward)한다 — "그 시간은 그냥 이전 ES level을 승계해야 한다"는 사용자 지시를 그대로
+    반영.
+  - **검증**: 6-스텝 합성 데이터의 3번째 스텝(index 2)에 `cmIPTput=NaN`을 주입해 단위 테스트 —
+    레벨/IIR이 정확히 이전 스텝(index 1) 값을 그대로 승계하고(레벨 1, cmIPTput_IIR 동일값 유지), 이후
+    스텝(index 3)은 승계된 상태를 기반으로 다시 정상적으로 레벨 결정(레벨 2로 진입)이 이어짐을 확인.
+    실제 GUI 앱으로 트래픽 데이터의 약 6%(17/288행, ES 운영 시간대에 집중) 행에 IpThruThpDLTime=0/NaN을
+    주입해 Optimizer→Rawdata를 실행 — 이전이면 해당 행들이 통째로 사라져 24행 중 18행만 남았을 것이
+    이번 수정 후 24행 모두 유지되고 그중 6행만 cmIPTput=NaN으로 정확히 표시됨을 확인.
 """
 
 import tkinter as tk
@@ -1942,6 +1966,9 @@ class ESAnalyzerApp(AppDashboard):
           PRB는 IIR 기준) -> 3) 유지 순으로 판정.
         - 레벨이 적용된 스텝의 cmIPTput은 raw 값 대신 max(cmIPTput*(1-DRB_L(레벨)/(total_rb-UsedRB)), 0)로
           보정한 값을 IIR 필터의 입력으로 사용(레벨 미적용 스텝은 raw 그대로).
+        - [예외처리, r15-후속3] IpThruThpDLTime<=0/NaN이라 그 스텝의 cmIPTput을 계산할 수 없으면(rawdata의
+          cmIPTput이 NaN) 레벨 결정 자체를 보류하고 이전 스텝의 ES level/IIR 상태를 그대로 승계한다(윈도우
+          진입/이탈 판정도 건너뜀) — 해당 스텝의 데이터로는 신뢰할 수 있는 판단을 할 수 없기 때문.
         [r15-후속, r15-후속2] `sim_raw_df`가 다루는 "시뮬레이션 수행 기간"(=Rawdata를 만들 때 지정한 기간,
         _build_rawdata_for_period 참조)과 이 함수의 `eval_start_date`/`eval_end_date`/`eval_hours`(공통
         "평가 기간/평가 시간" 필터)는 서로 다른 별개의 설정이다 — 시뮬레이션 자체(레벨 결정/IIR)는 ES
@@ -1990,6 +2017,15 @@ class ESAnalyzerApp(AppDashboard):
             rb_iir[0] = 0.0 if np.isnan(raw_rb[0]) else raw_rb[0]
 
             for i in range(1, n_rows):
+                if np.isnan(raw_cm[i]):
+                    # [예외처리, r15-후속3] IpThruThpDLTime<=0/NaN이라 cmIPTput을 계산할 수 없는 스텝은
+                    # 레벨 결정(증가/감소/윈도우 진입 판정 포함)을 보류하고 이전 스텝의 ES level/IIR
+                    # 상태를 그대로 승계한다.
+                    level[i] = level[i - 1]
+                    cm_input[i] = cm_input[i - 1]
+                    cm_iir[i] = cm_iir[i - 1]
+                    rb_iir[i] = rb_iir[i - 1]
+                    continue
                 w_prev, w_now = int(win_idx[i - 1]), int(win_idx[i])
                 if w_now == 0 or w_prev != w_now:
                     nxt = 0  # ES 미운영 시간 또는 새 윈도우 진입 -> Initial level(0)로 재시작
@@ -2780,13 +2816,16 @@ class ESAnalyzerApp(AppDashboard):
 
             group = group.copy()
             group['UsedRB_t_adj'] = np.where(group['UsedRB_t'] == 0, group['UsedRB'], group['UsedRB_t'])
-            valid_mask = ((group['UsedRB_t_adj'] > 0) & (group['IpThruThpDLTime'] > 0) &
-                          (group['AirMacDLByte'].notna()) & (group['IpThruThpVoDLByte'].notna()))
+            # [r15-후속3] IpThruThpDLTime<=0/NaN인 행은 더 이상 통째로 제외하지 않음(제외하면 15분 간격이
+            # 끊겨 시뮬레이션의 연속 스텝 가정이 깨짐) — cmIPTput만 NaN으로 두고(_run_es_level_simulation이
+            # 이 스텝을 '이전 ES level 승계' 예외로 처리), 행 자체는 그대로 유지한다.
+            valid_mask = ((group['UsedRB_t_adj'] > 0) & (group['AirMacDLByte'].notna()) & (group['IpThruThpVoDLByte'].notna()))
             group = group[valid_mask]
             if group.empty: continue
 
             group['SP'] = (group['AirMacDLByte'] * 8) / (900 * group['UsedRB_t_adj'])
-            group['cmIPTput'] = (group['IpThruThpVoDLByte'] / group['IpThruThpDLTime']) * 8000
+            dl_time_safe = group['IpThruThpDLTime'].where(group['IpThruThpDLTime'] > 0)
+            group['cmIPTput'] = (group['IpThruThpVoDLByte'] / dl_time_safe) * 8000
 
             total_rb, max_n = cell_defs['total_rb'], cell_defs['max_n']
             window_map = {idx: (w['hours'], [{'ES Level': n, **vals} for n, vals in w['levels'].items()])
@@ -2959,8 +2998,11 @@ class ESAnalyzerApp(AppDashboard):
 
                 group = group.copy()
                 group['UsedRB_t_adj'] = np.where(group['UsedRB_t'] == 0, group['UsedRB'], group['UsedRB_t'])
-                valid_mask = ((group['UsedRB_t_adj'] > 0) & (group['IpThruThpDLTime'] > 0) &
-                              (group['AirMacDLByte'].notna()) & (group['IpThruThpVoDLByte'].notna()))
+                # [r15-후속3] IpThruThpDLTime<=0/NaN인 행은 더 이상 통째로 제외하지 않음(제외하면 15분
+                # 간격이 끊겨 시뮬레이션의 연속 스텝 가정이 깨짐) — cmIPTput만 NaN으로 두고
+                # (_run_es_level_simulation이 이 스텝을 '이전 ES level 승계' 예외로 처리), 행 자체는
+                # 그대로 유지한다.
+                valid_mask = ((group['UsedRB_t_adj'] > 0) & (group['AirMacDLByte'].notna()) & (group['IpThruThpVoDLByte'].notna()))
                 group = group[valid_mask]
                 if group.empty: continue
 
@@ -2973,7 +3015,8 @@ class ESAnalyzerApp(AppDashboard):
                 rb_low = np.ceil(cov_band_rb * rb_mult)
 
                 group['SP'] = (group['AirMacDLByte'] * 8) / (900 * group['UsedRB_t_adj'])
-                group['cmIPTput'] = (group['IpThruThpVoDLByte'] / group['IpThruThpDLTime']) * 8000
+                dl_time_safe = group['IpThruThpDLTime'].where(group['IpThruThpDLTime'] > 0)
+                group['cmIPTput'] = (group['IpThruThpVoDLByte'] / dl_time_safe) * 8000
                 group['InitEstIPTput'] = (total_rb - group['UsedRB_t_adj']) * group['SP']
 
                 if self.auto_optimize_time.get():
