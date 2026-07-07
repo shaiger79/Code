@@ -254,8 +254,15 @@
   * **동작 확인(사용자 제시 예시로 검증)**: "Curr=3, 레벨1/2는 Deep Sleep 지원 RU, 레벨3은 현재 최고 레벨" 시나리오(카운트 Level1=5/Level2=8/Level3=77)로 계산 — 레벨1/2는 `count(Level>k)` 몫(각각 85, 77스텝)에 Deep Sleep 전력차가 적용되고, 레벨3은 `count(Level==3)` 몫(77스텝, `count(Level>3)`는 항상 0)에 PA off 전력차만 적용됨을 확인 — "레벨2로 fallback하면 레벨2의 Deep Sleep이 즉시 Cell off로 전환되고 레벨3의 RU는 완전히 켜진다"는 시나리오가 매 15분 스텝마다 그 순간의 Applied_ES_Level 값을 기준으로 count_eq_k/count_gt_k를 판정하는 방식으로 자연히 성립됨을 확인(전용 상태 추적 로직 없이도 집계 공식만으로 시나리오가 성립).
   * **검증**: (a) 위 예시 시나리오에서 절감 에너지 3496.5Wh(Gamma2=0.7 적용 후), Deep Sleep 추가 절감분 850.5Wh가 손계산과 정확히 일치함을 확인, (b) Deep Sleep 미지원 기존 r15 테스트 케이스를 그대로 재실행해 절감 에너지 1365.0Wh/소모 에너지 7200.0Wh/절감률 18.96%/Deep Sleep 추가 절감 0.0Wh로 r15와 완전히 동일한 결과가 나옴을 확인(하위 호환 검증). 실제 GUI 앱으로 RU/MMU Spec 에디터의 '행 추가'가 `Deep Sleep` 열을 포함해 생성됨을 확인하고, Optimizer 실행 → Deep Sleep 지원 RU/MMU Spec 구성 → ES Level 시뮬레이션 → 절감 에너지 계산까지 전체 파이프라인이 오류 없이 동작함을 확인.
 
+* **[v5.1 / esm_r16.py, 동일 수정을 esm_r15.py에도 적용] (2026-07-07) 버그 수정: "시뮬레이션 수행 기간"이 "평가 기간"에 강제 통합되어 있던 문제**
+  * **배경**: v4.2에서 날짜/시간 필터를 "평가 기간/평가 시간"으로 통합하면서, ES Level 시뮬레이션 팝업/절감효과 예측(Mode 2·3)이 "어느 트래픽 데이터를 Rawdata로 만들어 시뮬레이션을 돌릴지"(시뮬레이션 수행 기간)까지 실수로 "평가 기간"과 같은 값으로 강제 통합해버림 — 원래 이 둘은 별개 개념인데 하나로 묶여, 실제 ES operation 시간과 평가 시간이 다른 경우(예: 실제 0~7시 운영, 평가는 0~4시만) 시뮬레이션이 제대로 동작하지 못하는 문제가 있었음. 사용자가 "Sector별로 ES level 적용 시간이 다른데 절감에너지량이 똑같이 나온다"는 버그도 함께 보고.
+  * **수정**: `_open_es_level_simulation_popup`과 `_predict_energy_saving_popup`(Mode 2/3)에 팝업 자체의 "시뮬레이션 수행 기간" 날짜 범위 위젯을 별도로 복원 — 이 값이 `_build_rawdata_for_period`(Rawdata 생성/재사용 판단)에 전달되고, Energy Dashboard 상단의 공통 "평가 기간/평가 시간"은 오직 결과 집계·소모 에너지 비교에만 사용. `_run_es_level_simulation`에 `eval_start_date`/`eval_end_date`를 추가해 시뮬레이션은 시뮬레이션 수행 기간 전체에 대해 항상 실행하고, summary_df 집계만 평가 기간(날짜)+평가 시간(시간)으로 한정(기존에는 시간만 한정 가능했음). 표시용 열도 `In_Eval_Hours` → `In_Eval_Window`로 개명(날짜+시간 조건을 모두 반영).
+  * **"Sector별 절감에너지 동일" 버그 조사**: `_calc_es_level_simulation_savings`/`_run_es_level_simulation`을 서로 다른 레벨-시간 분포를 가진 2개 Sector로 직접 단위 테스트 — 각각 52.5Wh/0.0Wh로 카운트에 비례해 정확히 다르게 나와 집계 공식 자체는 정상임을 확인. 위 기간 통합 버그가 원인일 가능성이 높다고 판단(원하는 평가 기간이 보유한 트래픽 데이터 범위와 맞지 않으면 Rawdata 재생성이 실패해 이전 결과가 표에 남아있는 것처럼 보일 수 있었음) — 이번 수정으로 시뮬레이션 수행 기간을 트래픽 데이터가 있는 범위로 별도 지정할 수 있게 되어 해결될 것으로 예상. 재현 시 CM Data/RU-MMU Spec의 board-type 매핑 누락으로 전력차가 0으로 조용히 귀결되는 경우가 있는지도 확인 필요.
+  * **적용 범위**: 사용자 요청에 따라 동일한 수정(시뮬레이션 수행 기간 분리 + 버그 조사)을 `esm_r15.py`에도 그대로 반영(r15에는 Deep Sleep 기능이 없으므로 그 부분은 제외하고 이 수정만 포팅).
+  * **검증**: 팝업 2개 모두 새 "시뮬레이션 수행 기간" 위젯이 포함되어 오류 없이 열리고, 트래픽 미설정 시 경고만 표시하고 예외 없이 종료됨을 확인. `python -m py_compile` 통과(양쪽 파일 모두).
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v5.0(`esm_r16.py`) - ES Level 시뮬레이션의 절감 에너지 계산에 Deep Sleep(RU HW의 더 깊은 저전력 상태) 반영 완료 — HW 지원 여부(RU/MMU Spec 신규 `Deep Sleep` 열)/RU HW 전체 shutdown(Single Band 가정)/최고 레벨 제외라는 3조건을 모두 만족할 때만 적용되도록 구현, 기존(Deep Sleep 미지원) 결과와 완전히 동일하게 귀결되는 하위 호환성까지 검증 완료. 이전 v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Energy Dashboard/Learning Energy Curve 다운로드의 Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + NC2/시뮬레이션/둘다(Mode 1/2/3) 전환, v4.1에서 절감 에너지[Wh] 환산, v4.0에서 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션을 순차적으로 추가하며 여기까지 도달.
+* 현재 상태: v5.1(`esm_r16.py` + 동일 수정된 `esm_r15.py`) - "시뮬레이션 수행 기간"과 "평가 기간"을 다시 별개 설정으로 분리해 실제 ES operation 시간과 평가 시간이 다른 경우도 올바르게 동작하도록 수정 완료, Sector별 절감에너지 계산 공식 자체는 서로 다른 입력에 대해 정확히 다른 값을 냄을 재확인. 이전 v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가했고, v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Energy Dashboard/Learning Energy Curve 다운로드의 Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + NC2/시뮬레이션/둘다(Mode 1/2/3) 전환을 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -264,8 +271,9 @@
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
-  8. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 Dual Band RU 식별/처리 방법을 알려줄 예정 — `esm_r16.py`에서 반영)
+  8. **다음 결정 대기(v5.1)**: 사용자가 실데이터로 "시뮬레이션 수행 기간" 분리 후 Sector별 절감에너지가 정상적으로 달라지는지 재확인 필요 — 만약 여전히 동일하게 나오면 CM/RU-MMU Spec 매핑 여부를 함께 점검.
+  9. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
+* 다음 대기 작업: (사용자가 실데이터로 재확인한 결과를 알려줄 예정 — `esm_r16.py`에서 계속 반영)
 
 ---
 *Last Updated: 2026-07-06*

@@ -190,6 +190,15 @@ Output 폴더에 자동 저장:
     (표시용 컬럼 추가가 계산 로직에 영향 없음을 확인). `_download_learn_result`를 실제로 호출해
     `Output/<timestamp>/LearningEnergyCurve/<파일명>`에 정확히 저장되는 것을 파일시스템에서 직접 확인.
     `python -m py_compile` 통과.
+
+[r15-후속2] 버그 수정(esm_r16.py와 동일하게 반영): "시뮬레이션 수행 기간"이 "평가 기간"에 강제
+통합되어 있던 문제. `_open_es_level_simulation_popup`/`_predict_energy_saving_popup`(Mode 2/3)에
+팝업 자체의 "시뮬레이션 수행 기간" 날짜 범위 위젯을 별도로 복원(어느 트래픽 데이터를 Rawdata로 만들지),
+Energy Dashboard 상단의 공통 "평가 기간/평가 시간"은 결과 집계·소모 에너지 비교에만 사용하도록 분리.
+`_run_es_level_simulation`에 `eval_start_date`/`eval_end_date`를 추가해 시뮬레이션은 시뮬레이션 수행
+기간 전체에 대해 항상 실행하고 summary_df 집계만 평가 기간(날짜)+평가 시간(시간)으로 한정(표시용 열도
+`In_Eval_Hours` -> `In_Eval_Window`로 개명). 이 파일에는 Deep Sleep 기능이 없으므로(esm_r16.py 전용)
+그 부분은 제외하고 기간 분리 수정만 포팅. 상세 배경/검증은 esm_r16.py의 "[r16-후속]" 항목 참조.
 """
 
 import tkinter as tk
@@ -1770,9 +1779,11 @@ class ESAnalyzerApp(AppDashboard):
         return cmp_df
 
     def _predict_energy_saving_popup(self):
-        """[r15-후속] '에너지 절감효과 예측' 버튼의 단일 진입점. Advanced Settings의 `saving_prediction_mode`
-        (1=NC2 기반, 2=시뮬레이션 기반(기본), 3=둘 다 + 비교표)에 따라 필요한 탭만 구성하고 계산한다.
-        Energy Dashboard 상단의 공통 '평가 기간/평가 시간'을 그대로 사용(팝업 자체 필터 없음)."""
+        """[r15-후속, r15-후속2에서 시뮬레이션 수행 기간을 평가 기간과 분리] '에너지 절감효과 예측' 버튼의
+        단일 진입점. Advanced Settings의 `saving_prediction_mode`(1=NC2 기반, 2=시뮬레이션 기반(기본),
+        3=둘 다 + 비교표)에 따라 필요한 탭만 구성하고 계산한다. Mode 2/3은 시뮬레이션을 돌리므로 이 팝업
+        자체의 "시뮬레이션 수행 기간"(어느 트래픽 데이터를 Rawdata로 만들지)을 별도로 지정하고,
+        Energy Dashboard 상단의 공통 '평가 기간/평가 시간'은 결과 집계·소모 에너지 비교 시에만 사용한다."""
         mode = self.saving_prediction_mode.get() if hasattr(self, 'saving_prediction_mode') else 2
 
         win = tk.Toplevel(self)
@@ -1784,7 +1795,26 @@ class ESAnalyzerApp(AppDashboard):
         top_frame.pack(fill=tk.X)
         mode_txt = {1: 'NC2 기반', 2: '시뮬레이션 기반', 3: 'NC2 + 시뮬레이션 비교'}.get(mode, '시뮬레이션 기반')
         ttk.Label(top_frame, text=f"예측 Mode: {mode_txt} (Energy Dashboard 고급 설정에서 변경)", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-        ttk.Label(top_frame, text="* 상단의 '평가 기간/평가 시간' 설정을 사용합니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=15)
+
+        sim_start_picker = sim_end_picker = sim_start_str = sim_end_str = None
+        if mode in (2, 3):
+            ttk.Label(top_frame, text="시뮬레이션 수행 기간:").pack(side=tk.LEFT, padx=(15, 5))
+            today = datetime.today()
+            if HAS_CALENDAR:
+                sim_start_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
+                sim_start_picker.set_date(today)
+                sim_start_picker.pack(side=tk.LEFT)
+                ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
+                sim_end_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
+                sim_end_picker.set_date(today)
+                sim_end_picker.pack(side=tk.LEFT)
+            else:
+                sim_start_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
+                sim_end_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
+                ttk.Entry(top_frame, textvariable=sim_start_str, width=12).pack(side=tk.LEFT)
+                ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
+                ttk.Entry(top_frame, textvariable=sim_end_str, width=12).pack(side=tk.LEFT)
+        ttk.Label(top_frame, text="* 결과 집계는 상단의 '평가 기간/평가 시간' 설정을 사용합니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=15)
 
         state = {'sim_saving_df': pd.DataFrame(), 'cmp_df': pd.DataFrame()}
 
@@ -1792,16 +1822,24 @@ class ESAnalyzerApp(AppDashboard):
             if mode in (1, 3):
                 self._run_prediction_calc()
             if mode in (2, 3):
-                s_date, e_date = self._get_eval_date_range()
-                if not s_date or not e_date:
+                if HAS_CALENDAR:
+                    sim_s_date, sim_e_date = sim_start_picker.get_date(), sim_end_picker.get_date()
+                else:
+                    try:
+                        sim_s_date = datetime.strptime(sim_start_str.get(), '%Y-%m-%d').date()
+                        sim_e_date = datetime.strptime(sim_end_str.get(), '%Y-%m-%d').date()
+                    except Exception:
+                        return messagebox.showerror("오류", "시뮬레이션 수행 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
+                eval_s_date, eval_e_date = self._get_eval_date_range()
+                if not eval_s_date or not eval_e_date:
                     return messagebox.showerror("오류", "평가 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
                 eval_hours = self._parse_eval_hours()
-                raw_df, reused = self._build_rawdata_for_period(s_date, e_date, self.exclude_dates_str.get())
+                raw_df, reused = self._build_rawdata_for_period(sim_s_date, sim_e_date, self.exclude_dates_str.get())
                 if raw_df.empty:
                     messagebox.showwarning("경고", "해당 기간에 대한 Rawdata를 만들 수 없습니다.\n(트래픽 데이터/Optimizer 결과를 확인해주세요.)")
                 else:
-                    _, summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
-                    saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date, eval_hours=eval_hours)
+                    _, summary_df = self._run_es_level_simulation(raw_df, eval_start_date=eval_s_date, eval_end_date=eval_e_date, eval_hours=eval_hours)
+                    saving_df = self._calc_es_level_simulation_savings(summary_df, eval_s_date, eval_e_date, eval_hours=eval_hours)
                     state['sim_saving_df'] = saving_df
                     self._update_tree(tree_refs['sim'], saving_df)
             if mode == 3:
@@ -1895,7 +1933,7 @@ class ESAnalyzerApp(AppDashboard):
                     formatted.append(v)
             tree.insert("", tk.END, values=formatted)
 
-    def _run_es_level_simulation(self, sim_raw_df, eval_hours=None):
+    def _run_es_level_simulation(self, sim_raw_df, eval_start_date=None, eval_end_date=None, eval_hours=None):
         """[r15] Rawdata(_build_rawdata_for_period 결과, 15분 단위 raw 트래픽 + 레벨별 임계값/예측치 열 포함)를
         받아 (eNodeBID, Sector) 셀 단위로 15분 스텝마다 ES level을 결정해 나가는 시간별 시뮬레이션을 수행한다.
         - ES_Window_Index==0(운영 윈도우 밖) 시간, 또는 직전 스텝과 윈도우가 바뀌는 첫 스텝은 Level을
@@ -1904,14 +1942,18 @@ class ESAnalyzerApp(AppDashboard):
           PRB는 IIR 기준) -> 3) 유지 순으로 판정.
         - 레벨이 적용된 스텝의 cmIPTput은 raw 값 대신 max(cmIPTput*(1-DRB_L(레벨)/(total_rb-UsedRB)), 0)로
           보정한 값을 IIR 필터의 입력으로 사용(레벨 미적용 스텝은 raw 그대로).
-        [r15-후속] `eval_hours`(평가 시간, None이면 24시간 전체): 시뮬레이션 자체(레벨 결정/IIR)는 ES
-        operation window 정의를 그대로 따라 24시간 전체에 대해 항상 수행하되(윈도우가 0~5시라면 평가
-        시간과 무관하게 그 5시간 내내 ES 정책이 적용됨), summary_df에 집계되는 '레벨별 누적 카운트'/
-        'Tput 불만족 카운트'/'ES Active Steps'/'Total Steps'만 eval_hours에 속하는 스텝으로 한정한다
-        (예: 평가 시간이 0~2시뿐이면 0~5시 윈도우가 계속 적용되더라도 카운트는 0~2시 몫만 집계).
-        반환: (timeline_df: 스텝별 Applied_ES_Level/IIR값/Tput_Violation 포함 원본 rawdata 전체(In_Eval_Hours
-        열로 평가 시간 해당 여부 표시), summary_df: 셀별 레벨별 누적 카운트 + Tput 불만족 누적 카운트
-        (eval_hours 한정))."""
+        [r15-후속, r15-후속2] `sim_raw_df`가 다루는 "시뮬레이션 수행 기간"(=Rawdata를 만들 때 지정한 기간,
+        _build_rawdata_for_period 참조)과 이 함수의 `eval_start_date`/`eval_end_date`/`eval_hours`(공통
+        "평가 기간/평가 시간" 필터)는 서로 다른 별개의 설정이다 — 시뮬레이션 자체(레벨 결정/IIR)는 ES
+        operation window 정의를 그대로 따라 시뮬레이션 수행 기간 전체에 대해 항상 수행하되(윈도우가
+        0~7시라면 평가 시간 설정과 무관하게 그 8시간 내내 ES 정책이 적용됨), summary_df에 집계되는
+        '레벨별 누적 카운트'/'Tput 불만족 카운트'/'ES Active Steps'/'Total Steps'만 평가 기간·평가 시간에
+        속하는 스텝으로 한정한다(예: 평가 시간이 0~4시뿐이면 0~7시 윈도우가 계속 적용되더라도 카운트는
+        0~4시 몫만 집계). eval_start_date/eval_end_date가 None이면 날짜 제한 없음(전체 시뮬레이션
+        기간), eval_hours가 None이면 시간 제한 없음(24시간 전체).
+        반환: (timeline_df: 스텝별 Applied_ES_Level/IIR값/Tput_Violation 포함 원본 rawdata 전체(In_Eval_Window
+        열로 평가 기간·평가 시간 해당 여부 표시), summary_df: 셀별 레벨별 누적 카운트 + Tput 불만족 누적
+        카운트(평가 기간·평가 시간으로 한정))."""
         if sim_raw_df is None or sim_raw_df.empty:
             return pd.DataFrame(), pd.DataFrame()
 
@@ -1982,8 +2024,12 @@ class ESAnalyzerApp(AppDashboard):
             cell_df['UsedRB_t_adj_IIR'] = rb_iir
             cell_df['cmIPTput_Simulated'] = cm_input
             cell_df['Tput_Violation'] = tput_violation
-            eval_mask = cell_df['Time'].dt.hour.isin(eval_hours).to_numpy() if eval_hours else np.ones(n_rows, dtype=bool)
-            cell_df['In_Eval_Hours'] = eval_mask
+            eval_mask = np.ones(n_rows, dtype=bool)
+            if eval_start_date and eval_end_date:
+                eval_mask &= ((cell_df['Time'].dt.date >= eval_start_date) & (cell_df['Time'].dt.date <= eval_end_date)).to_numpy()
+            if eval_hours:
+                eval_mask &= cell_df['Time'].dt.hour.isin(eval_hours).to_numpy()
+            cell_df['In_Eval_Window'] = eval_mask
             timeline_parts.append(cell_df)
 
             # [r15-후속2] cmIPTput/RB 등 절감량 계산에 들어가는 값은 '15분 단위 count' 기준이라 실제
@@ -2138,10 +2184,13 @@ class ESAnalyzerApp(AppDashboard):
         return result_df
 
     def _open_es_level_simulation_popup(self):
-        """[r15] Energy Dashboard의 'ES Level 시간별 시뮬레이션' 팝업. Energy Dashboard 상단의 공통
-        '평가 기간/평가 시간'을 그대로 사용해(Optimizer 기간과 동일하면 Rawdata 재사용, 다르면 재생성),
-        15분 단위 ES level 시뮬레이션을 실행해 Sector별 요약(평가 시간으로 한정한 레벨별 누적 카운트 +
-        Tput 불만족 카운트)과 상세 타임라인을 보여준다."""
+        """[r15, r15-후속2에서 시뮬레이션 수행 기간을 평가 기간과 분리] Energy Dashboard의 'ES Level 시간별
+        시뮬레이션' 팝업. "시뮬레이션 수행 기간"(이 팝업 자체의 날짜 범위 — 어느 트래픽 데이터를 Rawdata로
+        만들어 시뮬레이션을 돌릴지)과 Energy Dashboard 상단의 공통 "평가 기간/평가 시간"(결과 집계·소모
+        에너지 비교 시 어느 기간·시간만 카운트할지)은 서로 다른 설정이다 — 시뮬레이션 수행 기간이
+        Optimizer 기간과 동일하면 Rawdata 재사용, 다르면 재생성(Optimizer 재실행 없음). 15분 단위 ES
+        level 시뮬레이션은 시뮬레이션 수행 기간 전체에 대해 실행되고, 결과 집계(레벨별 누적 카운트/Tput
+        불만족 카운트)만 평가 기간·평가 시간으로 한정된다."""
         if self.latest_optimizer_results is None or self.latest_optimizer_results.empty:
             return messagebox.showwarning("경고", "먼저 Optimizer 탭에서 '최적화 결과 화면으로 보기'를 실행해 ES Level 정책을 도출해주세요.")
 
@@ -2152,7 +2201,23 @@ class ESAnalyzerApp(AppDashboard):
 
         top_frame = ttk.Frame(win, padding=10)
         top_frame.pack(fill=tk.X)
-        ttk.Label(top_frame, text="* Energy Dashboard 상단의 '평가 기간/평가 시간' 설정을 그대로 사용합니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=5)
+        ttk.Label(top_frame, text="시뮬레이션 수행 기간:", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
+        today = datetime.today()
+        if HAS_CALENDAR:
+            sim_start_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
+            sim_start_picker.set_date(today)
+            sim_start_picker.pack(side=tk.LEFT)
+            ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
+            sim_end_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
+            sim_end_picker.set_date(today)
+            sim_end_picker.pack(side=tk.LEFT)
+        else:
+            sim_start_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
+            sim_end_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
+            ttk.Entry(top_frame, textvariable=sim_start_str, width=12).pack(side=tk.LEFT)
+            ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
+            ttk.Entry(top_frame, textvariable=sim_end_str, width=12).pack(side=tk.LEFT)
+        ttk.Label(top_frame, text="* 결과 집계는 상단의 '평가 기간/평가 시간'으로 한정됩니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=15)
 
         status_label = ttk.Label(top_frame, text="대기 중...", foreground=self.ACCENT_BLUE)
         status_label.pack(side=tk.LEFT, padx=20)
@@ -2170,22 +2235,31 @@ class ESAnalyzerApp(AppDashboard):
         state = {'summary_df': pd.DataFrame(), 'timeline_df': pd.DataFrame(), 'saving_df': pd.DataFrame()}
 
         def run_sim():
-            s_date, e_date = self._get_eval_date_range()
-            if not s_date or not e_date:
+            if HAS_CALENDAR:
+                sim_s_date, sim_e_date = sim_start_picker.get_date(), sim_end_picker.get_date()
+            else:
+                try:
+                    sim_s_date = datetime.strptime(sim_start_str.get(), '%Y-%m-%d').date()
+                    sim_e_date = datetime.strptime(sim_end_str.get(), '%Y-%m-%d').date()
+                except Exception:
+                    return messagebox.showerror("오류", "시뮬레이션 수행 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
+
+            eval_s_date, eval_e_date = self._get_eval_date_range()
+            if not eval_s_date or not eval_e_date:
                 return messagebox.showerror("오류", "평가 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
             eval_hours = self._parse_eval_hours()
 
             status_label.config(text="Rawdata 준비 중...", foreground=self.ACCENT_BLUE)
             win.update()
-            raw_df, reused = self._build_rawdata_for_period(s_date, e_date, self.exclude_dates_str.get())
+            raw_df, reused = self._build_rawdata_for_period(sim_s_date, sim_e_date, self.exclude_dates_str.get())
             if raw_df.empty:
                 status_label.config(text="Rawdata 없음", foreground="red")
                 return messagebox.showwarning("경고", "해당 기간에 대한 Rawdata를 만들 수 없습니다.\n(트래픽 데이터/Optimizer 결과를 확인해주세요.)")
 
             status_label.config(text=f"시뮬레이션 실행 중... (Rawdata {'재사용' if reused else '신규 생성'})", foreground=self.ACCENT_BLUE)
             win.update()
-            timeline_df, summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
-            saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date, eval_hours=eval_hours)
+            timeline_df, summary_df = self._run_es_level_simulation(raw_df, eval_start_date=eval_s_date, eval_end_date=eval_e_date, eval_hours=eval_hours)
+            saving_df = self._calc_es_level_simulation_savings(summary_df, eval_s_date, eval_e_date, eval_hours=eval_hours)
             state['summary_df'], state['timeline_df'], state['saving_df'] = summary_df, timeline_df, saving_df
             self._update_tree(tree_sum, summary_df)
             self._update_tree(tree_saving, saving_df)
