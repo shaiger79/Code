@@ -266,16 +266,16 @@
   * **적용 범위**: 사용자 요청에 따라 동일한 수정(시뮬레이션 수행 기간 분리 + 버그 조사)을 `esm_r15.py`에도 그대로 반영(r15에는 Deep Sleep 기능이 없으므로 그 부분은 제외하고 이 수정만 포팅).
   * **검증**: 팝업 2개 모두 새 "시뮬레이션 수행 기간" 위젯이 포함되어 오류 없이 열리고, 트래픽 미설정 시 경고만 표시하고 예외 없이 종료됨을 확인. `python -m py_compile` 통과(양쪽 파일 모두).
 
-* **[v5.2 / esm_r15.py 우선 반영, esm_r16.py는 다음 포팅 예정] (2026-07-07) 버그 수정: IpThruThpDLTime<=0/NaN 행 통째 제외로 인한 15분 연속성 붕괴 + 특정 Sector ES 적용 0회 문제**
+* **[v5.2 / esm_r15.py 우선 반영 후 esm_r16.py에 포팅 완료] (2026-07-07) 버그 수정: IpThruThpDLTime<=0/NaN 행 통째 제외로 인한 15분 연속성 붕괴 + 특정 Sector ES 적용 0회 문제**
   * **배경**: 사용자가 시뮬레이션 상세 타임라인을 직접 검토하다가, IIR을 손으로 재현해도 Entering 조건(Tput/UsedRB_t)이 만족되는 것처럼 보이는데 실제 시뮬레이션은 특정 Sector에서 레벨 적용 횟수가 0으로 나오는 것을 발견 — 이상하다고 보고. 사용자가 "r15에 먼저 반영하고, 고친 뒤 r16에 반영"하라고 순서를 지정.
   * **원인**: `run_analysis`/`_build_rawdata_for_period` 양쪽 모두 `IpThruThpDLTime > 0`을 만족 못하는 행(트래픽 통계가 0초/NaN으로 잡힌 구간)을 valid_mask에서 통째로 제외하고 있었음 — 이러면 15분 간격의 연속 스텝이라는 시뮬레이션의 기본 가정이 깨져서, 결측 구간이 많은 Sector는 윈도우 진입마다 Initial level(0)로 재시작하는 로직과 맞물려 레벨이 오를 기회 자체가 거의 사라져 "적용 횟수 0"으로 보였을 것으로 추정.
   * **수정**: valid_mask에서 `IpThruThpDLTime > 0` 조건을 제거해 그런 행도 더 이상 통째로 버리지 않고 유지(15분 간격 연속성 보존)하되, `cmIPTput`만 그 행에서 NaN으로 계산되도록 함(SP/InitEstIPTput은 IpThruThpDLTime과 무관하므로 영향 없음). `_run_es_level_simulation`에 예외 처리 추가: 그 스텝의 rawdata `cmIPTput`이 NaN이면(윈도우 진입/이탈 판정 포함) 레벨 결정을 보류하고 이전 스텝의 ES level/IIR 상태를 그대로 승계(freeze-forward) — "그 시간은 그냥 이전 ES level을 승계해야 한다"는 사용자 지시 그대로 반영.
   * **검증**: 6-스텝 합성 데이터의 3번째 스텝에 `cmIPTput=NaN`을 주입한 단위 테스트에서 레벨/IIR이 정확히 이전 스텝 값을 승계하고 이후 스텝은 승계된 상태를 기반으로 다시 정상적으로 레벨 결정이 이어짐을 확인. 실제 GUI 앱으로 트래픽의 약 6%(17/288행, ES 운영 시간대 집중) 행에 IpThruThpDLTime=0/NaN을 주입해 실행 — 이전이면 해당 행들이 사라져 24행 중 18행만 남았을 것이 수정 후 24행 모두 유지되고 그중 6행만 cmIPTput=NaN으로 정확히 표시됨을 확인.
-  * **적용 순서**: 사용자 지시대로 이번엔 `esm_r15.py`에만 우선 반영 완료. `esm_r16.py`에는 다음 라운드에 동일 수정을 포팅 예정(Deep Sleep 로직과의 상호작용은 없음 — 이 수정은 레벨 결정 전 단계의 rawdata/시뮬레이션 루프에 대한 것이라 Deep Sleep 절감 계산과 독립적).
+  * **적용 순서**: 사용자 지시대로 `esm_r15.py`에 먼저 반영·검증한 뒤, 동일한 수정(valid_mask 변경 2곳 + `_run_es_level_simulation` 예외 처리)을 `esm_r16.py`에도 그대로 포팅 완료 — 두 파일 모두 동일한 합성 테스트로 결과 일치 확인(Deep Sleep 로직과는 독립적이라 상호작용 없음).
 
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.2(`esm_r15.py`만 우선 수정) - IpThruThpDLTime<=0/NaN 행이 통째로 제외되어 15분 연속성이 깨지던 버그를 수정(행은 유지, cmIPTput만 NaN 처리 + 시뮬레이션이 그 스텝을 이전 레벨 승계 예외로 처리). **`esm_r16.py`에는 아직 미반영 — 다음 라운드에 포팅 필요.** 이전 v5.1(`esm_r16.py` + `esm_r15.py`)에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가했고, v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + Mode 1/2/3 전환을 추가하며 여기까지 도달.
+* 현재 상태: v5.2(`esm_r15.py` + `esm_r16.py` 모두 반영 완료) - IpThruThpDLTime<=0/NaN 행이 통째로 제외되어 15분 연속성이 깨지던 버그를 양쪽 파일 모두 수정(행은 유지, cmIPTput만 NaN 처리 + 시뮬레이션이 그 스텝을 이전 레벨 승계 예외로 처리). 이전 v5.1(`esm_r16.py` + `esm_r15.py`)에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가했고, v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + Mode 1/2/3 전환을 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -284,10 +284,9 @@
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
-  8. **다음 결정 대기(v5.1)**: 사용자가 실데이터로 "시뮬레이션 수행 기간" 분리 후 Sector별 절감에너지가 정상적으로 달라지는지 재확인 필요 — 만약 여전히 동일하게 나오면 CM/RU-MMU Spec 매핑 여부를 함께 점검.
-  9. **다음 필수 작업(v5.2)**: `esm_r16.py`에 이번 IpThruThpDLTime 예외처리 수정을 포팅해야 함.
-  10. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (이번 세션 내에 esm_r16.py로 동일 수정 포팅 예정)
+  8. **다음 결정 대기(v5.1/v5.2)**: 사용자가 실데이터로 "시뮬레이션 수행 기간" 분리 + IpThruThpDLTime 예외처리 적용 후 특정 Sector의 ES level 적용 횟수가 정상적으로(0이 아니게) 나오는지 재확인 필요 — 만약 여전히 0으로 나오면 CM/RU-MMU Spec 매핑 여부를 함께 점검.
+  9. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
+* 다음 대기 작업: (사용자가 실데이터로 재확인한 결과를 알려줄 예정 — `esm_r16.py`에서 계속 반영)
 
 ---
 *Last Updated: 2026-07-06*
