@@ -108,6 +108,33 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
     실행에 없던 3일차)를 넣으면 `reused=False`로 Optimizer를 재실행하지 않고 트래픽만 다시 읽어 15분
     간격(하루 96행) Rawdata를 새로 만들며 ES_Window_Index/DRB_L/Entering Th_PRB 등이 기존에 학습된
     윈도우 정의와 정확히 일치함을 확인 — 이 Rawdata로 시뮬레이션까지 오류 없이 실행됨을 확인.
+
+[r15-후속] ES Level 시뮬레이션 결과를 실제 절감 에너지[Wh]로 환산 + Advanced Settings 위치 수정:
+  - **버그 수정**: IIR Filter Coefficient Tput_LTE/PRB_LTE가 Optimizer 탭의 Advanced Settings에만 있어
+    Energy Dashboard 쪽에서 보이지 않던 문제 수정 — ES Level 시뮬레이션 전용 파라미터이므로 Energy
+    Dashboard 자체의 Advanced Settings(`energy_adv_frame`, 기존 Gamma 설정이 있던 곳)로 이동.
+  - **신규 Gamma2**: Energy Dashboard Advanced Settings에 `Gamma2`(기본값 0.7) 추가 — 시뮬레이션 기반
+    절감 에너지 추정치에 곱하는 보정 계수(기존 Nc2 기반 방식의 `Gamma`와 동일한 역할, 별도 파라미터).
+  - **ES Level 시뮬레이션 → 절감 에너지 환산** (신규 `_calc_es_level_simulation_savings`): ESM Output
+    Result의 레벨별 `Target Cell Num`(그 레벨에서 새로 꺼지는 고유 셀)과 CM 매핑으로 찾은 RU HW의
+    Idle-PAoff 전력차(신규 `_power_delta_for_cells`, 기존 `_calculate_est_saving`과 동일 로직만 추출)를
+    결합. 레벨 k의 셀은 `Applied_ES_Level >= k`인 모든 스텝 동안 계속 꺼져 있으므로(DRBn이 누적합인 것과
+    동일한 논리, 기존 `_calc_all_savings`의 cum_nc2 누적 방식과 수학적으로 동일) — 절감 에너지 =
+    Σ_k [ power_delta(레벨 k 고유 대상 셀) × count(Level>=k, 시뮬레이션 요약의 `Level {L} Count`에서 계산)
+    × 0.25h ] × Gamma2.
+  - **Sector별 소모 대비 절감률**: 신규 `_parse_energy_stat_for_range`(Energy Dashboard 탭의 날짜 위젯과
+    무관하게 임의 기간으로 Energy Stat을 직접 필터링) + `_sector_total_energy_wh`(CM의 `Sector`
+    열(cell-num%10)로 해당 Sector의 모든 RU path를 찾아 총 소모 에너지 합산, 공유 RU 중복 방지)를 추가.
+    ES Level 시뮬레이션 팝업에 "에너지 절감 효과 (Sector별)" 탭을 신규 추가해 Sector별
+    소모에너지[Wh]/절감에너지[Wh]/절감률(%)/Tput Violation Count/Tput Violation Ratio(=위반
+    스텝수/ES Active Steps)를 표로 보여주고, 마지막 행에 전체 사이트 합계를 추가. CSV 다운로드에도
+    함께 포함(`_EnergySaving.csv`).
+  - **검증**: `_calc_es_level_simulation_savings`를 가짜 self(3개 RU를 가진 Sector, 레벨1/2 각각 고유
+    대상 셀 1개씩, RU HW Idle-PAoff 전력차 60W, 레벨별 카운트 0/30/50, Energy Stat 24시간치 합성 데이터)로
+    단위 테스트 — 절감 에너지 1365.0Wh(=60W×80스텝×0.25h + 60W×50스텝×0.25h, 이후 Gamma2=0.7 적용),
+    소모 에너지 7200.0Wh(3개 RU×24시간×100Wh), 절감률 18.96%, Tput Violation Ratio 0.0625가 모두 손계산과
+    정확히 일치함을 확인. 실제 GUI 앱에서 ES Level 시뮬레이션 팝업이 3개 탭(Sector 요약/에너지 절감
+    효과/상세 타임라인) 구성으로 오류 없이 열림을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -545,10 +572,6 @@ class AppBase(BaseTk):
         ttk.Entry(self.advanced_frame, textvariable=self.req_ip_tput_low_util_lte, width=15).grid(row=7, column=1, sticky=tk.W, padx=10)
         ttk.Label(self.advanced_frame, text="N_allowedEScell_LTE:").grid(row=8, column=0, sticky=tk.W, pady=5)
         ttk.Entry(self.advanced_frame, textvariable=self.n_allowed_escell_lte, width=15).grid(row=8, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="IIR Filter Coefficient Tput_LTE:").grid(row=9, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(self.advanced_frame, textvariable=self.iir_coef_tput_lte, width=15).grid(row=9, column=1, sticky=tk.W, padx=10)
-        ttk.Label(self.advanced_frame, text="IIR Filter Coefficient PRB_LTE:").grid(row=10, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(self.advanced_frame, textvariable=self.iir_coef_prb_lte, width=15).grid(row=10, column=1, sticky=tk.W, padx=10)
 
         bottom_frame = ttk.Frame(self.frame_main)
         bottom_frame.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM)
@@ -867,8 +890,17 @@ class AppDashboard(AppEditors):
 
         self.energy_adv_frame = ttk.Frame(ctrl_frame, padding=5)
         if not hasattr(self, 'pred_gamma'): self.pred_gamma = tk.DoubleVar(value=0.700)
+        if not hasattr(self, 'pred_gamma2'): self.pred_gamma2 = tk.DoubleVar(value=0.700)  # [r15-후속] ES Level 시뮬레이션 절감량 보정 계수
         ttk.Label(self.energy_adv_frame, text="Gamma (Effective Nc2 보정 계수):").grid(row=0, column=0, sticky=tk.W, padx=5)
         ttk.Spinbox(self.energy_adv_frame, from_=0.001, to=1.000, increment=0.001, textvariable=self.pred_gamma, width=10).grid(row=0, column=1, sticky=tk.W)
+        # [r15-후속] ES Level 시간별 시뮬레이션 전용 파라미터 — Energy Dashboard 기능이므로 Optimizer 탭이 아니라
+        # 여기(Energy Dashboard Advanced Settings)에 둔다.
+        ttk.Label(self.energy_adv_frame, text="IIR Filter Coefficient Tput_LTE:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=(5, 0))
+        ttk.Spinbox(self.energy_adv_frame, from_=0.01, to=1.00, increment=0.01, textvariable=self.iir_coef_tput_lte, width=10).grid(row=1, column=1, sticky=tk.W, pady=(5, 0))
+        ttk.Label(self.energy_adv_frame, text="IIR Filter Coefficient PRB_LTE:").grid(row=2, column=0, sticky=tk.W, padx=5)
+        ttk.Spinbox(self.energy_adv_frame, from_=0.01, to=1.00, increment=0.01, textvariable=self.iir_coef_prb_lte, width=10).grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(self.energy_adv_frame, text="Gamma2 (ES Level 시뮬레이션 절감량 보정 계수):").grid(row=3, column=0, sticky=tk.W, padx=5)
+        ttk.Spinbox(self.energy_adv_frame, from_=0.001, to=1.000, increment=0.001, textvariable=self.pred_gamma2, width=10).grid(row=3, column=1, sticky=tk.W)
         self.show_energy_adv = False
 
         self.energy_plot_frame = ttk.Frame(self.frame_energy)
@@ -1775,7 +1807,7 @@ class ESAnalyzerApp(AppDashboard):
 
             level_counts = pd.Series(level).value_counts().to_dict()
             summary = {
-                'eNodeBID': str(enodeb), 'Sector': str(sector), 'Total Steps': n_rows,
+                'eNodeBID': str(enodeb), 'Sector': str(sector), 'Max_ES_Level': max_n, 'Total Steps': n_rows,
                 'ES Active Steps': int((win_idx != 0).sum()), 'Tput Violation Count': int(tput_violation.sum()),
             }
             for lv in range(0, max_n + 1):
@@ -1785,6 +1817,135 @@ class ESAnalyzerApp(AppDashboard):
         timeline_df = pd.concat(timeline_parts, ignore_index=True) if timeline_parts else pd.DataFrame()
         summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
         return timeline_df, summary_df
+
+    def _power_delta_for_cells(self, enodeb, target_cells_str):
+        """[r15-후속] `_calculate_est_saving`과 동일한 RU HW Idle-PAoff 전력차(W) 합산 로직만 따로 추출한
+        헬퍼. active_samples를 곱하지 않고 순수 전력차(고유 RU 기준 합)만 반환한다."""
+        if not target_cells_str or pd.isna(target_cells_str) or str(target_cells_str) == '-1': return 0.0
+        if self.cm_map_df_full.empty or self.ru_spec_df_internal.empty: return 0.0
+        try:
+            cells = re.findall(r'\d+', str(target_cells_str))
+            if not cells: return 0.0
+            cm_sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) & (self.cm_map_df_full['cell-num'].astype(str).isin(cells))]
+            if cm_sub.empty: return 0.0
+            ru_keys = ['ru-board-id', 'ru-port-id', 'ru-cascade-id']
+            avail_keys = [c for c in ru_keys if c in cm_sub.columns]
+            spec_bcol = next((c for c in self.ru_spec_df_internal.columns if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
+            btype_col = next((c for c in cm_sub.columns if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
+            if not spec_bcol or not btype_col: return 0.0
+            total_power_diff = 0.0
+            if avail_keys:
+                unique_rus = cm_sub[avail_keys + [btype_col]].drop_duplicates(subset=avail_keys)
+                for _, ru in unique_rus.iterrows():
+                    b_type = str(ru[btype_col]).strip().lower()
+                    spec_row = self.ru_spec_df_internal[self.ru_spec_df_internal[spec_bcol].astype(str).str.strip().str.lower() == b_type]
+                    if not spec_row.empty:
+                        try:
+                            idle = float(spec_row.iloc[0].get('Idle', 0))
+                            pa_off = float(spec_row.iloc[0].get('PA off', 0))
+                            coe_val = spec_row.iloc[0].get('Coe_paoff', 1.0)
+                            coe_paoff = float(coe_val) if pd.notna(coe_val) and str(coe_val).strip() != '' else 1.0
+                            total_power_diff += (idle - pa_off) * coe_paoff
+                        except Exception: pass
+            return total_power_diff
+        except Exception:
+            return 0.0
+
+    def _parse_energy_stat_for_range(self, start_date, end_date):
+        """[r15-후속] Energy Dashboard 탭의 날짜 위젯과 무관하게, ES Level 시뮬레이션이 지정한 임의의
+        [start_date, end_date] 기간(전체 시간대)으로 Energy Stat 데이터를 직접 필터링한다."""
+        df_e = self._parse_energy_stat_raw()
+        df_e = df_e[(df_e['Timestamp'].dt.date >= start_date) & (df_e['Timestamp'].dt.date <= end_date)]
+        if df_e.empty: return df_e
+        df_e = df_e.copy()
+        df_e['Hourly_TS'] = df_e['Timestamp'].dt.floor('h')
+        return df_e
+
+    def _sector_total_energy_wh(self, enodeb, sector, df_estat):
+        """[r15-후속] (eNodeBID, Sector)에 속한 모든 Cell의 RU path를 CM 매핑(cm_map_df_full의 'Sector'
+        열, cell-num%10 기준)으로 찾아, 이미 기간 필터된 df_estat에서 해당 RU들의 총 소모 에너지[Wh]를
+        합산한다(공유 RU 중복 합산 방지를 위해 RU path 기준으로 먼저 dedupe)."""
+        if df_estat is None or df_estat.empty or self.cm_map_df_full.empty: return 0.0
+        cm_sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) & (self.cm_map_df_full['Sector'].astype(str) == str(sector))]
+        if cm_sub.empty: return 0.0
+        ru_keys = ['ru-board-id', 'ru-port-id', 'ru-cascade-id']
+        avail_keys = [c for c in ru_keys if c in cm_sub.columns and c in df_estat.columns]
+        if not avail_keys: return 0.0
+        unique_rus = cm_sub[avail_keys].drop_duplicates()
+        total_wh = 0.0
+        for _, ru in unique_rus.iterrows():
+            mask = pd.Series(True, index=df_estat.index)
+            for k in avail_keys: mask &= (df_estat[k] == ru[k])
+            ru_data = df_estat[mask]
+            if ru_data.empty: continue
+            ru_hr = ru_data.groupby('Hourly_TS', observed=True).agg({'RuPowerTot': 'sum', 'RuPowerCnt': 'sum'})
+            ru_hr['Energy_Wh'] = np.where(ru_hr['RuPowerCnt'] > 0, ru_hr['RuPowerTot'] / ru_hr['RuPowerCnt'], 0)
+            total_wh += ru_hr['Energy_Wh'].sum()
+        return total_wh
+
+    def _calc_es_level_simulation_savings(self, summary_df, start_date, end_date):
+        """[r15-후속] ES Level 시뮬레이션의 셀별 레벨 누적 카운트(summary_df)에 ESM Output Result의
+        레벨별 Target Cell Num + RU HW(Idle-PAoff) 전력차를 결합해 Sector별 예상 절감 에너지[Wh]를
+        계산하고, Energy Stat 데이터에서 동일 기간 실제 총 소모 에너지[Wh]를 가져와 절감률/Tput 위반
+        비율과 함께 정리한다. 마지막 행에 전체 사이트 합계를 추가한다.
+
+        레벨 k의 셀은 "Applied_ES_Level >= k"인 모든 스텝 동안 계속 꺼져있으므로(DRBn이 누적합인 것과
+        동일한 논리, 기존 `_calc_all_savings`의 cum_nc2 방식과 동일 원리), 절감 에너지 =
+        Σ_k [ power_delta(레벨 k 고유 Target Cell) × count(Level>=k) × 0.25h ] × Gamma2."""
+        if summary_df is None or summary_df.empty: return pd.DataFrame()
+        if self.latest_optimizer_results is None or self.latest_optimizer_results.empty: return pd.DataFrame()
+
+        gamma2 = self.pred_gamma2.get() if hasattr(self, 'pred_gamma2') else 0.7
+
+        df_estat = None
+        if self.energy_stat_file.get():
+            try: df_estat = self._parse_energy_stat_for_range(start_date, end_date)
+            except Exception: df_estat = None
+
+        rows = []
+        for _, srow in summary_df.iterrows():
+            enodeb, sector, max_n = str(srow['eNodeBID']), str(srow['Sector']), int(srow['Max_ES_Level'])
+            cell_res = self.latest_optimizer_results[
+                (self.latest_optimizer_results['eNodeBID'].astype(str) == enodeb) &
+                (self.latest_optimizer_results['Sector'].astype(str) == sector) &
+                (self.latest_optimizer_results['ES Level'] != 7)
+            ]
+            level_power_delta = {int(r['ES Level']): self._power_delta_for_cells(enodeb, r.get('Target Cell Num', ''))
+                                  for _, r in cell_res.iterrows()}
+
+            saved_wh = 0.0
+            for k in range(1, max_n + 1):
+                count_ge_k = sum(int(srow.get(f'Level {lv} Count', 0)) for lv in range(k, max_n + 1))
+                saved_wh += level_power_delta.get(k, 0.0) * count_ge_k * 0.25
+            saved_wh *= gamma2
+
+            consumed_wh = self._sector_total_energy_wh(enodeb, sector, df_estat)
+            es_active = int(srow.get('ES Active Steps', 0))
+            violation_cnt = int(srow.get('Tput Violation Count', 0))
+            pct = (saved_wh / consumed_wh * 100) if consumed_wh else np.nan
+            violation_ratio = (violation_cnt / es_active) if es_active else 0.0
+
+            rows.append({
+                'eNodeBID': enodeb, 'Sector': sector,
+                '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': round(saved_wh, 2),
+                '절감률 (%)': round(pct, 2) if pd.notna(pct) else np.nan,
+                'Tput Violation Count': violation_cnt, 'Tput Violation Ratio': round(violation_ratio, 4),
+            })
+
+        result_df = pd.DataFrame(rows)
+        if not result_df.empty:
+            total_consumed, total_saved = result_df['소모에너지 [Wh]'].sum(), result_df['절감에너지 [Wh]'].sum()
+            total_violation = result_df['Tput Violation Count'].sum()
+            total_active = summary_df['ES Active Steps'].sum() if 'ES Active Steps' in summary_df.columns else 0
+            total_row = {
+                'eNodeBID': '전체 합계', 'Sector': '', '소모에너지 [Wh]': round(total_consumed, 2),
+                '절감에너지 [Wh]': round(total_saved, 2),
+                '절감률 (%)': round(total_saved / total_consumed * 100, 2) if total_consumed else np.nan,
+                'Tput Violation Count': int(total_violation),
+                'Tput Violation Ratio': round(total_violation / total_active, 4) if total_active else 0.0,
+            }
+            result_df = pd.concat([result_df, pd.DataFrame([total_row])], ignore_index=True)
+        return result_df
 
     def _open_es_level_simulation_popup(self):
         """[r15] Energy Dashboard의 'ES Level 시간별 시뮬레이션' 팝업. 시뮬레이션 대상 기간을 지정하면
@@ -1822,13 +1983,15 @@ class ESAnalyzerApp(AppDashboard):
 
         nb = ttk.Notebook(win)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        sum_frame, detail_frame = ttk.Frame(nb), ttk.Frame(nb)
+        sum_frame, saving_frame, detail_frame = ttk.Frame(nb), ttk.Frame(nb), ttk.Frame(nb)
         nb.add(sum_frame, text="Sector 요약 (레벨별 누적 카운트)")
+        nb.add(saving_frame, text="에너지 절감 효과 (Sector별)")
         nb.add(detail_frame, text="상세 타임라인 (15분 단위)")
         tree_sum = self._create_tree_in_frame(sum_frame)
+        tree_saving = self._create_tree_in_frame(saving_frame)
         tree_detail = self._create_tree_in_frame(detail_frame)
 
-        state = {'summary_df': pd.DataFrame(), 'timeline_df': pd.DataFrame()}
+        state = {'summary_df': pd.DataFrame(), 'timeline_df': pd.DataFrame(), 'saving_df': pd.DataFrame()}
 
         def run_sim():
             if HAS_CALENDAR:
@@ -1850,10 +2013,13 @@ class ESAnalyzerApp(AppDashboard):
             status_label.config(text=f"시뮬레이션 실행 중... (Rawdata {'재사용' if reused else '신규 생성'})", foreground=self.ACCENT_BLUE)
             win.update()
             timeline_df, summary_df = self._run_es_level_simulation(raw_df)
-            state['summary_df'], state['timeline_df'] = summary_df, timeline_df
+            saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date)
+            state['summary_df'], state['timeline_df'], state['saving_df'] = summary_df, timeline_df, saving_df
             self._update_tree(tree_sum, summary_df)
+            self._update_tree(tree_saving, saving_df)
             self._update_tree_precise(tree_detail, timeline_df.head(2000), precise_cols=())
-            status_label.config(text=f"완료 (Rawdata {'재사용' if reused else '신규 생성'}, 셀 {summary_df['eNodeBID'].nunique() if not summary_df.empty else 0}개)", foreground=self.ACCENT_GREEN)
+            note = "" if self.energy_stat_file.get() else " (Energy Stat Data 미입력 - 소모에너지/절감률 계산 불가)"
+            status_label.config(text=f"완료 (Rawdata {'재사용' if reused else '신규 생성'}, 셀 {summary_df['eNodeBID'].nunique() if not summary_df.empty else 0}개){note}", foreground=self.ACCENT_GREEN)
 
         ttk.Button(top_frame, text="🔄 계산 실행", style='Primary.TButton', command=run_sim).pack(side=tk.LEFT, padx=10)
 
@@ -1865,11 +2031,14 @@ class ESAnalyzerApp(AppDashboard):
             filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="ES_Level_Simulation_Summary.csv")
             if filepath:
                 state['summary_df'].to_csv(filepath, index=False, encoding='utf-8-sig')
-                timeline_path = filepath.rsplit('.', 1)[0] + "_Timeline.csv"
+                base_path = filepath.rsplit('.', 1)[0]
+                saving_path = base_path + "_EnergySaving.csv"
+                timeline_path = base_path + "_Timeline.csv"
+                if not state['saving_df'].empty: state['saving_df'].to_csv(saving_path, index=False, encoding='utf-8-sig')
                 state['timeline_df'].to_csv(timeline_path, index=False, encoding='utf-8-sig')
-                messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}\n{timeline_path}")
+                messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}\n{saving_path}\n{timeline_path}")
 
-        ttk.Button(bot_frame, text="💾 결과 CSV 다운로드 (요약+타임라인)", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
+        ttk.Button(bot_frame, text="💾 결과 CSV 다운로드 (요약+절감효과+타임라인)", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
         ttk.Label(bot_frame, text="* 상세 타임라인 표는 화면에는 최대 2000행만 표시되며, CSV에는 전체가 저장됩니다.", foreground='#6B7280').pack(side=tk.LEFT)
 
     def _calc_all_savings(self, df_energy_stat=None):
