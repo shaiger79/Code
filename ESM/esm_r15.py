@@ -165,6 +165,31 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
     시뮬레이션되지만 카운트만 한정되는 것을 확인). 실제 GUI 앱으로 Optimizer 실행 후 Mode 1/2/3 팝업과
     ES Level 시뮬레이션 팝업, 그리고 절감 효과 시각화가 추가된 `_analyze_energy_stat`이 모두 오류 없이
     실행됨을 확인. `python -m py_compile` 통과.
+
+[r15-후속3] 절감 에너지 계산 단위(Wh) 재확인/명시 + Energy Dashboard·Learning Energy Curve 결과도
+Output 폴더에 자동 저장:
+  - **단위 재확인**: `_calc_es_level_simulation_savings`의 절감 에너지 계산은 이미
+    `power_delta(W) × count(15분 단위 스텝 수) × 0.25(h/step) × Gamma2` 형태로, count(15분 카운트)를
+    0.25를 곱해 시간(hour)으로 환산한 뒤에만 Watt(전력)와 곱해 Wh(에너지)를 산출하고 있었음(기존
+    `_calculate_est_saving`의 `/4.0`과 동일한 관례). 다만 `_run_es_level_simulation`의 summary_df에는
+    원래 카운트(`Level {L} Count`)만 있어 이 환산이 결과물에서 바로 보이지 않았으므로, 카운트 옆에
+    시간 환산값(`Level {L} Hours` = count×0.25)을 나란히 기록해 결과 CSV만 봐도 단위 환산이 명확히
+    드러나도록 함(계산 자체는 기존과 동일, 표시만 추가).
+  - **Output 폴더 자동 저장**: Optimizer의 "최종 결과 파일 저장"이 파일 대화상자 없이
+    `Output/<timestamp>/`에 바로 저장하는 것과 동일하게, Energy Dashboard/Learning Energy Curve의
+    다운로드 버튼들도 `filedialog.asksaveasfilename` 대화상자를 제거하고 신규 `_make_output_dir(subfolder)`
+    헬퍼로 `Output/<timestamp>/<subfolder>/`에 고정 파일명으로 자동 저장하도록 변경(Optimizer만 사용하던
+    "결과는 Output 폴더에 자동으로 쌓인다"는 규칙을 앱 전체로 일반화):
+    `_download_energy_intermediate` -> `Output/<ts>/EnergyDashboard/Energy_Intermediate.csv`,
+    `_predict_energy_saving_popup`의 CSV 다운로드 -> `Output/<ts>/EnergySavingPrediction/`(모드에 따라
+    NC2_Sector.csv/Simulation_Sector.csv/Comparison.csv 중 해당하는 것만), ES Level 시뮬레이션 팝업의
+    CSV 다운로드 -> `Output/<ts>/ESLevelSimulation/`(Summary.csv/EnergySaving.csv/Timeline.csv),
+    `_download_learn_result`(RU 단위 상세/HW 요약/Formula 3버튼 공용) -> `Output/<ts>/LearningEnergyCurve/`.
+  - **검증**: 기존 절감 에너지 단위 테스트(3개 RU, 레벨1/2, 전력차 60W, 카운트 80/50, Gamma2=0.7)에
+    `Level {L} Hours` 컬럼을 포함한 summary_df로 재실행 — 절감 에너지 1365.0Wh로 기존과 동일함을 재확인
+    (표시용 컬럼 추가가 계산 로직에 영향 없음을 확인). `_download_learn_result`를 실제로 호출해
+    `Output/<timestamp>/LearningEnergyCurve/<파일명>`에 정확히 저장되는 것을 파일시스템에서 직접 확인.
+    `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -325,6 +350,15 @@ class AppBase(BaseTk):
         if len(df.columns) == 1 and '\t' in df.columns[0]: df = pd.read_csv(filepath, encoding='utf-8-sig', sep='\t')
         df.columns = df.columns.str.strip()
         return df
+
+    def _make_output_dir(self, subfolder):
+        """[r15-후속] Optimizer의 run_analysis()가 결과를 저장하는 방식과 동일하게, Energy Dashboard/
+        Learning Energy Curve의 다운로드 결과도 파일 대화상자 없이 `Output/<timestamp>/<subfolder>/`에
+        자동 저장하기 위한 폴더를 만들어 경로를 반환한다."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = os.path.join(os.getcwd(), "Output", ts, subfolder)
+        os.makedirs(out_dir, exist_ok=True)
+        return out_dir
 
     def _get_target_cells_str(self, band_names, carrier_df, target_col):
         cells = []
@@ -1260,11 +1294,10 @@ class AppDashboard(AppEditors):
             final_df = df_merged.groupby(['eNB_ID', 'Sector', 'Date_str', 'HourOfDay'], observed=True)['Energy_Wh'].sum().reset_index()
             final_df.rename(columns={'eNB_ID': 'eNodeBID', 'Date_str': 'Date', 'HourOfDay': 'Hour', 'Energy_Wh': 'Consumed Energy [Wh]'}, inplace=True)
 
-            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv"), ("Parquet Files", "*.parquet")], initialfile="Energy_Intermediate.csv")
-            if filepath:
-                if filepath.endswith('.parquet'): final_df.to_parquet(filepath, index=False)
-                else: final_df.to_csv(filepath, index=False, encoding='utf-8-sig')
-                messagebox.showinfo("저장 완료", f"상세 데이터가 저장되었습니다:\n{filepath}")
+            out_dir = self._make_output_dir("EnergyDashboard")
+            filepath = os.path.join(out_dir, "Energy_Intermediate.csv")
+            final_df.to_csv(filepath, index=False, encoding='utf-8-sig')
+            messagebox.showinfo("저장 완료", f"상세 데이터가 저장되었습니다:\n{filepath}")
 
             self.status_label.config(text="Intermediate 다운로드 완료", fg=self.ACCENT_GREEN)
         except Exception as e:
@@ -1807,18 +1840,18 @@ class ESAnalyzerApp(AppDashboard):
         bot_frame.pack(fill=tk.X)
 
         def save_csv():
-            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="Energy_Saving_Prediction.csv")
-            if not filepath: return
-            base_path = filepath.rsplit('.', 1)[0]
             saved_paths = []
+            has_data = ((mode in (1, 3) and getattr(self, 'pred_df_sec', pd.DataFrame()) is not None and not self.pred_df_sec.empty) or
+                        (mode in (2, 3) and not state['sim_saving_df'].empty) or (mode == 3 and not state['cmp_df'].empty))
+            if not has_data: return messagebox.showwarning("경고", "먼저 '계산 및 업데이트'를 눌러주세요.")
+            out_dir = self._make_output_dir("EnergySavingPrediction")
             if mode in (1, 3) and getattr(self, 'pred_df_sec', pd.DataFrame()) is not None and not self.pred_df_sec.empty:
-                p = base_path + "_NC2_Sector.csv"; self.pred_df_sec.to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+                p = os.path.join(out_dir, "NC2_Sector.csv"); self.pred_df_sec.to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
             if mode in (2, 3) and not state['sim_saving_df'].empty:
-                p = base_path + "_Simulation_Sector.csv"; state['sim_saving_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+                p = os.path.join(out_dir, "Simulation_Sector.csv"); state['sim_saving_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
             if mode == 3 and not state['cmp_df'].empty:
-                p = base_path + "_Comparison.csv"; state['cmp_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
-            if saved_paths: messagebox.showinfo("저장 완료", "저장되었습니다:\n" + "\n".join(saved_paths))
-            else: messagebox.showwarning("경고", "먼저 '계산 및 업데이트'를 눌러주세요.")
+                p = os.path.join(out_dir, "Comparison.csv"); state['cmp_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+            messagebox.showinfo("저장 완료", "저장되었습니다:\n" + "\n".join(saved_paths))
 
         ttk.Button(bot_frame, text="💾 결과 CSV 다운로드", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
 
@@ -1953,6 +1986,10 @@ class ESAnalyzerApp(AppDashboard):
             cell_df['In_Eval_Hours'] = eval_mask
             timeline_parts.append(cell_df)
 
+            # [r15-후속2] cmIPTput/RB 등 절감량 계산에 들어가는 값은 '15분 단위 count' 기준이라 실제
+            # Energy 단위(Wh)와는 시간 축이 다르다 — count/4(=count*0.25h)로 시간(hour) 환산해야 Watt와
+            # 곱했을 때 비로소 Wh가 된다(`_calc_es_level_simulation_savings`에서 이미 이렇게 계산함).
+            # 결과 표에서도 이 환산이 명확히 보이도록 카운트 옆에 시간(h) 환산값을 함께 기록한다.
             level_counts = pd.Series(level[eval_mask]).value_counts().to_dict()
             summary = {
                 'eNodeBID': str(enodeb), 'Sector': str(sector), 'Max_ES_Level': max_n,
@@ -1960,7 +1997,9 @@ class ESAnalyzerApp(AppDashboard):
                 'Tput Violation Count': int(tput_violation[eval_mask].sum()),
             }
             for lv in range(0, max_n + 1):
-                summary[f'Level {lv} Count'] = int(level_counts.get(lv, 0))
+                cnt = int(level_counts.get(lv, 0))
+                summary[f'Level {lv} Count'] = cnt
+                summary[f'Level {lv} Hours'] = round(cnt * 0.25, 2)
             summary_rows.append(summary)
 
         timeline_df = pd.concat(timeline_parts, ignore_index=True) if timeline_parts else pd.DataFrame()
@@ -2161,15 +2200,14 @@ class ESAnalyzerApp(AppDashboard):
 
         def save_csv():
             if state['summary_df'].empty: return messagebox.showwarning("경고", "먼저 '계산 실행'을 눌러주세요.")
-            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="ES_Level_Simulation_Summary.csv")
-            if filepath:
-                state['summary_df'].to_csv(filepath, index=False, encoding='utf-8-sig')
-                base_path = filepath.rsplit('.', 1)[0]
-                saving_path = base_path + "_EnergySaving.csv"
-                timeline_path = base_path + "_Timeline.csv"
-                if not state['saving_df'].empty: state['saving_df'].to_csv(saving_path, index=False, encoding='utf-8-sig')
-                state['timeline_df'].to_csv(timeline_path, index=False, encoding='utf-8-sig')
-                messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}\n{saving_path}\n{timeline_path}")
+            out_dir = self._make_output_dir("ESLevelSimulation")
+            filepath = os.path.join(out_dir, "Summary.csv")
+            saving_path = os.path.join(out_dir, "EnergySaving.csv")
+            timeline_path = os.path.join(out_dir, "Timeline.csv")
+            state['summary_df'].to_csv(filepath, index=False, encoding='utf-8-sig')
+            if not state['saving_df'].empty: state['saving_df'].to_csv(saving_path, index=False, encoding='utf-8-sig')
+            state['timeline_df'].to_csv(timeline_path, index=False, encoding='utf-8-sig')
+            messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}\n{saving_path}\n{timeline_path}")
 
         ttk.Button(bot_frame, text="💾 결과 CSV 다운로드 (요약+절감효과+타임라인)", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
         ttk.Label(bot_frame, text="* 상세 타임라인 표는 화면에는 최대 2000행만 표시되며, CSV에는 전체가 저장됩니다.", foreground='#6B7280').pack(side=tk.LEFT)
@@ -3134,10 +3172,10 @@ class ESAnalyzerApp(AppDashboard):
     def _download_learn_result(self, df, default_name):
         if df is None or df.empty:
             return messagebox.showwarning("경고", "먼저 '학습 실행'을 눌러 결과를 생성해주세요.")
-        filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile=default_name)
-        if filepath:
-            df.to_csv(filepath, index=False, encoding='utf-8-sig')
-            messagebox.showinfo("저장 완료", f"결과가 저장되었습니다:\n{filepath}")
+        out_dir = self._make_output_dir("LearningEnergyCurve")
+        filepath = os.path.join(out_dir, default_name)
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        messagebox.showinfo("저장 완료", f"결과가 저장되었습니다:\n{filepath}")
 
     def _browse_learning_files_multi(self):
         paths = filedialog.askopenfilenames(filetypes=[("CSV Files", "*.csv")])
