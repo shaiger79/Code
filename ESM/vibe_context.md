@@ -221,17 +221,25 @@
   * **사용자 확인 완료 사항**(구현 전 3가지 질문 → 모두 "권장안대로" 확정): (a) `Pred_IPTput_Mbps_L(Curr+1)` 계산은 raw(비-IIR) UsedRB_t_adj/SP 사용. (b) "동일 기간" 판정은 시작일/종료일/제외 날짜 모두 일치. (c) 결과는 Energy Dashboard의 새 버튼+팝업으로 표시(기존 "Energy Saving Prediction" 팝업과는 별도).
   * **검증**: `_run_es_level_simulation`을 가짜 self(iir 계수만 있는 객체)와 손으로 설계한 6-스텝 합성 Rawdata(윈도우 내내 유리한 조건→0→1→2 증가, PRB Leaving 조건으로 2→1 감소, Tput Leaving 조건으로 1→0 감소(Tput_Violation 플래그 확인), 마지막 스텝은 윈도우 이탈로 0 유지)로 단위 테스트해 레벨 궤적 `[0,1,2,1,0,0]`과 IIR 값이 손계산과 소수점까지 정확히 일치함을 확인. 실제 GUI 앱으로 3일치 15분 단위 합성 트래픽에 Optimizer를 실행한 뒤, Optimizer와 동일 기간을 넣으면 `reused=True`로 기존 Rawdata를 그대로 반환하고, 다른 날짜(Optimizer 실행에 없던 3일차)를 넣으면 `reused=False`로 Optimizer를 재실행하지 않고 트래픽만 다시 읽어 15분 간격(하루 96행) Rawdata를 새로 만들며 `ES_Window_Index`/`DRB_L`/`Entering Th_PRB` 등이 기존 학습된 윈도우 정의와 정확히 일치함을 확인 — 이 Rawdata로 시뮬레이션까지 오류 없이 실행됨을 확인. `python -m py_compile` 통과.
 
+* **[v4.1 / esm_r15.py] (2026-07-07) ES Level 시뮬레이션 → 절감 에너지[Wh] 환산 + Advanced Settings 위치 버그 수정**
+  * **배경**: v4.0에서 IIR 필터 계수를 Optimizer 탭 Advanced Settings에 추가했는데, 이 파라미터는 Energy Dashboard 전용 기능(ES Level 시뮬레이션)에서만 쓰이다 보니 사용자가 Energy Dashboard 쪽 Advanced Settings에서 찾다가 못 찾음(버그로 보고) — Energy Dashboard의 Advanced Settings(`energy_adv_frame`, 기존 Gamma 설정 위치)로 이동. 또한 v4.0에서는 ES Level별 누적 카운트만 보여주고 실제 Watt-hour 절감량 환산은 미구현이었는데, 이를 구현해달라는 요청.
+  * **Advanced Settings 위치 수정**: IIR Filter Coefficient Tput_LTE/PRB_LTE를 Optimizer 탭에서 제거하고 Energy Dashboard 탭의 Advanced Settings로 이동(내부 변수 `self.iir_coef_tput_lte`/`self.iir_coef_prb_lte`는 그대로 재사용, UI 위젯 위치만 변경).
+  * **신규 Gamma2**: Energy Dashboard Advanced Settings에 `Gamma2`(기본값 0.7, 기존 Nc2 기반 방식의 `Gamma`와 동일한 스핀박스 스타일) 추가 — ES Level 시뮬레이션 기반 절감 에너지 추정치에 곱하는 보정 계수.
+  * **절감 에너지 계산 로직** (신규 `_calc_es_level_simulation_savings` + 헬퍼 `_power_delta_for_cells`/`_parse_energy_stat_for_range`/`_sector_total_energy_wh`): ESM Output Result의 레벨별 `Target Cell Num`(그 레벨에서 새로 꺼지는 고유 셀)과 CM 매핑으로 찾은 RU HW의 Idle-PAoff 전력차를 결합. 레벨 k의 셀은 `Applied_ES_Level >= k`인 모든 시뮬레이션 스텝 동안 계속 꺼져 있으므로(DRBn이 누적합인 것과 동일한 논리, 기존 `_calc_all_savings`의 cum_nc2 누적 방식과 수학적으로 동일한 원리) — 절감 에너지 = Σ_k [ power_delta(레벨 k 고유 대상 셀) × count(Level>=k, 시뮬레이션 요약의 `Level {L} Count`로 계산) × 0.25h ] × Gamma2.
+  * **Sector별 소모 대비 절감률**: Energy Stat 데이터를 (Energy Dashboard 탭의 날짜 위젯과 무관하게) 시뮬레이션이 지정한 기간으로 직접 필터링(`_parse_energy_stat_for_range`)하고, CM의 `Sector`열(cell-num%10)로 해당 Sector에 속한 모든 RU path를 찾아 총 소모 에너지를 합산(`_sector_total_energy_wh`, 공유 RU 중복 방지를 위해 RU path 기준 dedupe). ES Level 시뮬레이션 팝업에 "에너지 절감 효과 (Sector별)" 탭을 신규 추가해 Sector별 **소모에너지[Wh] / 절감에너지[Wh] / 절감률(%) / Tput Violation Count / Tput Violation Ratio**(=위반 스텝수/ES Active Steps)를 표로 보여주고, 마지막 행에 전체 사이트 합계를 추가. CSV 다운로드에도 `_EnergySaving.csv`로 함께 포함.
+  * **검증**: `_calc_es_level_simulation_savings`를 가짜 self(3개 RU를 가진 Sector, 레벨1/2 각각 고유 대상 셀 1개씩, RU HW Idle-PAoff 전력차 60W, 레벨별 카운트 0/30/50, Energy Stat 24시간치 합성 데이터)로 단위 테스트 — 절감 에너지 1365.0Wh(=60W×80스텝×0.25h + 60W×50스텝×0.25h, Gamma2=0.7 적용), 소모 에너지 7200.0Wh(3개 RU×24시간×100Wh), 절감률 18.96%, Tput Violation Ratio 0.0625가 모두 손계산과 정확히 일치함을 확인. 실제 GUI 앱에서 ES Level 시뮬레이션 팝업이 3개 탭(Sector 요약/에너지 절감 효과/상세 타임라인) 구성으로 오류 없이 열림을 확인.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
-* 현재 상태: v4.0(`esm_r15.py`) - Energy Dashboard에 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능 신규 추가 완료(로직 단위 테스트 + 실제 GUI 앱 End-to-End 검증 완료). 이전 v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개(RB Threshold Margin_LTE/Required IP Tput Low Util_LTE/N_allowedEScell_LTE) 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
+* 현재 상태: v4.1(`esm_r15.py`) - ES Level 시뮬레이션 결과를 실제 절감 에너지[Wh]/절감률/소모에너지 대비 비교까지 환산 완료, IIR 계수 Advanced Settings 위치 버그 수정, Gamma2 보정 계수 추가. 이전 v4.0에서 Energy Dashboard에 ES Level 시간별(15분 단위) IIR 기반 시뮬레이션 기능(레벨 궤적/누적 카운트만) 신규 추가했고, v3.1(`esm_r14.py`)까지 Optimizer Advanced Settings 파라미터 3개 전부 계산 로직 연결 + ESM Output Result 4열 재구성 + Energy Dashboard용 24시간 Rawdata(`self.latest_optimizer_rawdata`) 생성까지 완료된 상태에서 분기.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
   3. GUI 환경(tkinterdnd2 설치된 로컬 PC)에서 실제 CM 파일/Cell 단위/RU 단위 학습데이터 파일을 드래그 앤 드롭해 "학습 실행" 버튼 동작 확인 필요, 특히 신규 "수식(Formula)" 탭/다운로드, 3열로 넓어진 시각화 탭(가로 스크롤 필요할 수 있음)과 scipy 설치 여부(ExpSat 모델 활성화 조건) 함께 확인 필요.
   4. **다음 결정 대기(기존)**: 실데이터로 학습 실행 후 `Recommended Model`(자동 추천)과 그래프 모양을 함께 보고 사용자가 최종 확인 — 그룹(Board Type×공유여부×Sector Group)마다 추천 모델이 다르게 나올 수 있으므로 그대로 채택할지, 특정 그룹은 수동으로 다른 모델을 지정할지 결정.
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
-  6. **다음 결정 대기(v4.0)**: 사용자가 실제 데이터로 ES Level 시뮬레이션 결과(레벨 궤적, IP Tput 불만족 빈도)를 검토한 뒤 — (a) Watt-hour 절감량 환산(RU HW Idle/PAoff 전력차와 결합) 반영 여부/방법, (b) Initial level을 0이 아닌 값으로 최적화하는 기능, (c) 기존 Nc2 기반 예측(`_calc_all_savings`)과의 비교/교체 여부를 다음 라운드에 결정.
+  6. **다음 결정 대기(v4.1)**: 사용자가 실제 데이터로 Sector별 절감 에너지/절감률 결과를 검토한 뒤 — (a) Initial level을 0이 아닌 값으로 최적화하는 기능, (b) 기존 Nc2 기반 예측(`_calc_all_savings`)과의 비교/교체 여부를 다음 라운드에 결정.
   7. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 ES Level 시뮬레이션 결과를 실데이터로 확인한 뒤 Watt-hour 환산 등 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
+* 다음 대기 작업: (사용자가 실제 데이터로 Sector별 절감 에너지 결과를 확인한 뒤 후속 기능을 요청할 예정 — `esm_r15.py`에서 계속 반영)
 
 ---
 *Last Updated: 2026-07-06*
