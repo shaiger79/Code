@@ -135,6 +135,36 @@ https://colab.research.google.com/drive/1z-2MrlWJjp_vs8s7Zv_kFStx7XyqcFXK).
     소모 에너지 7200.0Wh(3개 RU×24시간×100Wh), 절감률 18.96%, Tput Violation Ratio 0.0625가 모두 손계산과
     정확히 일치함을 확인. 실제 GUI 앱에서 ES Level 시뮬레이션 팝업이 3개 탭(Sector 요약/에너지 절감
     효과/상세 타임라인) 구성으로 오류 없이 열림을 확인. `python -m py_compile` 통과.
+
+[r15-후속2] Energy Dashboard 필터 통합 + 절감효과 예측 Mode(1/2/3) + 평가 시간 한정 카운트:
+  - **평가 기간/평가 시간으로 통합**: "날짜 범위"/"시간" 라벨을 "평가 기간"/"평가 시간"으로 개명하고,
+    Energy Dashboard의 모든 기능(에너지 분석 실행/에너지 절감효과 예측/ES Level 시뮬레이션)이 이 공통
+    필터 하나만 참조하도록 통일. `_predict_energy_saving_popup`의 자체 시간 필터(`pred_hours_var`)와
+    ES Level 시뮬레이션 팝업의 자체 날짜 범위 위젯을 모두 제거하고, 신규 `_get_eval_date_range`/
+    `_parse_eval_hours` 헬퍼로 공통 필터를 읽어 사용.
+  - **에너지 분석 실행에 절감 효과 시각화 추가**: `_analyze_energy_stat`에 ES Level 시뮬레이션 기반 절감
+    에너지 계산을 추가해 상단 요약 라벨에 "예상 절감 에너지" 표시, 기존 3개 그래프(누적 추이/시간대별/
+    요일별) 아래에 4번째 그래프(소모/절감/절감 후 예상 소모 3-bar 비교)를 추가.
+  - **절감효과 예측 Mode 1/2/3** (Energy Dashboard Advanced Settings에 `절감효과 예측 Mode` 신규 추가,
+    기본값 2): `_predict_energy_saving_popup`을 모드에 따라 동적으로 탭을 구성하는 단일 진입점으로 재구성.
+    Mode 1(NC2 기반)은 기존 3개 탭(전체 eNodeBID 요약/Sector 단위 요약/ES Level 상세 내역)만, Mode
+    2(시뮬레이션 기반, 기본값)는 ES Level 시뮬레이션의 "Sector별 절감 효과" 탭만, Mode 3(둘 다)은 앞의
+    모든 탭에 더해 신규 `_build_mode_comparison_df`로 만든 "Mode 비교(NC2 vs 시뮬레이션)" 탭(Sector별
+    두 방식의 소모/절감/절감률과 차이)까지 표시. CSV 다운로드는 현재 모드에 해당하는 표만 저장.
+  - **평가 시간으로 한정된 ES Level 카운트/위반 집계** (`_run_es_level_simulation`에 `eval_hours` 인자
+    추가): 시뮬레이션 자체(레벨 결정 로직 + IIR)는 ES operation window 정의를 따라 24시간 전체에 대해
+    항상 그대로 수행하되(예: 윈도우가 0~5시면 평가 시간 설정과 무관하게 그 5시간 내내 정책이 적용됨),
+    summary_df에 집계하는 "레벨별 누적 카운트"/"Tput 불만족 카운트"/"ES Active Steps"/"Total Steps"만
+    평가 시간에 속하는 스텝으로 한정(예: 평가 시간이 0~2시뿐이면 윈도우는 0~5시 내내 적용되지만 집계는
+    0~2시 몫만 반영). timeline_df에는 각 행이 평가 시간에 해당하는지 보여주는 `In_Eval_Hours` 열을 추가.
+    `_parse_energy_stat_for_range`/`_calc_es_level_simulation_savings`에도 `eval_hours`를 전달해 소모
+    에너지 계산도 동일하게 평가 시간으로 한정.
+  - **검증**: 6-스텝 합성 Rawdata(레벨 궤적 [0,1,2,1,0,0], 기존 검증과 동일)를 `eval_hours=[0]`으로 다시
+    실행 — 전체 궤적은 그대로 유지된 채 summary만 앞 4스텝(0시)으로 한정되어 Total Steps=4/ES Active
+    Steps=4/Tput Violation Count=1/Level 0,1,2 Count=1,2,1로 정확히 집계됨을 확인(윈도우는 계속
+    시뮬레이션되지만 카운트만 한정되는 것을 확인). 실제 GUI 앱으로 Optimizer 실행 후 Mode 1/2/3 팝업과
+    ES Level 시뮬레이션 팝업, 그리고 절감 효과 시각화가 추가된 `_analyze_energy_stat`이 모두 오류 없이
+    실행됨을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -856,7 +886,9 @@ class AppDashboard(AppEditors):
 
         row1 = ttk.Frame(ctrl_frame)
         row1.pack(fill=tk.X, pady=5)
-        ttk.Label(row1, text="날짜 범위:").pack(side=tk.LEFT, padx=5)
+        # [r15-후속] "날짜 범위/시간" -> "평가 기간/평가 시간"으로 개명: Energy Dashboard의 모든 기능(에너지
+        # 분석 실행, 에너지 절감효과 예측, ES Level 시간별 시뮬레이션)이 공통으로 참조하는 평가 대상 기간·시간.
+        ttk.Label(row1, text="평가 기간:").pack(side=tk.LEFT, padx=5)
         today = datetime.today()
         if HAS_CALENDAR:
             self.energy_start_date = DateEntry(row1, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
@@ -873,7 +905,7 @@ class AppDashboard(AppEditors):
             ttk.Label(row1, text="~").pack(side=tk.LEFT, padx=2)
             ttk.Entry(row1, textvariable=self.energy_end_str, width=12).pack(side=tk.LEFT)
 
-        ttk.Label(row1, text="시간(ex. 0,1,2 또는 All):").pack(side=tk.LEFT, padx=(15,5))
+        ttk.Label(row1, text="평가 시간(ex. 0,1,2 또는 All):").pack(side=tk.LEFT, padx=(15,5))
         self.energy_hours_str = tk.StringVar(value="All")
         ttk.Entry(row1, textvariable=self.energy_hours_str, width=15).pack(side=tk.LEFT)
 
@@ -891,6 +923,7 @@ class AppDashboard(AppEditors):
         self.energy_adv_frame = ttk.Frame(ctrl_frame, padding=5)
         if not hasattr(self, 'pred_gamma'): self.pred_gamma = tk.DoubleVar(value=0.700)
         if not hasattr(self, 'pred_gamma2'): self.pred_gamma2 = tk.DoubleVar(value=0.700)  # [r15-후속] ES Level 시뮬레이션 절감량 보정 계수
+        if not hasattr(self, 'saving_prediction_mode'): self.saving_prediction_mode = tk.IntVar(value=2)  # [r15-후속] 1=NC2, 2=시뮬레이션(기본), 3=둘다
         ttk.Label(self.energy_adv_frame, text="Gamma (Effective Nc2 보정 계수):").grid(row=0, column=0, sticky=tk.W, padx=5)
         ttk.Spinbox(self.energy_adv_frame, from_=0.001, to=1.000, increment=0.001, textvariable=self.pred_gamma, width=10).grid(row=0, column=1, sticky=tk.W)
         # [r15-후속] ES Level 시간별 시뮬레이션 전용 파라미터 — Energy Dashboard 기능이므로 Optimizer 탭이 아니라
@@ -901,6 +934,8 @@ class AppDashboard(AppEditors):
         ttk.Spinbox(self.energy_adv_frame, from_=0.01, to=1.00, increment=0.01, textvariable=self.iir_coef_prb_lte, width=10).grid(row=2, column=1, sticky=tk.W)
         ttk.Label(self.energy_adv_frame, text="Gamma2 (ES Level 시뮬레이션 절감량 보정 계수):").grid(row=3, column=0, sticky=tk.W, padx=5)
         ttk.Spinbox(self.energy_adv_frame, from_=0.001, to=1.000, increment=0.001, textvariable=self.pred_gamma2, width=10).grid(row=3, column=1, sticky=tk.W)
+        ttk.Label(self.energy_adv_frame, text="절감효과 예측 Mode (1=NC2, 2=시뮬레이션, 3=둘다):").grid(row=4, column=0, sticky=tk.W, padx=5)
+        ttk.Spinbox(self.energy_adv_frame, from_=1, to=3, textvariable=self.saving_prediction_mode, width=10).grid(row=4, column=1, sticky=tk.W)
         self.show_energy_adv = False
 
         self.energy_plot_frame = ttk.Frame(self.frame_energy)
@@ -1027,29 +1062,35 @@ class AppDashboard(AppEditors):
         if df_e.empty: raise ValueError("Date/Time 정보를 해석할 수 없습니다.")
         return df_e
 
+    def _get_eval_date_range(self):
+        """[r15-후속] Energy Dashboard 공통 '평가 기간' 위젯에서 현재 설정된 start/end date를 읽어온다."""
+        if HAS_CALENDAR: return self.energy_start_date.get_date(), self.energy_end_date.get_date()
+        try: return datetime.strptime(self.energy_start_str.get(), '%Y-%m-%d').date(), datetime.strptime(self.energy_end_str.get(), '%Y-%m-%d').date()
+        except: return None, None
+
+    def _parse_eval_hours(self):
+        """[r15-후속] Energy Dashboard 공통 '평가 시간'(energy_hours_str) 문자열을 파싱한다.
+        'All'이거나 파싱에 실패하면 None(=시간 제한 없음, 24시간 전체 평가)을 반환한다."""
+        h_str = self.energy_hours_str.get().strip()
+        if not h_str or h_str.lower() == 'all': return None
+        try: return [int(x.strip()) for x in h_str.split(',')]
+        except Exception: return None
+
     def _parse_energy_stat(self):
         df_e = self._parse_energy_stat_raw()
         min_d = df_e['Timestamp'].dt.date.min()
         max_d = df_e['Timestamp'].dt.date.max()
 
-        if HAS_CALENDAR: s_date, e_date = self.energy_start_date.get_date(), self.energy_end_date.get_date()
-        else:
-            try: s_date, e_date = datetime.strptime(self.energy_start_str.get(), '%Y-%m-%d').date(), datetime.strptime(self.energy_end_str.get(), '%Y-%m-%d').date()
-            except: s_date, e_date = None, None
-
+        s_date, e_date = self._get_eval_date_range()
         if s_date and e_date: df_e = df_e[(df_e['Timestamp'].dt.date >= s_date) & (df_e['Timestamp'].dt.date <= e_date)]
 
-        h_str = self.energy_hours_str.get().strip()
-        if h_str.lower() != 'all':
-            try:
-                h_list = [int(x.strip()) for x in h_str.split(',')]
-                df_e = df_e[df_e['Timestamp'].dt.hour.isin(h_list)]
-            except: pass
+        eval_hours = self._parse_eval_hours()
+        if eval_hours: df_e = df_e[df_e['Timestamp'].dt.hour.isin(eval_hours)]
 
         if df_e.empty:
-            raise ValueError(f"선택하신 날짜/시간 조건에 해당하는 데이터가 0건입니다.\n\n"
+            raise ValueError(f"선택하신 평가 기간/평가 시간 조건에 해당하는 데이터가 0건입니다.\n\n"
                              f"[💡 원본 데이터의 실제 날짜 범위]\n{min_d} ~ {max_d}\n\n"
-                             f"UI의 '날짜 범위'를 위 실제 날짜에 맞게 수정해 주세요.")
+                             f"UI의 '평가 기간'을 위 실제 날짜에 맞게 수정해 주세요.")
 
         df_e['Hourly_TS'] = df_e['Timestamp'].dt.floor('h')
         df_e['DayOfWeek'] = df_e['Hourly_TS'].dt.day_name()
@@ -1105,6 +1146,29 @@ class AppDashboard(AppEditors):
             hourly_trend['Energy_Scaled'] = hourly_trend['Energy_Wh'] / div
             dow_trend['Energy_Scaled'] = dow_trend['Energy_Wh'] / div
 
+            # [r15-후속] 절감 효과도 같은 화면에 함께 시각화(ES Level 시뮬레이션 기반, 대상 eNodeBID/Sector로
+            # 한정) — 평가 기간/평가 시간(공통 필터)에 대해 계산.
+            saved_wh, saving_pct = 0.0, None
+            try:
+                s_date, e_date = self._get_eval_date_range()
+                if s_date and e_date and self.latest_optimizer_results is not None and not self.latest_optimizer_results.empty:
+                    eval_hours = self._parse_eval_hours()
+                    raw_df, _ = self._build_rawdata_for_period(s_date, e_date, self.exclude_dates_str.get())
+                    if not raw_df.empty:
+                        if target_enb not in ('All', ''): raw_df = raw_df[raw_df['eNodeBID'].astype(str) == str(target_enb)]
+                        if target_sec not in ('All', ''): raw_df = raw_df[raw_df['Sector'].astype(str) == str(target_sec)]
+                        if not raw_df.empty:
+                            _, sim_summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
+                            sim_saving_df = self._calc_es_level_simulation_savings(sim_summary_df, s_date, e_date, eval_hours=eval_hours)
+                            if not sim_saving_df.empty:
+                                total_row = sim_saving_df[sim_saving_df['eNodeBID'].astype(str) == '전체 합계']
+                                if not total_row.empty:
+                                    saved_wh = float(total_row['절감에너지 [Wh]'].iloc[0])
+                                    pct_val = total_row['절감률 (%)'].iloc[0]
+                                    saving_pct = float(pct_val) if pd.notna(pct_val) else None
+            except Exception as e:
+                logging.warning(f"[DEBUG] 절감 효과 시각화용 계산 실패: {e}")
+
             for widget in self.energy_plot_frame.winfo_children(): widget.destroy()
 
             summary_frame = ttk.Frame(self.energy_plot_frame, padding=5)
@@ -1114,10 +1178,12 @@ class AppDashboard(AppEditors):
             if target_enb != 'All': t_txt = f"eNodeBID: {target_enb}"
             if target_sec != 'All': t_txt += f" / Sector: {target_sec}"
 
-            ttk.Label(summary_frame, text=f"📊 [대상: {t_txt}] 총 소모 에너지: {total_wh/div:,.2f} {unit}",
+            pct_txt = f" ({saving_pct:.2f}%)" if saving_pct is not None else ""
+            ttk.Label(summary_frame, text=f"📊 [대상: {t_txt}] 총 소모 에너지: {total_wh/div:,.2f} {unit}  |  "
+                                           f"예상 절감 에너지: {saved_wh/div:,.2f} {unit}{pct_txt}",
                       font=('Segoe UI', 13, 'bold'), foreground=self.ACCENT_BLUE).pack(side=tk.LEFT)
 
-            fig, axes = plt.subplots(3, 1, figsize=(10, 12))
+            fig, axes = plt.subplots(4, 1, figsize=(10, 15))
             fig.patch.set_facecolor(self.PLOT_BG)
 
             axes[0].set_facecolor(self.AXES_BG)
@@ -1140,6 +1206,20 @@ class AppDashboard(AppEditors):
             axes[2].set_ylabel(f"Total Energy [{unit}]")
             axes[2].grid(True, linestyle='--', color=self.GRID_COLOR, axis='y')
             axes[2].tick_params(axis='x', rotation=30)
+
+            # [r15-후속] 소모 vs 절감 에너지 비교(ES Level 시뮬레이션 기반 예측)
+            axes[3].set_facecolor(self.AXES_BG)
+            expected_scaled = max(total_wh - saved_wh, 0) / div
+            bars = axes[3].bar(['소모 에너지', '예상 절감', '절감 후 예상 소모'],
+                                [total_wh / div, saved_wh / div, expected_scaled],
+                                color=[self.ACCENT_BLUE, self.ACCENT_GREEN, '#F59E0B'], edgecolor='black', alpha=0.85)
+            for b in bars:
+                axes[3].annotate(f"{b.get_height():,.2f}", xy=(b.get_x() + b.get_width() / 2, b.get_height()),
+                                  xytext=(0, 3), textcoords="offset points", ha='center', fontsize=9, fontweight='bold')
+            title_pct = f" (절감률 {saving_pct:.2f}%)" if saving_pct is not None else ""
+            axes[3].set_title(f"Energy Saving Effect (ES Level 시뮬레이션 기반){title_pct}", fontweight='bold')
+            axes[3].set_ylabel(f"Energy [{unit}]")
+            axes[3].grid(True, linestyle='--', color=self.GRID_COLOR, axis='y')
 
             plt.tight_layout()
             canvas = FigureCanvasTkAgg(fig, master=self.energy_plot_frame)
@@ -1500,14 +1580,13 @@ class ESAnalyzerApp(AppDashboard):
     # ---------------------------------------------------------
 
     def _run_prediction_calc(self):
-        hours_str = self.pred_hours_var.get().strip()
+        # [r15-후속] 팝업 자체 시간 필터(pred_hours_var)를 없애고 Energy Dashboard 공통 '평가 시간'을 사용
+        # (_parse_energy_stat()가 평가 기간/평가 시간을 이미 적용해 반환).
+        hours_str = self.energy_hours_str.get().strip()
 
-        # 1. Energy Stat 파싱 (시간 필터 적용)
+        # 1. Energy Stat 파싱 (평가 기간/평가 시간 필터 적용)
         try:
             df_e = self._parse_energy_stat()
-            if hours_str.lower() != 'all':
-                h_list = [int(x.strip()) for x in hours_str.split(',')]
-                df_e = df_e[df_e['Timestamp'].dt.hour.isin(h_list)]
         except Exception as e:
             df_e = pd.DataFrame()
             logging.warning(f"[DEBUG] Energy Stat 파싱 오류: {e}")
@@ -1641,48 +1720,109 @@ class ESAnalyzerApp(AppDashboard):
         self.pred_df_det = df_sav_det
 
 
+    def _build_mode_comparison_df(self, nc2_sec_df, sim_saving_df):
+        """[r15-후속] 절감효과 예측 Mode 3(NC2+시뮬레이션 둘다)에서 두 방식의 Sector별 결과를 나란히
+        비교하는 표를 만든다."""
+        if nc2_sec_df is None or nc2_sec_df.empty or sim_saving_df is None or sim_saving_df.empty:
+            return pd.DataFrame()
+        nc2 = nc2_sec_df[['eNodeBID', 'Sector', 'Consumed [Wh]', 'Est. Saving [Wh]', 'Saving Ratio [%]']].copy()
+        nc2.rename(columns={'Consumed [Wh]': '소모에너지(NC2 집계) [Wh]', 'Est. Saving [Wh]': '절감에너지(NC2) [Wh]',
+                             'Saving Ratio [%]': '절감률(NC2) [%]'}, inplace=True)
+        sim = sim_saving_df[sim_saving_df['eNodeBID'].astype(str) != '전체 합계'][
+            ['eNodeBID', 'Sector', '소모에너지 [Wh]', '절감에너지 [Wh]', '절감률 (%)']].copy()
+        sim.rename(columns={'소모에너지 [Wh]': '소모에너지(시뮬레이션 집계) [Wh]', '절감에너지 [Wh]': '절감에너지(시뮬레이션) [Wh]',
+                             '절감률 (%)': '절감률(시뮬레이션) [%]'}, inplace=True)
+        cmp_df = pd.merge(nc2, sim, on=['eNodeBID', 'Sector'], how='outer').fillna(0)
+        cmp_df['차이(시뮬레이션-NC2) [Wh]'] = cmp_df['절감에너지(시뮬레이션) [Wh]'] - cmp_df['절감에너지(NC2) [Wh]']
+        return cmp_df
+
     def _predict_energy_saving_popup(self):
+        """[r15-후속] '에너지 절감효과 예측' 버튼의 단일 진입점. Advanced Settings의 `saving_prediction_mode`
+        (1=NC2 기반, 2=시뮬레이션 기반(기본), 3=둘 다 + 비교표)에 따라 필요한 탭만 구성하고 계산한다.
+        Energy Dashboard 상단의 공통 '평가 기간/평가 시간'을 그대로 사용(팝업 자체 필터 없음)."""
+        mode = self.saving_prediction_mode.get() if hasattr(self, 'saving_prediction_mode') else 2
+
         win = tk.Toplevel(self)
-        win.title("Energy Saving Prediction & Comparison")
-        win.geometry("1100x700")
+        win.title("에너지 절감효과 예측")
+        win.geometry("1250x750")
         win.configure(bg=self.BG_COLOR)
 
         top_frame = ttk.Frame(win, padding=10)
         top_frame.pack(fill=tk.X)
+        mode_txt = {1: 'NC2 기반', 2: '시뮬레이션 기반', 3: 'NC2 + 시뮬레이션 비교'}.get(mode, '시뮬레이션 기반')
+        ttk.Label(top_frame, text=f"예측 Mode: {mode_txt} (Energy Dashboard 고급 설정에서 변경)", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
+        ttk.Label(top_frame, text="* 상단의 '평가 기간/평가 시간' 설정을 사용합니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=15)
 
-        ttk.Label(top_frame, text="시간(Hour) 필터 (ex. 0,1,2 또는 All):").pack(side=tk.LEFT, padx=5)
-        self.pred_hours_var = tk.StringVar(value="All")
-        ttk.Entry(top_frame, textvariable=self.pred_hours_var, width=15).pack(side=tk.LEFT)
+        state = {'sim_saving_df': pd.DataFrame(), 'cmp_df': pd.DataFrame()}
 
-        ttk.Button(top_frame, text="🔄 계산 및 업데이트", style='Primary.TButton', command=self._run_prediction_calc).pack(side=tk.LEFT, padx=10)
+        def run_calc():
+            if mode in (1, 3):
+                self._run_prediction_calc()
+            if mode in (2, 3):
+                s_date, e_date = self._get_eval_date_range()
+                if not s_date or not e_date:
+                    return messagebox.showerror("오류", "평가 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
+                eval_hours = self._parse_eval_hours()
+                raw_df, reused = self._build_rawdata_for_period(s_date, e_date, self.exclude_dates_str.get())
+                if raw_df.empty:
+                    messagebox.showwarning("경고", "해당 기간에 대한 Rawdata를 만들 수 없습니다.\n(트래픽 데이터/Optimizer 결과를 확인해주세요.)")
+                else:
+                    _, summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
+                    saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date, eval_hours=eval_hours)
+                    state['sim_saving_df'] = saving_df
+                    self._update_tree(tree_refs['sim'], saving_df)
+            if mode == 3:
+                cmp_df = self._build_mode_comparison_df(getattr(self, 'pred_df_sec', pd.DataFrame()), state['sim_saving_df'])
+                state['cmp_df'] = cmp_df
+                self._update_tree(tree_refs['cmp'], cmp_df)
 
+        ttk.Button(top_frame, text="🔄 계산 및 업데이트", style='Primary.TButton', command=run_calc).pack(side=tk.LEFT, padx=10)
         self.pred_summary_label = ttk.Label(top_frame, text="대기 중...", font=('Segoe UI', 12, 'bold'), foreground=self.ACCENT_BLUE)
         self.pred_summary_label.pack(side=tk.LEFT, padx=20)
 
         nb = ttk.Notebook(win)
         nb.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        enb_frame, sec_frame, det_frame = ttk.Frame(nb), ttk.Frame(nb), ttk.Frame(nb)
-        nb.add(enb_frame, text="전체 eNodeBID 요약")
-        nb.add(sec_frame, text="Sector 단위 요약")
-        nb.add(det_frame, text="ES Level 상세 내역")
+        tree_refs = {}
+        if mode in (1, 3):
+            enb_frame, sec_frame, det_frame = ttk.Frame(nb), ttk.Frame(nb), ttk.Frame(nb)
+            nb.add(enb_frame, text="[NC2] 전체 eNodeBID 요약")
+            nb.add(sec_frame, text="[NC2] Sector 단위 요약")
+            nb.add(det_frame, text="[NC2] ES Level 상세 내역")
+            self.tree_enb = self._create_tree_in_frame(enb_frame)
+            self.tree_sec = self._create_tree_in_frame(sec_frame)
+            self.tree_det = self._create_tree_in_frame(det_frame)
 
-        self.tree_enb = self._create_tree_in_frame(enb_frame)
-        self.tree_sec = self._create_tree_in_frame(sec_frame)
-        self.tree_det = self._create_tree_in_frame(det_frame)
+        if mode in (2, 3):
+            sim_frame = ttk.Frame(nb)
+            nb.add(sim_frame, text="[시뮬레이션] Sector별 절감 효과")
+            tree_refs['sim'] = self._create_tree_in_frame(sim_frame)
+
+        if mode == 3:
+            cmp_frame = ttk.Frame(nb)
+            nb.add(cmp_frame, text="Mode 비교 (NC2 vs 시뮬레이션)")
+            tree_refs['cmp'] = self._create_tree_in_frame(cmp_frame)
 
         bot_frame = ttk.Frame(win, padding=10)
         bot_frame.pack(fill=tk.X)
 
         def save_csv():
-            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="Predicted_Energy_Sector_Summary.csv")
-            if filepath:
-                self.pred_df_sec.to_csv(filepath, index=False, encoding='utf-8-sig')
-                messagebox.showinfo("저장 완료", f"저장되었습니다:\n{filepath}")
+            filepath = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV Files", "*.csv")], initialfile="Energy_Saving_Prediction.csv")
+            if not filepath: return
+            base_path = filepath.rsplit('.', 1)[0]
+            saved_paths = []
+            if mode in (1, 3) and getattr(self, 'pred_df_sec', pd.DataFrame()) is not None and not self.pred_df_sec.empty:
+                p = base_path + "_NC2_Sector.csv"; self.pred_df_sec.to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+            if mode in (2, 3) and not state['sim_saving_df'].empty:
+                p = base_path + "_Simulation_Sector.csv"; state['sim_saving_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+            if mode == 3 and not state['cmp_df'].empty:
+                p = base_path + "_Comparison.csv"; state['cmp_df'].to_csv(p, index=False, encoding='utf-8-sig'); saved_paths.append(p)
+            if saved_paths: messagebox.showinfo("저장 완료", "저장되었습니다:\n" + "\n".join(saved_paths))
+            else: messagebox.showwarning("경고", "먼저 '계산 및 업데이트'를 눌러주세요.")
 
-        ttk.Button(bot_frame, text="💾 Sector 결과 CSV 다운로드", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
+        ttk.Button(bot_frame, text="💾 결과 CSV 다운로드", style='Success.TButton', command=save_csv).pack(side=tk.RIGHT)
 
-        self._run_prediction_calc()
+        run_calc()
 
     def _create_tree_in_frame(self, parent):
         scroll_y = ttk.Scrollbar(parent, orient="vertical")
@@ -1722,7 +1862,7 @@ class ESAnalyzerApp(AppDashboard):
                     formatted.append(v)
             tree.insert("", tk.END, values=formatted)
 
-    def _run_es_level_simulation(self, sim_raw_df):
+    def _run_es_level_simulation(self, sim_raw_df, eval_hours=None):
         """[r15] Rawdata(_build_rawdata_for_period 결과, 15분 단위 raw 트래픽 + 레벨별 임계값/예측치 열 포함)를
         받아 (eNodeBID, Sector) 셀 단위로 15분 스텝마다 ES level을 결정해 나가는 시간별 시뮬레이션을 수행한다.
         - ES_Window_Index==0(운영 윈도우 밖) 시간, 또는 직전 스텝과 윈도우가 바뀌는 첫 스텝은 Level을
@@ -1731,8 +1871,14 @@ class ESAnalyzerApp(AppDashboard):
           PRB는 IIR 기준) -> 3) 유지 순으로 판정.
         - 레벨이 적용된 스텝의 cmIPTput은 raw 값 대신 max(cmIPTput*(1-DRB_L(레벨)/(total_rb-UsedRB)), 0)로
           보정한 값을 IIR 필터의 입력으로 사용(레벨 미적용 스텝은 raw 그대로).
-        반환: (timeline_df: 스텝별 Applied_ES_Level/IIR값/Tput_Violation 포함 원본 rawdata, summary_df: 셀별
-        레벨별 누적 카운트 + Tput 불만족 누적 카운트)."""
+        [r15-후속] `eval_hours`(평가 시간, None이면 24시간 전체): 시뮬레이션 자체(레벨 결정/IIR)는 ES
+        operation window 정의를 그대로 따라 24시간 전체에 대해 항상 수행하되(윈도우가 0~5시라면 평가
+        시간과 무관하게 그 5시간 내내 ES 정책이 적용됨), summary_df에 집계되는 '레벨별 누적 카운트'/
+        'Tput 불만족 카운트'/'ES Active Steps'/'Total Steps'만 eval_hours에 속하는 스텝으로 한정한다
+        (예: 평가 시간이 0~2시뿐이면 0~5시 윈도우가 계속 적용되더라도 카운트는 0~2시 몫만 집계).
+        반환: (timeline_df: 스텝별 Applied_ES_Level/IIR값/Tput_Violation 포함 원본 rawdata 전체(In_Eval_Hours
+        열로 평가 시간 해당 여부 표시), summary_df: 셀별 레벨별 누적 카운트 + Tput 불만족 누적 카운트
+        (eval_hours 한정))."""
         if sim_raw_df is None or sim_raw_df.empty:
             return pd.DataFrame(), pd.DataFrame()
 
@@ -1803,12 +1949,15 @@ class ESAnalyzerApp(AppDashboard):
             cell_df['UsedRB_t_adj_IIR'] = rb_iir
             cell_df['cmIPTput_Simulated'] = cm_input
             cell_df['Tput_Violation'] = tput_violation
+            eval_mask = cell_df['Time'].dt.hour.isin(eval_hours).to_numpy() if eval_hours else np.ones(n_rows, dtype=bool)
+            cell_df['In_Eval_Hours'] = eval_mask
             timeline_parts.append(cell_df)
 
-            level_counts = pd.Series(level).value_counts().to_dict()
+            level_counts = pd.Series(level[eval_mask]).value_counts().to_dict()
             summary = {
-                'eNodeBID': str(enodeb), 'Sector': str(sector), 'Max_ES_Level': max_n, 'Total Steps': n_rows,
-                'ES Active Steps': int((win_idx != 0).sum()), 'Tput Violation Count': int(tput_violation.sum()),
+                'eNodeBID': str(enodeb), 'Sector': str(sector), 'Max_ES_Level': max_n,
+                'Total Steps': int(eval_mask.sum()), 'ES Active Steps': int((win_idx[eval_mask] != 0).sum()),
+                'Tput Violation Count': int(tput_violation[eval_mask].sum()),
             }
             for lv in range(0, max_n + 1):
                 summary[f'Level {lv} Count'] = int(level_counts.get(lv, 0))
@@ -1851,11 +2000,12 @@ class ESAnalyzerApp(AppDashboard):
         except Exception:
             return 0.0
 
-    def _parse_energy_stat_for_range(self, start_date, end_date):
-        """[r15-후속] Energy Dashboard 탭의 날짜 위젯과 무관하게, ES Level 시뮬레이션이 지정한 임의의
-        [start_date, end_date] 기간(전체 시간대)으로 Energy Stat 데이터를 직접 필터링한다."""
+    def _parse_energy_stat_for_range(self, start_date, end_date, eval_hours=None):
+        """[r15-후속] Energy Dashboard 탭의 날짜 위젯과 무관하게, 지정한 임의의 [start_date, end_date] +
+        (선택적) 평가 시간(eval_hours, None이면 전체 시간대)으로 Energy Stat 데이터를 직접 필터링한다."""
         df_e = self._parse_energy_stat_raw()
         df_e = df_e[(df_e['Timestamp'].dt.date >= start_date) & (df_e['Timestamp'].dt.date <= end_date)]
+        if eval_hours: df_e = df_e[df_e['Timestamp'].dt.hour.isin(eval_hours)]
         if df_e.empty: return df_e
         df_e = df_e.copy()
         df_e['Hourly_TS'] = df_e['Timestamp'].dt.floor('h')
@@ -1883,11 +2033,12 @@ class ESAnalyzerApp(AppDashboard):
             total_wh += ru_hr['Energy_Wh'].sum()
         return total_wh
 
-    def _calc_es_level_simulation_savings(self, summary_df, start_date, end_date):
-        """[r15-후속] ES Level 시뮬레이션의 셀별 레벨 누적 카운트(summary_df)에 ESM Output Result의
-        레벨별 Target Cell Num + RU HW(Idle-PAoff) 전력차를 결합해 Sector별 예상 절감 에너지[Wh]를
-        계산하고, Energy Stat 데이터에서 동일 기간 실제 총 소모 에너지[Wh]를 가져와 절감률/Tput 위반
-        비율과 함께 정리한다. 마지막 행에 전체 사이트 합계를 추가한다.
+    def _calc_es_level_simulation_savings(self, summary_df, start_date, end_date, eval_hours=None):
+        """[r15-후속] ES Level 시뮬레이션의 셀별 레벨 누적 카운트(summary_df, 이미 평가 시간으로 한정된
+        값)에 ESM Output Result의 레벨별 Target Cell Num + RU HW(Idle-PAoff) 전력차를 결합해 Sector별
+        예상 절감 에너지[Wh]를 계산하고, Energy Stat 데이터에서 동일 평가 기간·평가 시간(eval_hours)의
+        실제 총 소모 에너지[Wh]를 가져와 절감률/Tput 위반 비율과 함께 정리한다. 마지막 행에 전체 사이트
+        합계를 추가한다.
 
         레벨 k의 셀은 "Applied_ES_Level >= k"인 모든 스텝 동안 계속 꺼져있으므로(DRBn이 누적합인 것과
         동일한 논리, 기존 `_calc_all_savings`의 cum_nc2 방식과 동일 원리), 절감 에너지 =
@@ -1899,7 +2050,7 @@ class ESAnalyzerApp(AppDashboard):
 
         df_estat = None
         if self.energy_stat_file.get():
-            try: df_estat = self._parse_energy_stat_for_range(start_date, end_date)
+            try: df_estat = self._parse_energy_stat_for_range(start_date, end_date, eval_hours=eval_hours)
             except Exception: df_estat = None
 
         rows = []
@@ -1948,9 +2099,10 @@ class ESAnalyzerApp(AppDashboard):
         return result_df
 
     def _open_es_level_simulation_popup(self):
-        """[r15] Energy Dashboard의 'ES Level 시간별 시뮬레이션' 팝업. 시뮬레이션 대상 기간을 지정하면
-        Optimizer 기간과 동일한지 확인해 Rawdata를 재사용/재생성하고, 15분 단위 ES level 시뮬레이션을 실행해
-        Sector별 요약(레벨별 누적 카운트 + Tput 불만족 카운트)과 상세 타임라인을 보여준다."""
+        """[r15] Energy Dashboard의 'ES Level 시간별 시뮬레이션' 팝업. Energy Dashboard 상단의 공통
+        '평가 기간/평가 시간'을 그대로 사용해(Optimizer 기간과 동일하면 Rawdata 재사용, 다르면 재생성),
+        15분 단위 ES level 시뮬레이션을 실행해 Sector별 요약(평가 시간으로 한정한 레벨별 누적 카운트 +
+        Tput 불만족 카운트)과 상세 타임라인을 보여준다."""
         if self.latest_optimizer_results is None or self.latest_optimizer_results.empty:
             return messagebox.showwarning("경고", "먼저 Optimizer 탭에서 '최적화 결과 화면으로 보기'를 실행해 ES Level 정책을 도출해주세요.")
 
@@ -1961,22 +2113,7 @@ class ESAnalyzerApp(AppDashboard):
 
         top_frame = ttk.Frame(win, padding=10)
         top_frame.pack(fill=tk.X)
-        ttk.Label(top_frame, text="시뮬레이션 기간:", font=('Segoe UI', 10, 'bold')).pack(side=tk.LEFT, padx=5)
-        today = datetime.today()
-        if HAS_CALENDAR:
-            sim_start_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
-            sim_start_picker.set_date(today)
-            sim_start_picker.pack(side=tk.LEFT)
-            ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
-            sim_end_picker = DateEntry(top_frame, width=12, background=self.ACCENT_BLUE, foreground='white', date_pattern='yyyy-mm-dd')
-            sim_end_picker.set_date(today)
-            sim_end_picker.pack(side=tk.LEFT)
-        else:
-            sim_start_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
-            sim_end_str = tk.StringVar(value=today.strftime('%Y-%m-%d'))
-            ttk.Entry(top_frame, textvariable=sim_start_str, width=12).pack(side=tk.LEFT)
-            ttk.Label(top_frame, text="~").pack(side=tk.LEFT, padx=2)
-            ttk.Entry(top_frame, textvariable=sim_end_str, width=12).pack(side=tk.LEFT)
+        ttk.Label(top_frame, text="* Energy Dashboard 상단의 '평가 기간/평가 시간' 설정을 그대로 사용합니다.", foreground='#6B7280').pack(side=tk.LEFT, padx=5)
 
         status_label = ttk.Label(top_frame, text="대기 중...", foreground=self.ACCENT_BLUE)
         status_label.pack(side=tk.LEFT, padx=20)
@@ -1994,14 +2131,10 @@ class ESAnalyzerApp(AppDashboard):
         state = {'summary_df': pd.DataFrame(), 'timeline_df': pd.DataFrame(), 'saving_df': pd.DataFrame()}
 
         def run_sim():
-            if HAS_CALENDAR:
-                s_date, e_date = sim_start_picker.get_date(), sim_end_picker.get_date()
-            else:
-                try:
-                    s_date = datetime.strptime(sim_start_str.get(), '%Y-%m-%d').date()
-                    e_date = datetime.strptime(sim_end_str.get(), '%Y-%m-%d').date()
-                except Exception:
-                    return messagebox.showerror("오류", "날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
+            s_date, e_date = self._get_eval_date_range()
+            if not s_date or not e_date:
+                return messagebox.showerror("오류", "평가 기간의 날짜 형식이 올바르지 않습니다 (YYYY-MM-DD).")
+            eval_hours = self._parse_eval_hours()
 
             status_label.config(text="Rawdata 준비 중...", foreground=self.ACCENT_BLUE)
             win.update()
@@ -2012,8 +2145,8 @@ class ESAnalyzerApp(AppDashboard):
 
             status_label.config(text=f"시뮬레이션 실행 중... (Rawdata {'재사용' if reused else '신규 생성'})", foreground=self.ACCENT_BLUE)
             win.update()
-            timeline_df, summary_df = self._run_es_level_simulation(raw_df)
-            saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date)
+            timeline_df, summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
+            saving_df = self._calc_es_level_simulation_savings(summary_df, s_date, e_date, eval_hours=eval_hours)
             state['summary_df'], state['timeline_df'], state['saving_df'] = summary_df, timeline_df, saving_df
             self._update_tree(tree_sum, summary_df)
             self._update_tree(tree_saving, saving_df)
