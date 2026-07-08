@@ -279,11 +279,17 @@
   * **원인 2(Tput 단위 불일치)**: rawdata의 `cmIPTput`은 `(IpThruThpVoDLByte/IpThruThpDLTime)*8000` 공식상 kbps 스케일(예: 32855.07kbps=32.86Mbps)인데 `Entering/Leaving Th_Tput`은 Mbps 스케일(예: 6~7) — Leaving(감소) 조건에서 kbps 스케일 cmIPTput_iir과 Mbps 스케일 임계값을 그대로 비교하면 cmIPTput이 항상 훨씬 크게 나와 "Tput 불만족으로 인한 감소"가 거의 발생하지 않는 문제(Entering 조건의 `Pred_IPTput_Mbps_L{n}`은 원래부터 Mbps라 문제 없었음).
   * **수정**: PRB 조건은 %(Entering/Leaving Th_PRB_L{n}) 대신 원시 RB 단위인 `RB_Threshold_L{n}`(이미 rawdata에 존재, ESM Output Result의 RBThreshold와 동일값)과 `RB Threshold Margin_LTE`를 그대로 사용(Entering: `UsedRB_t_adj_iir <= RB_Threshold_L{n}`, Leaving: `UsedRB_t_adj_iir > RB_Threshold_L{n} + RB Threshold Margin_LTE`). Tput 조건은 rawdata의 `cmIPTput`을 시뮬레이션 내부 로컬 변수에서만 1000으로 나눠 Mbps로 환산해 비교(원본 rawdata `cmIPTput` 열 자체는 Optimizer의 alpha 회귀 등에 그대로 쓰이므로 변경하지 않음).
   * **검증**: 사용자가 제시한 실제 수치를 그대로 입력해 단위 테스트 — 수정 전 로직대로면 PRB 조건이 25>10.92로 오판되어 진입 실패했을 것이, 수정 후 1번째 스텝에서 정확히 ES Level 1로 진입하고 `cmIPTput_IIR`도 32.86(Mbps)로 사람이 계산한 값과 일치함을 확인.
-  * **적용 순서**: 사용자 지시대로 `esm_r15.py`에 먼저 반영·검증한 뒤, 동일한 수정(cmIPTput /1000 Mbps 환산 + PRB 조건을 `RB_Threshold_L{n}`/`RB Threshold Margin_LTE` 기반으로 교체)을 `esm_r16.py`에도 그대로 포팅 완료(Deep Sleep 로직과는 독립적이라 상호작용 없음, `python -m py_compile` 양쪽 파일 모두 통과 확인).
+  * **적용 순서**: 사용자 지시대로 `esm_r15.py`에 먼저 반영·검증한 뒤, 동일한 수정(cmIPTput /1000 Mbps 환산 + PRB 조건을 `RB_Threshold_L{n}`/`RB Threshold Margin_LTE` 기반으로 교체)을 `esm_r16.py`에도 그대로 포팅 완료(Deep Sleep 로직과는 독립적이라 상호작용 없음, `python -m py_compile` 양쪽 파일 모두 통과 확인). 포팅 당시 `esm_r16.py` 모듈 상단 changelog 문단(`[r16-후속2]`)을 빠뜨렸던 것을 이번(v5.4) 작업 중 발견해 함께 보완.
+
+* **[v5.4 / esm_r16.py 전용, 새 편의 기능이라 esm_r15.py에는 포팅하지 않음(Deep Sleep과 동일한 전례)] (2026-07-09) 기능 추가: 파일 입출력 폴더/파라미터 초기값 자동 저장·불러오기 + Input 폴더 파일 자동 선택**
+  * **배경**: 사용자가 앱을 실행할 때마다 Input/Output 폴더나 각 탭 파라미터를 다시 설정하고, Traffic/Energy Stat/CM/학습데이터 파일을 드래그 앤 드롭이나 '찾기'로 매번 다시 선택하는 게 번거롭다고 요청. 조건: Input/Output 폴더 기본값은 앱이 위치한 폴더 내부의 Input/Output 폴더로, 설정 파일이 없으면 기존 하드코딩 초기값 사용, 자동 저장은 하지 말고 필요할 때만 수동으로 저장, Input 폴더의 파일도 파일명/헤더 규칙으로 자동 선택하고 실패 시 팝업으로 안내.
+  * **구현**: `_app_dir()`(스크립트 또는 exe가 위치한 폴더) 기준으로 `input_dir`/`output_dir` 기본값을 `<앱 폴더>/Input`, `<앱 폴더>/Output`으로 설정. 앱 폴더의 `esm_settings.json`이 있으면 `_load_app_settings()`가 그 값과 `_SETTINGS_PARAM_NAMES`(Optimizer/Advanced Settings/Energy Dashboard/Learning 탭의 주요 파라미터, 파일 경로는 제외)를 덮어씀 - 파일이 없으면 기존 초기값 그대로. 저장은 Data I/O 탭의 "현재 설정을 기본값으로 저장" 버튼(`_save_app_settings()`)에서만 수동으로 발생. `_auto_select_input_files()`가 앱 구동 시 Input 폴더를 스캔해 CM Data(확장자), Traffic/Energy Stat Data(기존 `handle_file_drop`과 동일한 파일명 키워드 규칙), Cell/RU 단위 학습데이터(기존 `_classify_learning_files_drop`과 동일한 CSV 헤더 컬럼 시그니처, 공통 로직은 `_sniff_learning_csv_kind`로 분리)를 자동으로 채워줌 - 항목별 후보가 정확히 1개일 때만 자동 선택하고, 0개/2개 이상이면 자동 선택하지 않고 팝업 하나로 모아서 안내. `_make_output_dir`/`run_analysis`/Traffic Pattern 저장 로직의 출력 폴더 기준도 `os.getcwd()`에서 `self.output_dir`로 통일.
+  * **검증**: 임시 폴더에 실제 스키마를 반영한 샘플 파일(CM 확장자, Traffic/Energy Stat CSV - Energy Stat은 실제 컬럼명인 `RuPowerTot`/`RuPowerCnt` 사용, Cell/RU 학습데이터 CSV)을 두고 `ESAnalyzerApp`을 실제로 생성해 5개 파일이 모두 정확히 자동 선택되고 경고 팝업이 뜨지 않음을 확인. 파라미터를 바꾸고 저장한 뒤 새 인스턴스를 생성해 Input/Output 폴더와 파라미터가 정확히 재로딩됨을 확인. CM 파일 후보를 2개로 만들었을 때는 자동 선택하지 않고 정확히 그 항목만 안내 팝업에 포함됨을 확인. `python -m py_compile` 통과.
+  * **적용 범위**: `esm_r16.py`에만 적용(Deep Sleep처럼 새 편의 기능이므로 esm_r15.py에는 포팅하지 않음). Input 폴더가 아직 없으면(사용자가 아직 Input 폴더를 만들지 않은 경우) 경고 팝업만 띄우고 정상 구동.
 
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.3(`esm_r15.py` + `esm_r16.py` 모두 반영 완료) - ES Level 시뮬레이션의 PRB 조건(%→원시 RB 단위)과 Tput 조건(kbps→Mbps) 단위 불일치를 양쪽 파일 모두 수정, 사용자가 제시한 실제 수치로 ES Level 1이 정상적으로 진입함을 확인. 이전 v5.2(`esm_r15.py`+`esm_r16.py`)에서 IpThruThpDLTime<=0/NaN 행 통째 제외 버그를 수정했고, v5.1에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
+* 현재 상태: v5.4(`esm_r16.py` 전용) - Input/Output 폴더와 각 탭 파라미터 초기값을 `esm_settings.json`으로 저장/자동 불러오기하고, Input 폴더에서 Traffic/Energy Stat/CM/학습데이터 파일을 자동으로 선택하는 편의 기능 추가. 이전 v5.3(`esm_r15.py`+`esm_r16.py`)에서 ES Level 시뮬레이션의 PRB 조건(%→원시 RB 단위)과 Tput 조건(kbps→Mbps) 단위 불일치를 양쪽 파일 모두 수정했고, v5.2(`esm_r15.py`+`esm_r16.py`)에서 IpThruThpDLTime<=0/NaN 행 통째 제외 버그를 수정했고, v5.1에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -293,9 +299,10 @@
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
   8. **다음 결정 대기(v5.3)**: 사용자가 실데이터로 재확인해 다른 Sector들도 이제 ES level이 정상적으로 적용되는지 검증 필요(esm_r15.py/esm_r16.py 양쪽 모두).
-  9. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 실데이터로 재확인한 결과를 알려줄 예정)
+  9. **다음 결정 대기(v5.4)**: 사용자가 실제 로컬 PC에서 `esm_r16.py`를 실행해 Input 폴더 자동 선택(파일명/헤더 규칙)과 `esm_settings.json` 저장/불러오기가 실제 CM/Traffic/Energy Stat/학습데이터 파일로도 의도대로 동작하는지, 안내 팝업 문구가 실제 상황에 적절한지 확인 필요.
+  10. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
+* 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정)
 
 ---
-*Last Updated: 2026-07-08*
+*Last Updated: 2026-07-09*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
