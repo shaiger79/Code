@@ -223,6 +223,36 @@ Energy Dashboard 상단의 공통 "평가 기간/평가 시간"은 결과 집계
     실제 GUI 앱으로 트래픽 데이터의 약 6%(17/288행, ES 운영 시간대에 집중) 행에 IpThruThpDLTime=0/NaN을
     주입해 Optimizer→Rawdata를 실행 — 이전이면 해당 행들이 통째로 사라져 24행 중 18행만 남았을 것이
     이번 수정 후 24행 모두 유지되고 그중 6행만 cmIPTput=NaN으로 정확히 표시됨을 확인.
+
+[r15-후속4] 버그 수정: ES Level 시뮬레이션의 PRB/Tput 조건 단위 불일치로 특정 Sector에서 ES level이
+전혀 적용되지 않던 문제:
+  - **배경**: 사용자가 실제 raw data 한 행(eNodeBID 210993 Sector 2, UsedRB_t_adj=25, total_rb=650,
+    cmIPTput=32855.07, Pred_IPTput_Mbps_L1=12.306, Entering Th_Tput=7, Entering Th_PRB_L1=10.92%)을
+    손으로 계산해보니 두 Entering 조건을 모두 만족하는 것 같은데 ES Level 1이 전혀 적용되지 않는다고
+    보고. "혹시 Th 조건을 PRB usage(%)가 아니라 UsedRB(원시 RB)로 비교한다면 ESM output의 RB
+    Threshold/RB Margin을 쓰면 된다"와 "Tput 단위 mismatch도 확인해달라"는 정확한 힌트를 제공.
+  - **원인 1(PRB 단위 불일치, 진짜 원인)**: `_run_es_level_simulation`이 PRB 조건에 `Entering/Leaving
+    Th_PRB_L{n}` 열(ESM Output Result와 동일하게 %, 0~100 스케일)을 그대로 썼는데, 비교 대상인
+    `UsedRB_t_adj_iir`는 원시 RB 개수(0~total_rb 스케일, 위 예시에서는 0~650)였음 — 예: 25(원시 RB) vs
+    10.92(%)를 그냥 비교하면 25 > 10.92라 "이미 초과"로 오판, 실제로는 25/650=3.8%로 10.92%보다 훨씬
+    작아 조건을 만족해야 했음. 그 결과 PRB 조건이 사실상 거의 항상 실패해 ES level이 오르지 못했음.
+  - **원인 2(Tput 단위 불일치)**: rawdata의 `cmIPTput`은 `(IpThruThpVoDLByte/IpThruThpDLTime)*8000`
+    공식상 kbps 스케일(예: 32855.07kbps = 32.86Mbps)인데, `Entering/Leaving Th_Tput`은 Mbps
+    스케일(예: 6~7) — Leaving(감소) 조건에서 `cmIPTput_iir`(kbps, 수만 단위)과 `Leaving Th_Tput`(Mbps,
+    한 자릿수)을 그대로 비교하면 cmIPTput이 사실상 항상 훨씬 크게 나와 "Tput 불만족으로 인한 감소"가
+    거의 발생하지 않는 문제(Entering 조건의 `Pred_IPTput_Mbps_L{n}`은 원래부터 Mbps 스케일이라 이쪽은
+    문제 없었음).
+  - **수정**: PRB 조건은 %(Entering/Leaving Th_PRB_L{n}) 대신 원시 RB 단위인 `RB_Threshold_L{n}`(이미
+    ESM Output Result의 RBThreshold와 동일한 값으로 rawdata에 존재)과 `RB Threshold Margin_LTE`를 그대로
+    사용 — Entering: `UsedRB_t_adj_iir <= RB_Threshold_L{n}`, Leaving: `UsedRB_t_adj_iir >
+    RB_Threshold_L{n} + RB Threshold Margin_LTE`. Tput 조건은 rawdata의 `cmIPTput`을 시뮬레이션
+    내부에서만 1000으로 나눠 Mbps로 환산한 뒤 비교(원본 rawdata의 `cmIPTput` 열 자체는 Optimizer의
+    alpha 회귀 등에 그대로 쓰이므로 변경하지 않음 — 시뮬레이션 로컬 변수만 환산).
+  - **검증**: 사용자가 제시한 실제 수치(UsedRB_t_adj=25, total_rb=650, cmIPTput=32855.07,
+    Pred_IPTput_Mbps_L1=12.306, RB_Threshold_L1=10.92%→원시 70.98RB 환산, Entering Th_Tput=7)를 그대로
+    입력해 단위 테스트 — 수정 전에는(구 코드 기준) PRB 조건이 25>10.92로 오판되어 진입 실패했을 것이,
+    수정 후 1번째 스텝에서 정확히 ES Level 1로 진입하고 `cmIPTput_IIR`도 32.86(Mbps)로 사람이 계산한
+    값과 일치함을 확인.
 """
 
 import tkinter as tk
@@ -1966,6 +1996,11 @@ class ESAnalyzerApp(AppDashboard):
           PRB는 IIR 기준) -> 3) 유지 순으로 판정.
         - 레벨이 적용된 스텝의 cmIPTput은 raw 값 대신 max(cmIPTput*(1-DRB_L(레벨)/(total_rb-UsedRB)), 0)로
           보정한 값을 IIR 필터의 입력으로 사용(레벨 미적용 스텝은 raw 그대로).
+        - [단위 수정, r15-후속4] PRB 조건은 %(Entering/Leaving Th_PRB_L{n})가 아니라 원시 RB 단위
+          (RB_Threshold_L{n} + RB Threshold Margin_LTE)로 비교한다(UsedRB_t_adj_iir 자체가 원시 RB
+          단위이므로 % 임계값과 직접 비교하면 스케일이 맞지 않아 진입 조건이 사실상 항상 실패했음).
+          Tput 조건에 쓰는 cmIPTput은 rawdata 상 kbps 스케일이라 Mbps 스케일인 Entering/Leaving
+          Th_Tput·Pred_IPTput_Mbps_L{n}과 비교하기 전에 1000으로 나눠 Mbps로 환산한다.
         - [예외처리, r15-후속3] IpThruThpDLTime<=0/NaN이라 그 스텝의 cmIPTput을 계산할 수 없으면(rawdata의
           cmIPTput이 NaN) 레벨 결정 자체를 보류하고 이전 스텝의 ES level/IIR 상태를 그대로 승계한다(윈도우
           진입/이탈 판정도 건너뜀) — 해당 스텝의 데이터로는 신뢰할 수 있는 판단을 할 수 없기 때문.
@@ -1995,14 +2030,22 @@ class ESAnalyzerApp(AppDashboard):
 
             n_rows = len(cell_df)
             win_idx = cell_df['ES_Window_Index'].to_numpy()
-            raw_cm = cell_df['cmIPTput'].to_numpy(dtype=float)
+            # [단위 수정, r15-후속4] rawdata의 'cmIPTput'은 (IpThruThpVoDLByte/IpThruThpDLTime)*8000 공식상
+            # kbps 스케일(예: 32855.07 kbps = 32.86 Mbps)인데, Entering/Leaving Th_Tput과 Pred_IPTput_Mbps_L{n}은
+            # Mbps 스케일(예: 6~12) — 여기서 1000으로 나눠 Mbps로 맞춘다(원본 rawdata의 'cmIPTput' 열 자체는
+            # Optimizer의 alpha 회귀 등 다른 용도로 그대로 쓰이므로 건드리지 않고, 시뮬레이션 내부에서만 변환).
+            raw_cm = cell_df['cmIPTput'].to_numpy(dtype=float) / 1000.0
             raw_rb = cell_df['UsedRB_t_adj'].to_numpy(dtype=float)
             raw_usedrb = cell_df['UsedRB'].to_numpy(dtype=float)
 
             drb_col = {n: cell_df[f'DRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
             pred_col = {n: cell_df[f'Pred_IPTput_Mbps_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
-            ent_prb = {n: cell_df[f'Entering Th_PRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
-            lev_prb = {n: cell_df[f'Leaving Th_PRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
+            # [단위 수정, r15-후속4] Entering/Leaving Th_PRB_L{n}은 %(0~100) 스케일인데 UsedRB_t_adj_iir은
+            # 원시 RB 개수(0~total_rb) 스케일이라 서로 비교할 수 없었음 — PRB 조건은 ESM Output Result의
+            # 원시 RB 단위 RBThreshold(=RB_Threshold_L{n})와 RB Threshold Margin_LTE를 그대로 사용한다
+            # (Entering: RB_Threshold_L{n}, Leaving: RB_Threshold_L{n} + RB Threshold Margin_LTE).
+            rb_th_col = {n: cell_df[f'RB_Threshold_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
+            rb_margin = self.rb_threshold_margin_lte.get()
             ent_tput = {n: cell_df[f'Entering Th_Tput_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
             lev_tput = {n: cell_df[f'Leaving Th_Tput_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
 
@@ -2035,14 +2078,14 @@ class ESAnalyzerApp(AppDashboard):
                     nxt, decided = curr, False
                     if curr > 0:
                         tput_bad = cm_prev < lev_tput[curr][i - 1]
-                        prb_bad = rb_prev > lev_prb[curr][i - 1]
+                        prb_bad = rb_prev > (rb_th_col[curr][i - 1] + rb_margin)
                         if tput_bad or prb_bad:
                             nxt = max(curr - 1, 0)
                             decided = True
                             if tput_bad: tput_violation[i - 1] = True
                     if not decided and curr < max_n:
                         nxt_lv = curr + 1
-                        if (pred_col[nxt_lv][i - 1] >= ent_tput[nxt_lv][i - 1]) and (rb_prev <= ent_prb[nxt_lv][i - 1]):
+                        if (pred_col[nxt_lv][i - 1] >= ent_tput[nxt_lv][i - 1]) and (rb_prev <= rb_th_col[nxt_lv][i - 1]):
                             nxt = min(curr + 1, max_n)
                 level[i] = nxt
                 if level[i] == 0:
