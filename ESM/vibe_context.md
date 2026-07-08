@@ -273,9 +273,17 @@
   * **검증**: 6-스텝 합성 데이터의 3번째 스텝에 `cmIPTput=NaN`을 주입한 단위 테스트에서 레벨/IIR이 정확히 이전 스텝 값을 승계하고 이후 스텝은 승계된 상태를 기반으로 다시 정상적으로 레벨 결정이 이어짐을 확인. 실제 GUI 앱으로 트래픽의 약 6%(17/288행, ES 운영 시간대 집중) 행에 IpThruThpDLTime=0/NaN을 주입해 실행 — 이전이면 해당 행들이 사라져 24행 중 18행만 남았을 것이 수정 후 24행 모두 유지되고 그중 6행만 cmIPTput=NaN으로 정확히 표시됨을 확인.
   * **적용 순서**: 사용자 지시대로 `esm_r15.py`에 먼저 반영·검증한 뒤, 동일한 수정(valid_mask 변경 2곳 + `_run_es_level_simulation` 예외 처리)을 `esm_r16.py`에도 그대로 포팅 완료 — 두 파일 모두 동일한 합성 테스트로 결과 일치 확인(Deep Sleep 로직과는 독립적이라 상호작용 없음).
 
+* **[v5.3 / esm_r15.py 우선 반영 후 esm_r16.py에 포팅 완료] (2026-07-08) 버그 수정: ES Level 시뮬레이션의 PRB/Tput 조건 단위 불일치로 특정 Sector에서 ES level이 전혀 적용되지 않던 문제**
+  * **배경**: v5.2로도 문제가 해결되지 않자, 사용자가 실제 raw data 한 행(eNodeBID 210993 Sector 2: UsedRB_t_adj=25, total_rb=650, cmIPTput=32855.07, Pred_IPTput_Mbps_L1=12.306, Entering Th_Tput=7, Entering Th_PRB_L1=10.92%)을 손으로 계산해 두 Entering 조건을 모두 만족하는 것 같은데 ES Level 1이 전혀 적용되지 않는다고 매우 구체적으로 보고. "혹시 Th 조건을 PRB usage(%)가 아니라 UsedRB(원시 RB)로 비교한다면 ESM output의 RB Threshold/RB Margin을 쓰면 된다"와 "Tput 단위 mismatch도 확인해달라"는 정확한 힌트까지 제공.
+  * **원인 1(PRB 단위 불일치, 진짜 근본 원인)**: `_run_es_level_simulation`이 PRB 조건에 `Entering/Leaving Th_PRB_L{n}` 열(ESM Output Result와 동일하게 %, 0~100 스케일)을 그대로 사용했는데, 비교 대상인 `UsedRB_t_adj_iir`는 원시 RB 개수(0~total_rb 스케일, 예시에서는 0~650) — 25(원시 RB)와 10.92(%)를 그냥 비교하면 25 > 10.92라 "이미 초과"로 오판되어, 실제로는 25/650=3.8%로 10.92%보다 훨씬 작아 조건을 만족해야 했던 상황에서도 PRB 조건이 거의 항상 실패해 ES level이 오르지 못하고 있었음.
+  * **원인 2(Tput 단위 불일치)**: rawdata의 `cmIPTput`은 `(IpThruThpVoDLByte/IpThruThpDLTime)*8000` 공식상 kbps 스케일(예: 32855.07kbps=32.86Mbps)인데 `Entering/Leaving Th_Tput`은 Mbps 스케일(예: 6~7) — Leaving(감소) 조건에서 kbps 스케일 cmIPTput_iir과 Mbps 스케일 임계값을 그대로 비교하면 cmIPTput이 항상 훨씬 크게 나와 "Tput 불만족으로 인한 감소"가 거의 발생하지 않는 문제(Entering 조건의 `Pred_IPTput_Mbps_L{n}`은 원래부터 Mbps라 문제 없었음).
+  * **수정**: PRB 조건은 %(Entering/Leaving Th_PRB_L{n}) 대신 원시 RB 단위인 `RB_Threshold_L{n}`(이미 rawdata에 존재, ESM Output Result의 RBThreshold와 동일값)과 `RB Threshold Margin_LTE`를 그대로 사용(Entering: `UsedRB_t_adj_iir <= RB_Threshold_L{n}`, Leaving: `UsedRB_t_adj_iir > RB_Threshold_L{n} + RB Threshold Margin_LTE`). Tput 조건은 rawdata의 `cmIPTput`을 시뮬레이션 내부 로컬 변수에서만 1000으로 나눠 Mbps로 환산해 비교(원본 rawdata `cmIPTput` 열 자체는 Optimizer의 alpha 회귀 등에 그대로 쓰이므로 변경하지 않음).
+  * **검증**: 사용자가 제시한 실제 수치를 그대로 입력해 단위 테스트 — 수정 전 로직대로면 PRB 조건이 25>10.92로 오판되어 진입 실패했을 것이, 수정 후 1번째 스텝에서 정확히 ES Level 1로 진입하고 `cmIPTput_IIR`도 32.86(Mbps)로 사람이 계산한 값과 일치함을 확인.
+  * **적용 순서**: 사용자 지시대로 `esm_r15.py`에 먼저 반영·검증한 뒤, 동일한 수정(cmIPTput /1000 Mbps 환산 + PRB 조건을 `RB_Threshold_L{n}`/`RB Threshold Margin_LTE` 기반으로 교체)을 `esm_r16.py`에도 그대로 포팅 완료(Deep Sleep 로직과는 독립적이라 상호작용 없음, `python -m py_compile` 양쪽 파일 모두 통과 확인).
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.2(`esm_r15.py` + `esm_r16.py` 모두 반영 완료) - IpThruThpDLTime<=0/NaN 행이 통째로 제외되어 15분 연속성이 깨지던 버그를 양쪽 파일 모두 수정(행은 유지, cmIPTput만 NaN 처리 + 시뮬레이션이 그 스텝을 이전 레벨 승계 예외로 처리). 이전 v5.1(`esm_r16.py` + `esm_r15.py`)에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가했고, v4.3(`esm_r15.py`)까지 절감 에너지 계산의 시간 단위(count→hour) 환산 명시화 + Output 폴더 자동 저장 통일, v4.2에서 "평가 기간/평가 시간" 필터 통합 + Mode 1/2/3 전환을 추가하며 여기까지 도달.
+* 현재 상태: v5.3(`esm_r15.py` + `esm_r16.py` 모두 반영 완료) - ES Level 시뮬레이션의 PRB 조건(%→원시 RB 단위)과 Tput 조건(kbps→Mbps) 단위 불일치를 양쪽 파일 모두 수정, 사용자가 제시한 실제 수치로 ES Level 1이 정상적으로 진입함을 확인. 이전 v5.2(`esm_r15.py`+`esm_r16.py`)에서 IpThruThpDLTime<=0/NaN 행 통째 제외 버그를 수정했고, v5.1에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -284,10 +292,10 @@
   5. **다음 결정 대기(v2.7)**: 실데이터로 `Better Axis (R² 기준)` 컬럼과 두 산점도(Loading_traffic 비율 vs Active_RB 절대)를 비교 — Active_RB 축이 Sector Group별 차이를 뚜렷하게 줄여준다면, 다음 라운드에서 Sector Group을 그룹핑 축에서 제거하고 Active_RB 기반 단일 커브로 결과를 단순화할지 결정.
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
-  8. **다음 결정 대기(v5.1/v5.2)**: 사용자가 실데이터로 "시뮬레이션 수행 기간" 분리 + IpThruThpDLTime 예외처리 적용 후 특정 Sector의 ES level 적용 횟수가 정상적으로(0이 아니게) 나오는지 재확인 필요 — 만약 여전히 0으로 나오면 CM/RU-MMU Spec 매핑 여부를 함께 점검.
+  8. **다음 결정 대기(v5.3)**: 사용자가 실데이터로 재확인해 다른 Sector들도 이제 ES level이 정상적으로 적용되는지 검증 필요(esm_r15.py/esm_r16.py 양쪽 모두).
   9. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-* 다음 대기 작업: (사용자가 실데이터로 재확인한 결과를 알려줄 예정 — `esm_r16.py`에서 계속 반영)
+* 다음 대기 작업: (사용자가 실데이터로 재확인한 결과를 알려줄 예정)
 
 ---
-*Last Updated: 2026-07-06*
+*Last Updated: 2026-07-08*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*

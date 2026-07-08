@@ -2027,6 +2027,12 @@ class ESAnalyzerApp(AppDashboard):
         - [예외처리, r16-후속] IpThruThpDLTime<=0/NaN이라 그 스텝의 cmIPTput을 계산할 수 없으면(rawdata의
           cmIPTput이 NaN) 레벨 결정 자체를 보류하고 이전 스텝의 ES level/IIR 상태를 그대로 승계한다(윈도우
           진입/이탈 판정도 건너뜀) — 해당 스텝의 데이터로는 신뢰할 수 있는 판단을 할 수 없기 때문.
+        - [단위 수정, r16-후속2] PRB 조건은 %(Entering/Leaving Th_PRB_L{n})가 아니라 원시 RB 단위
+          (RB_Threshold_L{n} + RB Threshold Margin_LTE)로 비교한다(UsedRB_t_adj_iir 자체가 원시 RB
+          단위이므로 % 임계값과 직접 비교하면 스케일이 맞지 않아 진입 조건이 사실상 항상 실패했음).
+          Tput 조건에 쓰는 cmIPTput은 rawdata 상 kbps 스케일이라 Mbps 스케일인 Entering/Leaving
+          Th_Tput·Pred_IPTput_Mbps_L{n}과 비교하기 전에 1000으로 나눠 Mbps로 환산한다(esm_r15.py에서
+          먼저 수정 및 검증된 내용을 그대로 포팅).
         [r15-후속, r16-후속] `sim_raw_df`가 다루는 "시뮬레이션 수행 기간"(=Rawdata를 만들 때 지정한 기간,
         _build_rawdata_for_period 참조)과 이 함수의 `eval_start_date`/`eval_end_date`/`eval_hours`(공통
         "평가 기간/평가 시간" 필터)는 서로 다른 별개의 설정이다 — 시뮬레이션 자체(레벨 결정/IIR)는 ES
@@ -2053,14 +2059,22 @@ class ESAnalyzerApp(AppDashboard):
 
             n_rows = len(cell_df)
             win_idx = cell_df['ES_Window_Index'].to_numpy()
-            raw_cm = cell_df['cmIPTput'].to_numpy(dtype=float)
+            # [단위 수정, r16-후속2] rawdata의 'cmIPTput'은 (IpThruThpVoDLByte/IpThruThpDLTime)*8000 공식상
+            # kbps 스케일(예: 32855.07 kbps = 32.86 Mbps)인데, Entering/Leaving Th_Tput과 Pred_IPTput_Mbps_L{n}은
+            # Mbps 스케일(예: 6~12) — 여기서 1000으로 나눠 Mbps로 맞춘다(원본 rawdata의 'cmIPTput' 열 자체는
+            # Optimizer의 alpha 회귀 등 다른 용도로 그대로 쓰이므로 건드리지 않고, 시뮬레이션 내부에서만 변환).
+            raw_cm = cell_df['cmIPTput'].to_numpy(dtype=float) / 1000.0
             raw_rb = cell_df['UsedRB_t_adj'].to_numpy(dtype=float)
             raw_usedrb = cell_df['UsedRB'].to_numpy(dtype=float)
 
             drb_col = {n: cell_df[f'DRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
             pred_col = {n: cell_df[f'Pred_IPTput_Mbps_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
-            ent_prb = {n: cell_df[f'Entering Th_PRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
-            lev_prb = {n: cell_df[f'Leaving Th_PRB_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
+            # [단위 수정, r16-후속2] Entering/Leaving Th_PRB_L{n}은 %(0~100) 스케일인데 UsedRB_t_adj_iir은
+            # 원시 RB 개수(0~total_rb) 스케일이라 서로 비교할 수 없었음 — PRB 조건은 ESM Output Result의
+            # 원시 RB 단위 RBThreshold(=RB_Threshold_L{n})와 RB Threshold Margin_LTE를 그대로 사용한다
+            # (Entering: RB_Threshold_L{n}, Leaving: RB_Threshold_L{n} + RB Threshold Margin_LTE).
+            rb_th_col = {n: cell_df[f'RB_Threshold_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
+            rb_margin = self.rb_threshold_margin_lte.get()
             ent_tput = {n: cell_df[f'Entering Th_Tput_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
             lev_tput = {n: cell_df[f'Leaving Th_Tput_L{n}'].to_numpy(dtype=float) for n in range(1, max_n + 1)}
 
@@ -2093,14 +2107,14 @@ class ESAnalyzerApp(AppDashboard):
                     nxt, decided = curr, False
                     if curr > 0:
                         tput_bad = cm_prev < lev_tput[curr][i - 1]
-                        prb_bad = rb_prev > lev_prb[curr][i - 1]
+                        prb_bad = rb_prev > (rb_th_col[curr][i - 1] + rb_margin)
                         if tput_bad or prb_bad:
                             nxt = max(curr - 1, 0)
                             decided = True
                             if tput_bad: tput_violation[i - 1] = True
                     if not decided and curr < max_n:
                         nxt_lv = curr + 1
-                        if (pred_col[nxt_lv][i - 1] >= ent_tput[nxt_lv][i - 1]) and (rb_prev <= ent_prb[nxt_lv][i - 1]):
+                        if (pred_col[nxt_lv][i - 1] >= ent_tput[nxt_lv][i - 1]) and (rb_prev <= rb_th_col[nxt_lv][i - 1]):
                             nxt = min(curr + 1, max_n)
                 level[i] = nxt
                 if level[i] == 0:
