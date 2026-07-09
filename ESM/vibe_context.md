@@ -82,6 +82,11 @@
   * **검증**: 교차 Sector 그룹 id 일치/ES priority==0 배제/ES Level 없는 cell 배제/HW 미지원 배제 단위 테스트. 손계산한 2-Sector 교차 시나리오(140Wh/40Wh 보너스, 70Wh/0 보너스)가 정확히 일치, 한 Sector가 그룹 내에서 잠깐 다시 켜지는 fallback 케이스로 보너스가 정확히 그만큼 줄어듦(40→30Wh)을 확인해 진짜 15분 단위 교차 동기화가 동작함을 증명. Base(§4)의 기존 회귀 테스트 전체(eMTC/ENDC anchor, 전 SectorList 포함, 윈도우 진입, Coverage band, 설정 저장, Output 폴더 통합)를 Deep Sleep off 상태로 재실행해 하위 호환 확인. `python -m py_compile` 통과.
   * **알려진 한계(확인 대기)**: `_run_es_level_simulation` 호출부 중 raw_df가 특정 eNodeBID/Sector로 미리 필터링된 경우(예: "에너지 분석 실행"에서 특정 sector만 선택 조회) 교차-Sector 판정에 필요한 다른 sector의 timeline이 아예 없어 보수적으로 "미충족" 처리되어 절감량이 실제보다 낮게 나올 수 있음 — 실사용에서 문제가 되는지 확인 필요.
 
+* **[v17.1] (2026-07-09) 성능 최적화: Deep Sleep 코드의 반복 DataFrame 필터링/재계산 제거**
+  * `_compute_deep_sleep_capability`: cell마다 매번 carrier_df를 필터링하던 것을 (sector, cell)→ES priority dict 사전 준비로 대체(O(cell수×band수) → O(band수)+O(cell수)), board-type별 Deep Sleep 지원 여부도 미리 dict화, eNodeBID별 Python 루프+반복 필터링을 관련 eNodeBID만 좁힌 뒤 단일 groupby로 대체, `iterrows()`/`apply(axis=1)`을 `zip()` 순회로 교체. 이 과정에서 `.astype(str)`이 object dtype 컬럼의 실제 NaN을 문자열로 바꿔주지 않는 pandas 특성으로 인한 버그도 발견해 `.fillna('')` 선적용으로 수정.
+  * `_calc_es_level_simulation_savings`: 같은 (eNodeBID, group id)가 여러 band/level에서 반복 참조될 때 "그룹 전체 off" Series를 캐시해 재사용, `level_deltas`/`level_group` 구성도 `cell_res` 2회 순회를 1회로 통합.
+  * **검증**: v17.0에서 작성한 모든 단위/통합 테스트를 재실행해 계산 결과가 최적화 전과 완전히 동일함을 확인. `python -m py_compile` 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:

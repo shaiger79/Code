@@ -478,6 +478,27 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     py_compile` 통과.
   - **적용 범위**: 이 라운드부터 `esm_r17.py`가 유일한 활성 개발 파일이다. `esm_r15_0.py`/
     `esm_r16_0.py`는 branch `esm-r0-cellru-mapping`에 이 라운드 종료 시점 상태로 그대로 보존.
+
+[v17.1] (2026-07-09) 성능 최적화: Deep Sleep 관련 코드의 반복 DataFrame 필터링/재계산 제거:
+  - **`_compute_deep_sleep_capability`**: (a) cell의 ES priority를 확인할 때마다 매번 carrier_df 전체를
+    필터링하던 `_band_row_for`를 제거하고, carrier_df(band 목록, 보통 cell 수보다 훨씬 작음)를 한 번만
+    순회해 `(sector, cell) -> ES priority`/`band 존재 여부` dict를 미리 만들어 이후에는 dict 조회만
+    사용(원래 O(cell수 × band수) 반복 필터링 → O(band수) 준비 + O(cell수) 조회로 감소). (b) board-type의
+    Deep Sleep 지원 여부도 RU/MMU Spec을 그룹마다 다시 필터링하지 않고 한 번만 dict로 준비. (c) eNodeBID
+    마다 Python 루프를 돌며 `cm_map_df_full`을 매번 다시 필터링·groupby하던 것을, 이번 실행에 관련된
+    eNodeBID로만 먼저 좁힌 뒤 `(eNB_ID, board-type, port-id)` 단일 groupby 한 번으로 대체(pandas 벡터화
+    groupby가 Python 루프보다 빠름). (d) `DataFrame.iterrows()`/`DataFrame.apply(axis=1)` 대신 `zip()`
+    기반 순회로 교체(Series 생성 오버헤드 제거). 이 과정에서 `.astype(str)`이 object dtype 컬럼의 실제
+    NaN을 문자열 'nan'으로 바꿔주지 않는 pandas 특성으로 인한 잠재 버그도 함께 발견해 `.fillna('')`를
+    먼저 적용하도록 수정.
+  - **`_calc_es_level_simulation_savings`**: 같은 (eNodeBID, Deep Sleep group id)가 여러 band/level(다른
+    sector에 걸칠 수도 있음)에서 반복 참조될 때마다 "그룹 전체가 동시에 꺼져 있는지" Series를 매번 다시
+    계산하던 것을, 최초 1회만 계산해 캐시(`_group_all_off_series_cached`)하고 재사용하도록 변경.
+    `level_deltas`/`level_group` dict도 `cell_res`를 두 번 순회해 각각 만들던 것을 한 번의 순회로 합침.
+  - **검증**: 위 알고리즘 변경이 결과에 영향을 주지 않는지, [v17.0]에서 작성한 모든 단위/통합 테스트
+    (Deep Sleep capability 4케이스, 교차-Sector 절감 시나리오, eMTC/ENDC anchor, 전 SectorList 포함,
+    윈도우 진입, Coverage band, 설정 자동 저장/불러오기, Output 폴더 통합)를 다시 실행해 값이 최적화
+    전과 완전히 동일함을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -2836,6 +2857,18 @@ class ESAnalyzerApp(AppDashboard):
                 result = col_ok if result is None else (result & col_ok)
             return result
 
+        # [최적화] 같은 (eNodeBID, group_id)는 여러 band/level(여러 sector에 걸칠 수도 있음)에서 반복
+        # 참조될 수 있는데, 매번 다시 계산하면 동일한 "그룹 전체 off" Series를 중복 계산하게 된다 -
+        # 한 번 계산한 결과는 캐시해 재사용한다.
+        _all_off_cache = {}
+
+        def _group_all_off_series_cached(enodeb, gid):
+            cache_key = (enodeb, gid)
+            if cache_key not in _all_off_cache:
+                members = group_members.get(enodeb, {}).get(gid, [])
+                _all_off_cache[cache_key] = _group_all_off_series(enodeb, members)
+            return _all_off_cache[cache_key]
+
         rows = []
         covered_pairs = set()
         if summary_df is not None and not summary_df.empty:
@@ -2847,13 +2880,16 @@ class ESAnalyzerApp(AppDashboard):
                     (self.latest_optimizer_results['Sector'].astype(str) == sector) &
                     (self.latest_optimizer_results['ES Level'] != 7)
                 ]
-                level_deltas = {int(r['ES Level']): self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
-                                 for _, r in cell_res.iterrows()}
-                level_group = {}
-                if deep_sleep_on:
-                    for _, r in cell_res.iterrows():
-                        try: level_group[int(r['ES Level'])] = int(r.get('Deep Sleep Capability', -1))
-                        except Exception: level_group[int(r['ES Level'])] = -1
+                # [최적화] level_deltas/level_group을 cell_res를 두 번 순회하며 각각 만들던 것을 한 번의
+                # 순회로 합침.
+                level_deltas, level_group = {}, {}
+                has_capability_col = deep_sleep_on and 'Deep Sleep Capability' in cell_res.columns
+                for _, r in cell_res.iterrows():
+                    lv = int(r['ES Level'])
+                    level_deltas[lv] = self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
+                    if has_capability_col:
+                        try: level_group[lv] = int(r.get('Deep Sleep Capability', -1))
+                        except Exception: level_group[lv] = -1
 
                 wide = level_wide_by_enb.get(enodeb) if deep_sleep_on else None
                 sector_level_series = wide[sector] if (wide is not None and sector in wide.columns) else None
@@ -2867,8 +2903,7 @@ class ESAnalyzerApp(AppDashboard):
                     eligible_steps = 0
                     gid = level_group.get(k, -1)
                     if gid != -1 and sector_level_series is not None:
-                        members = group_members.get(enodeb, {}).get(gid, [])
-                        all_off = _group_all_off_series(enodeb, members)
+                        all_off = _group_all_off_series_cached(enodeb, gid)
                         if all_off is not None:
                             passed_k = sector_level_series.reindex(all_off.index).fillna(0) > k
                             eligible_steps = min(int((passed_k & all_off).sum()), count_gt_k)  # 집계 카운트 초과 방지(안전장치)
@@ -3764,51 +3799,82 @@ class ESAnalyzerApp(AppDashboard):
             return out_df
 
         cat_id = self.target_cat_id.get().strip()
-        carrier_df = self.carrier_df_internal.copy()
+        carrier_df = self.carrier_df_internal
         if 'Cat_ID' in carrier_df.columns:
             carrier_df = carrier_df[carrier_df['Cat_ID'].astype(str) == cat_id]
 
         # 1) 이번 실행 결과로부터 cell별 (sector, ES Level)과 "ES Level 없음(7)" 여부를 구성.
+        #    (DataFrame.iterrows() 대신 zip으로 순회 - Series 생성 오버헤드 없이 더 빠름.)
         cell_off_level = {}   # (enodeb, cell) -> (sector, level)
         es7_cells = set()     # (enodeb, cell) - ES Level이 배정되지 않은 cell
-        for _, row in out_df.iterrows():
-            enodeb, sector, level = str(row['eNodeBID']), str(row['Sector']), int(row['ES Level'])
-            cells = re.findall(r'\d+', str(row.get('Target Cell Num', '')))
+        for enodeb, sector, level, target_cells in zip(
+                out_df['eNodeBID'].astype(str), out_df['Sector'].astype(str),
+                out_df['ES Level'].astype(int), out_df['Target Cell Num'].astype(str)):
+            cells = re.findall(r'\d+', target_cells)
             if level == 7:
-                for c in cells: es7_cells.add((enodeb, c))
+                es7_cells.update((enodeb, c) for c in cells)
             else:
                 for c in cells: cell_off_level[(enodeb, c)] = (sector, level)
 
-        def _band_row_for(sector, cell_num):
-            sector_map = {0: 'cell-num-A', 1: 'cell-num-B', 2: 'cell-num-C', 3: 'cell-num-D'}
-            try: sec_int = int(sector)
-            except Exception: return None
-            target_col = sector_map.get(sec_int, 'cell-num-A')
-            if target_col not in carrier_df.columns: return None
-            matches = carrier_df[carrier_df[target_col].astype(str).str.strip() == str(cell_num).strip()]
-            return matches.iloc[0] if not matches.empty else None
+        # 2) carrier_df(band 목록, 보통 cell 수보다 훨씬 작음)에서 (sector, cell-num) -> ES priority를
+        #    한 번만 미리 구성 - 원래는 cell마다 carrier_df를 매번 필터링했던 것을 dict 조회로 대체.
+        sector_map = {0: 'cell-num-A', 1: 'cell-num-B', 2: 'cell-num-C', 3: 'cell-num-D'}
+        has_priority_col = 'ES priority' in carrier_df.columns
+        band_exists = set()          # (sector, cell) - 이 (sector, cell)에 대응하는 band가 있음
+        es_priority_by_cell = {}     # (sector, cell) -> ES priority(숫자, NaN 가능)
+        for sec_int, target_col in sector_map.items():
+            if target_col not in carrier_df.columns: continue
+            sec_str = str(sec_int)
+            # [최적화] .astype(str)은 object dtype 컬럼의 실제 NaN을 문자열 'nan'으로 바꿔주지 않고 NaN
+            # 그대로 남기는 경우가 있어(pandas 특성), 먼저 fillna('')로 결측을 빈 문자열로 통일한 뒤
+            # astype(str)한다 - 그래야 이후 모든 값이 항상 진짜 str이 되어 .lower() 등이 안전하다.
+            col_vals = carrier_df[target_col].fillna('').astype(str).str.strip()
+            pri_vals = pd.to_numeric(carrier_df['ES priority'], errors='coerce') if has_priority_col else None
+            for i, cell_val in enumerate(col_vals):
+                if not cell_val: continue
+                key = (sec_str, cell_val)
+                band_exists.add(key)
+                if has_priority_col:
+                    es_priority_by_cell[key] = pri_vals.iloc[i]
 
-        # 2) eNodeBID별로 (board-type, port-id) RU 공유 그룹을 만들고 Deep Sleep 가능 여부 판정.
+        def _cell_es_priority_ok(sector, cell):
+            key = (sector, cell)
+            if key not in band_exists:
+                return False  # 연결된 band 자체가 없음 - 판정 불가로 간주해 제외
+            es_pri = es_priority_by_cell.get(key)
+            return not (es_pri is not None and pd.notna(es_pri) and es_pri == 0)
+
+        # 3) board-type -> Deep Sleep 지원 여부(전력 > 0)도 한 번만 미리 구성.
+        deep_sleep_support = {}
+        if spec_bcol in self.ru_spec_df_internal.columns:
+            spec_types = self.ru_spec_df_internal[spec_bcol].astype(str).str.strip().str.lower()
+            deep_vals = self.ru_spec_df_internal.get('Deep Sleep', pd.Series(dtype=object))
+            for b_type_norm, deep_val in zip(spec_types, deep_vals.reindex(spec_types.index)):
+                if b_type_norm in deep_sleep_support: continue  # 먼저 나온 행 우선(기존 .iloc[0] 동작과 동일)
+                try: p = float(deep_val) if pd.notna(deep_val) and str(deep_val).strip() != '' else 0.0
+                except Exception: p = 0.0
+                deep_sleep_support[b_type_norm] = p > 0
+
+        # 4) RU 공유 그룹: eNodeBID 별로 Python 루프를 돌며 매번 cm_map_df_full을 다시 필터링하는 대신,
+        #    이번 실행에 실제로 관련된 eNodeBID로만 한 번 좁힌 뒤 (eNB_ID, board-type, port-id) 단일
+        #    groupby로 한 번에 그룹화한다(pandas 내부 벡터화 연산 활용).
+        relevant_enbs = set(out_df['eNodeBID'].astype(str).unique())
+        cm_valid = self.cm_map_df_full[
+            self.cm_map_df_full['eNB_ID'].astype(str).isin(relevant_enbs) &
+            self.cm_map_df_full[btype_col].notna() & (self.cm_map_df_full[btype_col].astype(str).str.strip() != '') &
+            self.cm_map_df_full[port_col].notna() & (self.cm_map_df_full[port_col].astype(str).str.strip() != '')
+        ]
+
         cell_to_group = {}  # (enodeb, cell) -> group_id(1..)
-        for enodeb in out_df['eNodeBID'].astype(str).unique():
-            cm_sub = self.cm_map_df_full[self.cm_map_df_full['eNB_ID'].astype(str) == enodeb]
-            if cm_sub.empty: continue
-            cm_sub = cm_sub[cm_sub[btype_col].notna() & (cm_sub[btype_col].astype(str).str.strip() != '') &
-                             cm_sub[port_col].notna() & (cm_sub[port_col].astype(str).str.strip() != '')]
-            if cm_sub.empty: continue
-
-            next_group_id = 1
-            for (b_type, _port), grp in cm_sub.groupby([btype_col, port_col]):
+        next_group_id_by_enb = {}
+        if not cm_valid.empty:
+            enb_key = cm_valid['eNB_ID'].astype(str)
+            btype_key = cm_valid[btype_col].astype(str).str.strip().str.lower()
+            for (enodeb, b_type_norm, _port), grp in cm_valid.groupby([enb_key, btype_key, cm_valid[port_col]]):
+                if not deep_sleep_support.get(b_type_norm, False):
+                    continue  # HW가 Deep Sleep 미지원
                 member_cells = grp['cell-num'].astype(str).unique().tolist()
                 if not member_cells: continue
-
-                b_type_norm = str(b_type).strip().lower()
-                spec_row = self.ru_spec_df_internal[self.ru_spec_df_internal[spec_bcol].astype(str).str.strip().str.lower() == b_type_norm]
-                if spec_row.empty: continue
-                deep_val = spec_row.iloc[0].get('Deep Sleep', 0)
-                try: deep_sleep_power = float(deep_val) if pd.notna(deep_val) and str(deep_val).strip() != '' else 0.0
-                except Exception: deep_sleep_power = 0.0
-                if deep_sleep_power <= 0: continue  # HW가 Deep Sleep 미지원
 
                 capable = True
                 for cell in member_cells:
@@ -3816,32 +3882,28 @@ class ESAnalyzerApp(AppDashboard):
                     if key in es7_cells or key not in cell_off_level:
                         capable = False; break
                     sector, _level = cell_off_level[key]
-                    band_row = _band_row_for(sector, cell)
-                    if band_row is None:
-                        capable = False; break
-                    es_pri = pd.to_numeric(band_row.get('ES priority'), errors='coerce')
-                    if pd.notna(es_pri) and es_pri == 0:
+                    if not _cell_es_priority_ok(sector, cell):
                         capable = False; break
                 if not capable: continue
 
-                gid = next_group_id
-                next_group_id += 1
+                gid = next_group_id_by_enb.get(enodeb, 1)
+                next_group_id_by_enb[enodeb] = gid + 1
                 for cell in member_cells:
                     cell_to_group[(enodeb, cell)] = gid
 
-        # 3) out_df의 각 행에 대해 Target Cell Num의 모든 cell이 동일한 유효 group id를 공유하는지 확인.
-        def _row_capability(row):
-            if int(row['ES Level']) == 7:
-                return -1
-            enodeb = str(row['eNodeBID'])
-            cells = re.findall(r'\d+', str(row.get('Target Cell Num', '')))
-            if not cells: return -1
-            gids = {cell_to_group.get((enodeb, c)) for c in cells}
-            if len(gids) == 1 and None not in gids:
-                return list(gids)[0]
-            return -1
+        # 5) out_df의 각 행에 대해 Target Cell Num의 모든 cell이 동일한 유효 group id를 공유하는지 확인
+        #    (여기도 apply(axis=1) 대신 zip으로 순회).
+        capability_col = []
+        for level, enodeb, target_cells in zip(
+                out_df['ES Level'].astype(int), out_df['eNodeBID'].astype(str), out_df['Target Cell Num'].astype(str)):
+            if level == 7:
+                capability_col.append(-1)
+                continue
+            cells = re.findall(r'\d+', target_cells)
+            gids = {cell_to_group.get((enodeb, c)) for c in cells} if cells else {None}
+            capability_col.append(next(iter(gids)) if len(gids) == 1 and None not in gids else -1)
 
-        out_df['Deep Sleep Capability'] = out_df.apply(_row_capability, axis=1)
+        out_df['Deep Sleep Capability'] = capability_col
         return out_df
 
     def run_analysis(self):
