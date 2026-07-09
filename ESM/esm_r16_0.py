@@ -388,6 +388,24 @@ cm_map_df_full 단일 조회로 단순화:
     분기를 제거하고 cm_map_df_full(eNodeBID+cell-num)만 조회하도록 단순화(esm_r15_0.py와 동일).
   - **검증**: esm_r15_0.py에서 새 데이터 모델에 맞춰 다시 작성한 테스트를 이 파일에 대해서도 재실행해
     모두 통과함을 확인. `python -m py_compile` 통과.
+
+[r0-후속2] (esm_r15_0.py에서 먼저 확인된 수정을 그대로 포팅) 기능 개선: ES Level이 아예 생성되지 않은
+sector도 에너지 절감효과 결과표에 포함(절감 0):
+  - **배경**: eMTC/ENDC anchor 강제 조정 등으로 ES 적용대상 cell/band를 하나도 찾지 못해 ES Level
+    1조차 생성되지 않는 sector가 `_calc_es_level_simulation_savings`(Advanced Settings 기본 Mode인
+    시뮬레이션 기반 절감효과 계산)에서 통째로 누락되던 문제. `_run_es_level_simulation`이 그런 sector를
+    건너뛰는 것 자체는 정상(시뮬레이션이 필요 없으므로)이지만, 절감효과 결과표에서는 SectorList에 있는
+    sector인 이상 절감 0으로라도 나타나야 한다는 요청.
+  - **수정**: esm_r15_0.py와 동일 - 새 헬퍼 `_get_all_sectorlist_pairs()`로 현재 Cat_ID의 SectorList
+    전체 (eNodeBID, Sector) 쌍을 구하고, summary_df에 없는(=ES Level 없음) sector는 소모 에너지만
+    채우고 절감에너지(및 Deep Sleep 추가 절감)를 0으로 채운 행을 추가. summary_df가 완전히 비어도
+    SectorList 전체를 0-절감 행으로 채운 표를 반환하도록 변경(기존에는 즉시 빈 DataFrame 반환).
+    Deep Sleep 전용 컬럼(`중 Deep Sleep 추가 절감 [Wh]`)도 0으로 채움.
+  - **적용 범위**: `_calc_es_level_simulation_savings`(시뮬레이션 기반)에만 적용, NC2 기반
+    `_calc_all_savings`(Mode 1)은 esm_r15_0.py와 동일한 이유로 이번에는 다루지 않음.
+  - **검증**: esm_r15_0.py와 동일한 테스트(ES 정책 있는 sector 1개 + 없는 sector 2개, summary_df가
+    완전히 비어있는 경우 포함)를 이 파일(Deep Sleep 컬럼 포함)에 대해 재실행해 모두 통과함을 확인.
+    `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -2623,6 +2641,22 @@ class ESAnalyzerApp(AppDashboard):
             total_wh += ru_hr['Energy_Wh'].sum()
         return total_wh
 
+    def _get_all_sectorlist_pairs(self):
+        """[r0-후속2] 현재 Target Cat_ID의 SectorList에 있는 모든 (eNodeBID, Sector) 쌍을 반환한다.
+        ES 적용대상 cell/band를 찾지 못해 ES Level 자체가 생성되지 않은 sector도(그래서 ES Level
+        시뮬레이션의 summary_df에도 나타나지 않는 sector도) 에너지 절감효과 계산에서 누락되지 않도록,
+        summary_df가 아니라 SectorList 자체를 sector 전체 목록의 기준으로 삼기 위한 헬퍼."""
+        if self.sector_df_internal.empty:
+            return []
+        df = self.sector_df_internal
+        cat_id = self.target_cat_id.get().strip()
+        if 'Cat_ID' in df.columns:
+            df = df[df['Cat_ID'].astype(str) == cat_id]
+        if 'eNB_ID' not in df.columns or 'Sector' not in df.columns:
+            return []
+        pairs = df[['eNB_ID', 'Sector']].dropna().drop_duplicates()
+        return list(zip(pairs['eNB_ID'].astype(str), pairs['Sector'].astype(str)))
+
     def _calc_es_level_simulation_savings(self, summary_df, start_date, end_date, eval_hours=None):
         """[r15-후속, r16에서 Deep Sleep 반영] ES Level 시뮬레이션의 셀별 레벨 누적 카운트(summary_df,
         이미 평가 시간으로 한정된 값)에 ESM Output Result의 레벨별 Target Cell Num + RU HW 전력차를
@@ -2639,8 +2673,13 @@ class ESAnalyzerApp(AppDashboard):
         절감 에너지 = Σ_k [ pa_off_delta(k) × count(Level==k) × 0.25h
                            + elevated_delta(k) × count(Level>k) × 0.25h ] × Gamma2
         (Deep Sleep 미지원 HW는 elevated_delta==pa_off_delta이므로 기존 count(Level>=k) 공식과 동일하게
-        귀결됨 — 하위 호환)."""
-        if summary_df is None or summary_df.empty: return pd.DataFrame()
+        귀결됨 — 하위 호환).
+
+        [r0-후속2] ES 적용대상 cell/band를 찾지 못해(eMTC/ENDC anchor 강제 조정 등으로) ES Level 1조차
+        생성되지 않은 sector는 `_run_es_level_simulation`이 애초에 시뮬레이션을 수행하지 않으므로
+        summary_df에 나타나지 않는다 - 이런 sector까지 시뮬레이션할 필요는 없지만, SectorList에 있는
+        sector인 이상 절감 에너지 결과표(및 그 합계)에서는 누락되지 않고 절감에너지 0으로 표시되어야
+        하므로, summary_df에 없는 SectorList sector는 소모 에너지만 계산해 절감 0인 행으로 채운다."""
         if self.latest_optimizer_results is None or self.latest_optimizer_results.empty: return pd.DataFrame()
 
         gamma2 = self.pred_gamma2.get() if hasattr(self, 'pred_gamma2') else 0.7
@@ -2651,39 +2690,55 @@ class ESAnalyzerApp(AppDashboard):
             except Exception: df_estat = None
 
         rows = []
-        for _, srow in summary_df.iterrows():
-            enodeb, sector, max_n = str(srow['eNodeBID']), str(srow['Sector']), int(srow['Max_ES_Level'])
-            cell_res = self.latest_optimizer_results[
-                (self.latest_optimizer_results['eNodeBID'].astype(str) == enodeb) &
-                (self.latest_optimizer_results['Sector'].astype(str) == sector) &
-                (self.latest_optimizer_results['ES Level'] != 7)
-            ]
-            level_deltas = {int(r['ES Level']): self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
-                             for _, r in cell_res.iterrows()}
+        covered_pairs = set()
+        if summary_df is not None and not summary_df.empty:
+            for _, srow in summary_df.iterrows():
+                enodeb, sector, max_n = str(srow['eNodeBID']), str(srow['Sector']), int(srow['Max_ES_Level'])
+                covered_pairs.add((enodeb, sector))
+                cell_res = self.latest_optimizer_results[
+                    (self.latest_optimizer_results['eNodeBID'].astype(str) == enodeb) &
+                    (self.latest_optimizer_results['Sector'].astype(str) == sector) &
+                    (self.latest_optimizer_results['ES Level'] != 7)
+                ]
+                level_deltas = {int(r['ES Level']): self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
+                                 for _, r in cell_res.iterrows()}
 
-            saved_wh, deep_sleep_bonus_raw = 0.0, 0.0
-            for k in range(1, max_n + 1):
-                pa_off_delta, elevated_delta = level_deltas.get(k, (0.0, 0.0))
-                count_eq_k = int(srow.get(f'Level {k} Count', 0))
-                count_gt_k = sum(int(srow.get(f'Level {lv} Count', 0)) for lv in range(k + 1, max_n + 1))
-                saved_wh += pa_off_delta * count_eq_k * 0.25
-                saved_wh += elevated_delta * count_gt_k * 0.25
-                deep_sleep_bonus_raw += (elevated_delta - pa_off_delta) * count_gt_k * 0.25
-            saved_wh *= gamma2
-            deep_sleep_bonus_wh = deep_sleep_bonus_raw * gamma2
+                saved_wh, deep_sleep_bonus_raw = 0.0, 0.0
+                for k in range(1, max_n + 1):
+                    pa_off_delta, elevated_delta = level_deltas.get(k, (0.0, 0.0))
+                    count_eq_k = int(srow.get(f'Level {k} Count', 0))
+                    count_gt_k = sum(int(srow.get(f'Level {lv} Count', 0)) for lv in range(k + 1, max_n + 1))
+                    saved_wh += pa_off_delta * count_eq_k * 0.25
+                    saved_wh += elevated_delta * count_gt_k * 0.25
+                    deep_sleep_bonus_raw += (elevated_delta - pa_off_delta) * count_gt_k * 0.25
+                saved_wh *= gamma2
+                deep_sleep_bonus_wh = deep_sleep_bonus_raw * gamma2
 
+                consumed_wh = self._sector_total_energy_wh(enodeb, sector, df_estat)
+                es_active = int(srow.get('ES Active Steps', 0))
+                violation_cnt = int(srow.get('Tput Violation Count', 0))
+                pct = (saved_wh / consumed_wh * 100) if consumed_wh else np.nan
+                violation_ratio = (violation_cnt / es_active) if es_active else 0.0
+
+                rows.append({
+                    'eNodeBID': enodeb, 'Sector': sector,
+                    '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': round(saved_wh, 2),
+                    '중 Deep Sleep 추가 절감 [Wh]': round(deep_sleep_bonus_wh, 2),
+                    '절감률 (%)': round(pct, 2) if pd.notna(pct) else np.nan,
+                    'Tput Violation Count': violation_cnt, 'Tput Violation Ratio': round(violation_ratio, 4),
+                })
+
+        # [r0-후속2] ES Level이 없어 시뮬레이션 자체가 수행되지 않은 SectorList sector - 절감 0으로 채움.
+        for enodeb, sector in self._get_all_sectorlist_pairs():
+            if (enodeb, sector) in covered_pairs:
+                continue
             consumed_wh = self._sector_total_energy_wh(enodeb, sector, df_estat)
-            es_active = int(srow.get('ES Active Steps', 0))
-            violation_cnt = int(srow.get('Tput Violation Count', 0))
-            pct = (saved_wh / consumed_wh * 100) if consumed_wh else np.nan
-            violation_ratio = (violation_cnt / es_active) if es_active else 0.0
-
             rows.append({
                 'eNodeBID': enodeb, 'Sector': sector,
-                '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': round(saved_wh, 2),
-                '중 Deep Sleep 추가 절감 [Wh]': round(deep_sleep_bonus_wh, 2),
-                '절감률 (%)': round(pct, 2) if pd.notna(pct) else np.nan,
-                'Tput Violation Count': violation_cnt, 'Tput Violation Ratio': round(violation_ratio, 4),
+                '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': 0.0,
+                '중 Deep Sleep 추가 절감 [Wh]': 0.0,
+                '절감률 (%)': 0.0 if consumed_wh else np.nan,
+                'Tput Violation Count': 0, 'Tput Violation Ratio': 0.0,
             })
 
         result_df = pd.DataFrame(rows)
@@ -2691,7 +2746,7 @@ class ESAnalyzerApp(AppDashboard):
             total_consumed, total_saved = result_df['소모에너지 [Wh]'].sum(), result_df['절감에너지 [Wh]'].sum()
             total_deep_sleep = result_df['중 Deep Sleep 추가 절감 [Wh]'].sum()
             total_violation = result_df['Tput Violation Count'].sum()
-            total_active = summary_df['ES Active Steps'].sum() if 'ES Active Steps' in summary_df.columns else 0
+            total_active = summary_df['ES Active Steps'].sum() if summary_df is not None and not summary_df.empty and 'ES Active Steps' in summary_df.columns else 0
             total_row = {
                 'eNodeBID': '전체 합계', 'Sector': '', '소모에너지 [Wh]': round(total_consumed, 2),
                 '절감에너지 [Wh]': round(total_saved, 2), '중 Deep Sleep 추가 절감 [Wh]': round(total_deep_sleep, 2),

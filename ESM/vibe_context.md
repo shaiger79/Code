@@ -315,9 +315,16 @@
   * **검증**: 새 데이터 모델(conf-emtc-switch 등은 cm_map_df_full에, ES priority/ENDC_priority는 carrier_df에)에 맞춰 단위 테스트를 다시 작성해 재실행 - 서비스 미배치/이미 보장됨/강제 조정(eMTC·ENDC anchor)/anchor-type 불일치·support=False 케이스 모두 통과. `run_analysis` 합성 데이터 통합 테스트도 갱신해 재확인. `python -m py_compile` 양쪽 파일 모두 통과.
   * **적용 순서**: `esm_r15_0.py`에 먼저 반영 후 `esm_r16_0.py`에 동일 포팅.
 
+* **[v5.9 / esm_r15_0.py 우선 반영 후 esm_r16_0.py에 포팅 완료] (2026-07-09) 기능 개선: ES Level이 아예 생성되지 않은 sector도 에너지 절감효과 결과표에 포함(절감 0)**
+  * **배경**: 사용자 요청 — "ES 적용대상 cell/band를 찾지 못해, ES level 1도 생성되지 않은 경우, 시뮬레이션을 수행 필요는 없어. 다만 시뮬레이션 기반으로 Energy Saving 이득을 계산하니까, 에너지 절감효과 등을 계산할 때는 ES level이 없더라도 Sectorlist에 있는 sector들을 모두 포함하도록 코드를 수정해줘." eMTC/ENDC anchor 강제 조정(v5.7) 등으로 ES 적용대상 band가 하나도 남지 않으면 ES Level 1 자체가 생성되지 않고, `_run_es_level_simulation`도 그 sector를 건너뛰는 게 맞지만(시뮬레이션은 실제로 불필요), `_calc_es_level_simulation_savings`가 그 결과(summary_df)만 순회해 그런 sector가 절감효과 결과표에서 통째로 사라지는 문제가 있었음.
+  * **수정**: 새 헬퍼 `_get_all_sectorlist_pairs()`(현재 Target Cat_ID의 SectorList 전체 (eNodeBID, Sector) 쌍)를 추가. `_calc_es_level_simulation_savings`는 summary_df에 있는 sector는 기존과 동일하게 계산하고, SectorList에는 있지만 summary_df에 없는 sector는 소모 에너지(Energy Stat 기반, ES 정책과 무관)만 채우고 절감에너지=0(esm_r16_0.py는 Deep Sleep 추가 절감 컬럼도 0)인 행을 추가. summary_df가 완전히 비어 있어도(모든 sector가 ES Level 없음) 빈 표 대신 SectorList 전체를 0-절감 행으로 채운 표를 반환하도록 변경. 전체 합계 행은 기존 로직을 그대로 재사용(모든 행의 합이라 자동 반영).
+  * **적용 범위**: 시뮬레이션 기반 계산(`_calc_es_level_simulation_savings`, Advanced Settings 기본값인 Mode 2/3에서 사용)에만 적용 — NC2 기반(`_calc_all_savings`, Mode 1)은 ES Level별 상세 행(Target Cell Num/Board Type 등) 구조라 의미 있는 0-행을 만들기 어렵고, 사용자 요청도 "시뮬레이션 기반" 계산을 명시적으로 지목해 이번에는 다루지 않음.
+  * **검증**: SectorList에 3개 sector(1개는 ES 정책 있음, 2개는 ES 적용대상 band 없음)를 두고 호출 - 정책 없는 2개 sector도 절감에너지 0, 소모 에너지는 정상값으로 나타나고 전체 합계도 3개 sector 소모량을 모두 반영함을 확인. summary_df를 완전히 비워도 SectorList 3개 sector가 모두 0-절감 행으로 채워진 표를 반환함을 확인(빈 DataFrame이 아님). 양쪽 파일 모두 동일하게 통과. `python -m py_compile` 통과.
+  * **적용 순서**: `esm_r15_0.py`에 먼저 반영·검증 후 `esm_r16_0.py`에 동일 포팅.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.8(`esm_r15_0.py` + `esm_r16_0.py` 모두 반영 완료) - eMTC/ENDC anchor 속성(`conf-emtc-switch`/`endc-anchor-type`/`endc-support`) 조회처가 CM Data(`cm_map_df_full`)로 확정되어, v5.7에서 만들었던 CarrierConf 폴백 조회를 제거하고 단순화. 이전 v5.7에서 Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 새 라운드(esm-r0-cellru-mapping 브랜치)의 두 파일 모두에 추가했고, v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
+* 현재 상태: v5.9(`esm_r15_0.py` + `esm_r16_0.py` 모두 반영 완료) - ES 적용대상 cell/band를 찾지 못해 ES Level이 아예 생성되지 않은 sector도 에너지 절감효과 결과표(시뮬레이션 기반)에 절감 0으로 포함되도록 수정. 이전 v5.8에서 eMTC/ENDC anchor 속성(`conf-emtc-switch`/`endc-anchor-type`/`endc-support`) 조회처가 CM Data(`cm_map_df_full`)로 확정되어 v5.7의 CarrierConf 폴백 조회를 제거·단순화했고, v5.7에서 Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 새 라운드(esm-r0-cellru-mapping 브랜치)의 두 파일 모두에 추가했고, v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -331,6 +338,7 @@
   10. **다음 결정 대기(v5.5)**: 사용자가 실제로 Optimizer 실행 -> Energy Dashboard 사용 순서로 이어서 써보고, 결과가 정말 같은 `Output/<timestamp>/` 폴더에 모이는지, 반복 다운로드 시 생기는 `_2`/`_3` 폴더 분리 방식이 실사용에 괜찮은지(선호하면 파일명 index 방식으로 바꿀 수도 있음) 확인 필요(esm_r15.py/esm_r16.py 양쪽 모두).
   11. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
   12. **다음 결정 대기(v5.8)**: eMTC/ENDC anchor 판정 알고리즘(eMTC: `ES priority`가 가장 큰 band 선택, ENDC anchor: `ENDC_priority`가 가장 작은 band 선택·-1 제외)을 사용자가 실데이터로 재검증 필요 — 데이터 소스(cm_map_df_full)는 확정되었으나 실제 CM Data의 `conf-emtc-switch`/`endc-anchor-type`/`endc-support` 값 표기(Enable/Disable, True/False 등)가 코드의 `_TRUTHY_TOKENS` 판정과 맞는지 확인 필요.
+  13. **다음 결정 대기(v5.9)**: ES Level 없는 sector를 절감효과 결과표에 포함하는 수정은 시뮬레이션 기반 계산(`_calc_es_level_simulation_savings`, Mode 2/3)에만 적용했음 — NC2 기반(`_calc_all_savings`, Mode 1)도 동일하게 다뤄야 하는지 사용자 확인 필요(요청 시 ES Level별 상세 행 구조를 어떻게 0-표시할지 별도 설계 필요).
 * 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정)
 
 ---
