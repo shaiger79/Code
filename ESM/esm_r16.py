@@ -281,6 +281,84 @@ Output 폴더에 자동 저장:
     완전히 동일한 결과(레벨/IIR이 이전 스텝 값을 정확히 승계 후 재개)를 확인. 실제 GUI 앱으로 트래픽의
     약 6%(17/288행) 행에 IpThruThpDLTime=0/NaN을 주입해 실행 — 24행 모두 유지되고 그중 6행만
     cmIPTput=NaN으로 표시되어 esm_r15.py와 동일한 결과를 확인. `python -m py_compile` 통과.
+
+[r16-후속2] 버그 수정(esm_r15.py의 [r15-후속4]에서 먼저 확인된 수정을 그대로 포팅): ES Level 시뮬레이션의
+PRB/Tput 조건 단위 불일치로 특정 Sector에서 ES level이 전혀 적용되지 않던 문제:
+  - **배경**: 사용자가 실제 raw data 한 행(eNodeBID 210993 Sector 2, UsedRB_t_adj=25, total_rb=650,
+    cmIPTput=32855.07, Pred_IPTput_Mbps_L1=12.306, Entering Th_Tput=7, Entering Th_PRB_L1=10.92%)을
+    손으로 계산해보니 두 Entering 조건을 모두 만족하는 것 같은데 ES Level 1이 전혀 적용되지 않는다고
+    보고. "혹시 Th 조건을 PRB usage(%)가 아니라 UsedRB(원시 RB)로 비교한다면 ESM output의 RB
+    Threshold/RB Margin을 쓰면 된다"와 "Tput 단위 mismatch도 확인해달라"는 정확한 힌트를 제공.
+  - **원인 1(PRB 단위 불일치, 진짜 원인)**: `_run_es_level_simulation`이 PRB 조건에 `Entering/Leaving
+    Th_PRB_L{n}` 열(ESM Output Result와 동일하게 %, 0~100 스케일)을 그대로 썼는데, 비교 대상인
+    `UsedRB_t_adj_iir`는 원시 RB 개수(0~total_rb 스케일, 위 예시에서는 0~650)였음 — 예: 25(원시 RB) vs
+    10.92(%)를 그냥 비교하면 25 > 10.92라 "이미 초과"로 오판, 실제로는 25/650=3.8%로 10.92%보다 훨씬
+    작아 조건을 만족해야 했음. 그 결과 PRB 조건이 사실상 거의 항상 실패해 ES level이 오르지 못했음.
+  - **원인 2(Tput 단위 불일치)**: rawdata의 `cmIPTput`은 `(IpThruThpVoDLByte/IpThruThpDLTime)*8000`
+    공식상 kbps 스케일(예: 32855.07kbps = 32.86Mbps)인데, `Entering/Leaving Th_Tput`은 Mbps
+    스케일(예: 6~7) — Leaving(감소) 조건에서 `cmIPTput_iir`(kbps, 수만 단위)과 `Leaving Th_Tput`(Mbps,
+    한 자릿수)을 그대로 비교하면 cmIPTput이 사실상 항상 훨씬 크게 나와 "Tput 불만족으로 인한 감소"가
+    거의 발생하지 않는 문제(Entering 조건의 `Pred_IPTput_Mbps_L{n}`은 원래부터 Mbps 스케일이라 이쪽은
+    문제 없었음).
+  - **수정**: PRB 조건은 %(Entering/Leaving Th_PRB_L{n}) 대신 원시 RB 단위인 `RB_Threshold_L{n}`(이미
+    ESM Output Result의 RBThreshold와 동일한 값으로 rawdata에 존재)과 `RB Threshold Margin_LTE`를 그대로
+    사용 — Entering: `UsedRB_t_adj_iir <= RB_Threshold_L{n}`, Leaving: `UsedRB_t_adj_iir >
+    RB_Threshold_L{n} + RB Threshold Margin_LTE`. Tput 조건은 rawdata의 `cmIPTput`을 시뮬레이션
+    내부에서만 1000으로 나눠 Mbps로 환산한 뒤 비교(원본 rawdata의 `cmIPTput` 열 자체는 Optimizer의
+    alpha 회귀 등에 그대로 쓰이므로 변경하지 않음 — 시뮬레이션 로컬 변수만 환산).
+  - **검증**: 사용자가 제시한 실제 수치를 esm_r16.py에서 재구성 — ES Level 1이 두 번째 스텝에서 정확히
+    진입하고, 진입 직전(raw 값 그대로인) 첫 스텝의 `cmIPTput_IIR`이 32.86(Mbps)로 사람이 계산한 값과
+    일치함을 확인. `python -m py_compile` 통과.
+
+[r16-후속3] 편의 기능 추가: 파일 입출력 폴더/파라미터 초기값 자동 저장·불러오기 + Input 폴더 파일 자동 선택:
+  - **배경**: 사용자가 매번 Input/Output 폴더나 각 탭 파라미터를 다시 설정하고, Traffic/Energy Stat/CM/
+    학습데이터 파일을 드래그 앤 드롭이나 '찾기'로 매번 다시 선택하는 게 번거롭다고 요청 — "앱이 존재하는
+    폴더 내부의 Input/Output 폴더가 대상"이고 "자동 저장은 필요 없고 필요시 수동으로 업데이트"하면
+    된다는 조건, 그리고 Input 폴더 파일도 파일명/헤더 규칙을 보고 자동으로 선택해달라는 요청.
+  - **구현**: `_app_dir()`(스크립트/exe가 위치한 폴더)를 기준으로 `self.input_dir`/`self.output_dir`
+    기본값을 각각 `<앱 폴더>/Input`, `<앱 폴더>/Output`으로 설정. 앱 폴더의 `esm_settings.json`이
+    있으면 `_load_app_settings()`가 그 값과 `_SETTINGS_PARAM_NAMES`에 정의된 각 탭 파라미터(Optimizer/
+    Advanced Settings/Energy Dashboard/Learning 탭의 수치·문자열·체크박스 값)를 덮어쓴다 - 파일이 없으면
+    기존 하드코딩 초기값을 그대로 사용. 저장은 Data I/O 탭의 "현재 설정을 기본값으로 저장" 버튼
+    (`_save_app_settings()`)에서만 수동으로 발생하며, 값이 바뀔 때마다 자동으로 저장되지는 않는다.
+    파일 경로(Traffic/CM 등)는 설정에 포함하지 않는다 - 대신 `_auto_select_input_files()`가 앱 구동 시
+    Input 폴더를 스캔해 CM Data(.xlsx/.xls 확장자), Traffic/Energy Stat Data(기존 `handle_file_drop`과
+    동일한 파일명 키워드 규칙), Cell/RU 단위 학습데이터(기존 `_classify_learning_files_drop`과 동일한
+    CSV 헤더 컬럼 시그니처 - 공통 로직은 `_sniff_learning_csv_kind`로 분리)를 각 항목별로 자동 채워준다.
+    각 항목은 후보가 정확히 1개일 때만 자동 선택하고, 0개(못 찾음)/2개 이상(애매함)이면 자동 선택하지
+    않고 마지막에 팝업 하나로 모아서 안내한다(그 항목만 '찾기'/드래그 앤 드롭으로 직접 선택하면 됨).
+    `_make_output_dir`과 `run_analysis`/Traffic Pattern 저장 로직의 출력 폴더 기준도 `os.getcwd()`에서
+    `self.output_dir`로 통일.
+  - **검증**: 임시 폴더에 실제 스키마를 반영한 샘플 파일(CM 확장자, Traffic/Energy Stat CSV - Energy
+    Stat은 실제 컬럼명인 `RuPowerTot`/`RuPowerCnt` 사용, Cell/RU 학습데이터 CSV)을 두고 `ESAnalyzerApp`을
+    실제로 생성해 5개 파일이 모두 정확히 자동 선택되고 경고 팝업이 뜨지 않음을 확인. 파라미터를 바꾸고
+    저장한 뒤 새 인스턴스를 생성해 Input/Output 폴더와 파라미터가 정확히 재로딩됨을 확인. CM 파일 후보를
+    2개로 만들었을 때는 자동 선택하지 않고 정확히 그 항목만 안내 팝업에 포함됨을 확인. `python -m
+    py_compile` 통과.
+
+[r16-후속4] 기능 개선: Optimizer와 Energy Dashboard/Learning 결과를 같은 Output 타임스탬프 폴더로 통합 +
+같은 종류의 결과를 반복 다운로드해도 서로 덮어쓰지 않도록 폴더 분리:
+  - **배경**: ES Policy Optimizer를 실행한 뒤 Energy Dashboard(에너지 분석/절감효과 예측/ES Level
+    시뮬레이션)를 이어서 쓰는 게 정상적인 순차 워크플로우인데, 기존에는 `run_analysis`(Optimizer)와
+    `_make_output_dir`(Energy Dashboard/Learning 다운로드 공용)이 각자 `datetime.now()`로 새
+    타임스탬프를 만들어 결과가 `Output/<ts1>/`, `Output/<ts2>/`처럼 서로 다른 폴더에 흩어졌음. 또한
+    Energy Dashboard에서 eNodeBID/Sector나 시뮬레이션 조건을 바꿔가며 같은 종류의 결과를 여러 번
+    다운로드하면 같은 폴더(예: `ESLevelSimulation/`)의 같은 파일명(`Summary.csv` 등)에 매번 덮어써지는
+    문제도 있었음.
+  - **수정**: `self.latest_run_timestamp`를 신설해 `run_analysis`가 실행될 때마다 그 시점의 타임스탬프를
+    기록해두고, `_make_output_dir`은 더 이상 자체적으로 새 타임스탬프를 만들지 않고 이 값을 그대로
+    재사용(Optimizer를 아직 한 번도 실행하지 않았다면 첫 호출이 새 타임스탬프를 만들어 이후 호출들이
+    그것을 따름) - Optimizer -> Energy Dashboard/Learning 순서로 이어지는 한 세션의 모든 결과가 하나의
+    `Output/<timestamp>/` 폴더 아래 모이게 됨. 같은 타임스탬프 폴더 안에서 `_make_output_dir`에 넘겨준
+    subfolder(예: `ESLevelSimulation`)가 이미 존재하면 덮어쓰는 대신 `ESLevelSimulation_2`,
+    `ESLevelSimulation_3`…처럼 폴더 이름 자체를 다르게 만들어 매 다운로드 호출마다 새 폴더에 저장한다
+    (파일이름에 index를 붙이는 대신 폴더 이름을 다르게 하는 방식을 선택 - 다운로드 로직이 여러 파일을
+    한 번에 저장하는 호출도 있어 폴더 단위로 나누는 쪽이 더 간단하고 일관적임).
+  - **검증**: `latest_run_timestamp`를 미리 지정한 상태에서 `_make_output_dir`을 여러 subfolder로 호출해
+    모두 같은 타임스탬프 폴더 아래 생성됨을 확인. 같은 subfolder로 반복 호출하면 `_2`, `_3`으로 이어지며
+    서로 다른 폴더가 만들어짐을 확인. `latest_run_timestamp`가 없는 상태(Optimizer 미실행)에서는 첫
+    호출이 새 타임스탬프를 만들고 이후 호출들이 그 값을 그대로 재사용함을 확인. `python -m py_compile`
+    통과.
 """
 
 import tkinter as tk
@@ -291,9 +369,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.font_manager as fm
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import json
 import logging
 import os
 import re
+import sys
 from datetime import datetime
 
 try:
@@ -339,6 +419,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BaseTk = TkinterDnD.Tk if HAS_DND else tk.Tk
 
 class AppBase(BaseTk):
+    # [r16-후속3] 설정 저장/자동 불러오기(esm_settings.json) 대상 파라미터 목록. 파일 경로 변수(traffic_file
+    # 등)는 여기 포함하지 않는다 - Input 폴더에서 매번 자동 선택되므로 별도 저장이 필요 없다. 날짜
+    # 선택기(오늘 날짜가 기본값)나 검색창 같은 세션 한정 UI 상태도 제외한다.
+    _SETTINGS_PARAM_NAMES = [
+        'target_cat_id', 'exclude_dates_str', 'time_hours',
+        'tput_threshold', 'tput_margin', 'guarantee_ratio',
+        'threshold_rblowutil', 'coe_low', 'rblow_multiplier',
+        'rb_threshold_margin_lte', 'req_ip_tput_low_util_lte', 'n_allowed_escell_lte',
+        'iir_coef_tput_lte', 'iir_coef_prb_lte',
+        'auto_optimize_time', 'max_time_windows', 'no_es_hours', 'low_util_window_on',
+        'learn_down_ratio_th', 'learn_min_samples',
+        'energy_hours_str', 'pred_gamma', 'pred_gamma2', 'saving_prediction_mode',
+    ]
+
     def __init__(self):
         super().__init__()
 
@@ -396,6 +490,8 @@ class AppBase(BaseTk):
         self.latest_optimizer_results = None
         self.latest_optimizer_rawdata = None  # [r14] Energy Dashboard용 24시간 전체 Rawdata(ES 윈도우 밖 시간 포함)
         self.latest_optimizer_period = None  # [r15] (start_date, end_date, exclude_dates_str) - Rawdata 재사용 판정 기준
+        self.latest_run_timestamp = None  # [r16-후속4] Optimizer 실행(run_analysis)이 결과를 저장한 Output/<timestamp> 폴더 -
+        # _make_output_dir()이 이 값을 그대로 재사용해 Energy Dashboard/Learning 탭 결과도 같은 폴더에 모이게 한다.
         self.show_advanced = False
 
         # [Learning Energy Curve, r12] RU HW 단위 loading-energy 회귀 + Idle/PA off 보정 학습 관련 상태
@@ -412,8 +508,20 @@ class AppBase(BaseTk):
         self.learn_pooled_active_points = {}  # [r13-update] 창 크기 변경 시 재사용할 마지막 학습 결과(산점도 원본 포인트, Loading_traffic 비율 축)
         self.learn_pooled_active_points_rb = {}  # [r14] 위와 동일하되 Active_RB(절대 활성 RB) 축 기준
 
+        # [r16-후속3] 파일 입출력 폴더(Input/Output). 기본값은 앱이 위치한 폴더(스크립트 또는 exe가 있는
+        # 폴더) 하위의 Input/Output 폴더 - esm_settings.json이 있으면 _load_app_settings()에서 덮어쓴다.
+        app_dir = self._app_dir()
+        self.input_dir = tk.StringVar(value=os.path.join(app_dir, 'Input'))
+        self.output_dir = tk.StringVar(value=os.path.join(app_dir, 'Output'))
+
         self._load_auto_jsons()
         self.create_widgets()
+        # [r16-후속3] esm_settings.json이 있으면 Input/Output 폴더와 각 탭 파라미터 초기값을 덮어쓰고(없으면
+        # 방금 설정한 기본값을 그대로 사용), Input 폴더에서 CM/Traffic/Energy Stat/학습데이터 파일을 자동으로
+        # 찾아 각 입력창에 채워준다. 실시간 자동 저장은 하지 않으며, 설정을 바꾸고 싶으면 Data I/O 탭의
+        # '현재 설정을 기본값으로 저장' 버튼으로 수동 저장한다.
+        self._load_app_settings()
+        self._auto_select_input_files()
 
         if HAS_DND:
             self.drop_target_register(DND_FILES)
@@ -444,12 +552,180 @@ class AppBase(BaseTk):
 
     def _make_output_dir(self, subfolder):
         """[r15-후속] Optimizer의 run_analysis()가 결과를 저장하는 방식과 동일하게, Energy Dashboard/
-        Learning Energy Curve의 다운로드 결과도 파일 대화상자 없이 `Output/<timestamp>/<subfolder>/`에
-        자동 저장하기 위한 폴더를 만들어 경로를 반환한다."""
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = os.path.join(os.getcwd(), "Output", ts, subfolder)
+        Learning Energy Curve의 다운로드 결과도 파일 대화상자 없이 `<Output 폴더>/<timestamp>/<subfolder>/`에
+        자동 저장하기 위한 폴더를 만들어 경로를 반환한다. [r16-후속3] Output 폴더 자체는 self.output_dir(기본값:
+        앱 폴더의 Output, esm_settings.json으로 변경 가능)을 따른다.
+        [r16-후속4] 타임스탬프는 매번 새로 만들지 않고 self.latest_run_timestamp(가장 최근 Optimizer
+        실행이 기록)를 재사용한다 - Optimizer -> Energy Dashboard로 순차적으로 이어지는 워크플로우에서 두
+        결과가 서로 다른 타임스탬프 폴더에 흩어지지 않고 한 폴더에 모이게 하기 위함(Optimizer를 아직 한
+        번도 실행하지 않았으면 이번 호출이 새 타임스탬프를 만들어 이후 호출들이 그것을 따르게 된다).
+        같은 타임스탬프 폴더 안에서 subfolder가 이미 존재하면(Energy Dashboard에서 조합을 바꿔가며
+        같은 종류의 결과를 여러 번 다운로드한 경우) 파일을 덮어쓰지 않도록 'subfolder_2', 'subfolder_3'…
+        처럼 폴더 이름 자체를 다르게 만들어 매 호출마다 새 폴더에 저장한다."""
+        if self.latest_run_timestamp is None:
+            self.latest_run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_dir = os.path.join(self.output_dir.get(), self.latest_run_timestamp)
+
+        out_dir = os.path.join(base_dir, subfolder)
+        if os.path.isdir(out_dir):
+            idx = 2
+            while os.path.isdir(os.path.join(base_dir, f"{subfolder}_{idx}")):
+                idx += 1
+            out_dir = os.path.join(base_dir, f"{subfolder}_{idx}")
         os.makedirs(out_dir, exist_ok=True)
         return out_dir
+
+    def _app_dir(self):
+        """[r16-후속3] 앱이 위치한 폴더 - 스크립트로 실행 중이면 이 .py 파일이 있는 폴더, PyInstaller 등으로
+        exe로 패키징된 경우 그 exe가 있는 폴더. Input/Output 폴더 기본값과 esm_settings.json 저장 위치의
+        기준이 된다."""
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _settings_path(self):
+        return os.path.join(self._app_dir(), 'esm_settings.json')
+
+    def _load_app_settings(self):
+        """[r16-후속3] esm_settings.json(앱 폴더)이 있으면 Input/Output 폴더와 각 탭 파라미터(
+        _SETTINGS_PARAM_NAMES) 초기값을 불러와 덮어쓴다. 파일이 없으면 아무것도 하지 않고 기존
+        하드코딩된 초기값 + 앱 폴더의 Input/Output 폴더를 그대로 사용한다. 자동 저장은 하지 않으며,
+        설정을 바꾸고 싶으면 Data I/O 탭의 저장 버튼으로 수동 저장해야 한다(_save_app_settings)."""
+        path = self._settings_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showwarning("설정 불러오기 실패",
+                                    f"설정 파일을 읽는 중 오류가 발생했습니다:\n{path}\n{e}\n\n기존 초기값을 사용합니다.")
+            return
+
+        if data.get('input_dir'): self.input_dir.set(data['input_dir'])
+        if data.get('output_dir'): self.output_dir.set(data['output_dir'])
+
+        params = data.get('params', {})
+        for name in self._SETTINGS_PARAM_NAMES:
+            if name in params and hasattr(self, name):
+                try: getattr(self, name).set(params[name])
+                except Exception: pass
+
+    def _save_app_settings(self):
+        """[r16-후속3] 현재 Input/Output 폴더와 각 탭 파라미터 값을 esm_settings.json(앱 폴더)에 저장한다.
+        Data I/O 탭의 '현재 설정을 기본값으로 저장' 버튼에서만 호출되는 수동 저장 - 값이 바뀔 때마다
+        자동으로 저장되지는 않는다."""
+        data = {
+            'input_dir': self.input_dir.get(),
+            'output_dir': self.output_dir.get(),
+            'params': {name: getattr(self, name).get() for name in self._SETTINGS_PARAM_NAMES if hasattr(self, name)},
+        }
+        path = self._settings_path()
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            messagebox.showinfo("저장 완료", f"현재 설정을 기본값으로 저장했습니다:\n{path}")
+        except Exception as e:
+            messagebox.showerror("저장 실패", f"설정 저장 중 오류가 발생했습니다:\n{e}")
+
+    def _browse_dir(self, var):
+        initial = var.get() if os.path.isdir(var.get()) else self._app_dir()
+        d = filedialog.askdirectory(initialdir=initial)
+        if d: var.set(d)
+
+    def _sniff_learning_csv_kind(self, path):
+        """[r16-후속3] CSV 헤더 컬럼만 보고 Cell 단위/RU 단위 학습데이터인지 판별한다(_classify_learning_files_drop과
+        동일한 판별 규칙을 공유 - 둘 중 어느 것도 아니면 None)."""
+        try:
+            header = pd.read_csv(path, nrows=0, encoding='utf-8-sig').columns
+            if len(header) == 1 and '\t' in header[0]:
+                header = pd.read_csv(path, nrows=0, encoding='utf-8-sig', sep='\t').columns
+        except Exception:
+            return None
+        norm = [str(c).strip().lower().replace('_', '').replace('-', '').replace(' ', '') for c in header]
+        if any(c in ['cnum', 'cellid', 'cellnum'] for c in norm) and any(c == 'usedrb' for c in norm):
+            return 'cell'
+        if any(c.startswith('consumedpower') for c in norm):
+            return 'ru'
+        return None
+
+    def _auto_select_input_files(self):
+        """[r16-후속3] Input 폴더(self.input_dir)에서 Traffic/Energy Stat/CM Data와 Cell/RU 학습데이터
+        파일을 자동으로 찾아 각 입력창에 채워준다(드래그 앤 드롭이나 '찾기' 버튼으로 수동 선택할 필요 없이,
+        앱 구동 시 자동으로 선택됨) - 판별 규칙은 기존 handle_file_drop(파일명 키워드)/
+        _classify_learning_files_drop(CSV 헤더 컬럼)과 동일한 것을 그대로 재사용한다. 각 항목별로 후보가
+        정확히 1개일 때만 자동 선택하고, 후보가 0개(못 찾음)이거나 2개 이상(애매함)이면 자동 선택하지 않고
+        마지막에 팝업 하나로 모아서 안내한다(그 항목만 '찾기'/드래그 앤 드롭으로 직접 선택하면 됨)."""
+        in_dir = self.input_dir.get()
+        if not os.path.isdir(in_dir):
+            messagebox.showwarning("Input 폴더 없음",
+                                    f"Input 폴더를 찾을 수 없습니다:\n{in_dir}\n\n"
+                                    "파일을 직접 '찾기' 버튼으로 선택하거나 드래그 앤 드롭 해주세요.")
+            return
+
+        entries = [os.path.join(in_dir, f) for f in os.listdir(in_dir) if os.path.isfile(os.path.join(in_dir, f))]
+        xlsx_files = [f for f in entries if os.path.splitext(f)[1].lower() in ('.xlsx', '.xls')]
+        csv_files = [f for f in entries if os.path.splitext(f)[1].lower() == '.csv']
+
+        missing = []
+
+        if len(xlsx_files) == 1:
+            self.cm_file.set(xlsx_files[0])
+        elif len(xlsx_files) == 0:
+            missing.append("CM Data (Excel) - Input 폴더에 .xlsx/.xls 파일이 없습니다.")
+        else:
+            missing.append(f"CM Data (Excel) - 후보가 {len(xlsx_files)}개라 자동 선택할 수 없습니다({', '.join(os.path.basename(f) for f in xlsx_files)}).")
+
+        # [r16-후속3] CSV는 먼저 학습데이터(Cell/RU) 헤더 시그니처로 분류하고, 남는 파일만 Traffic/Energy Stat
+        # 파일명 키워드 규칙(handle_file_drop과 동일)으로 분류한다.
+        cell_candidates, ru_candidates, remaining_csv = [], [], []
+        for p in csv_files:
+            kind = self._sniff_learning_csv_kind(p)
+            if kind == 'cell': cell_candidates.append(p)
+            elif kind == 'ru': ru_candidates.append(p)
+            else: remaining_csv.append(p)
+
+        if len(cell_candidates) == 1:
+            self.learn_cell_file.set(cell_candidates[0])
+        elif len(cell_candidates) == 0:
+            missing.append("Cell 단위 학습데이터 - Input 폴더에서 인식되는 파일이 없습니다.")
+        else:
+            missing.append(f"Cell 단위 학습데이터 - 후보가 {len(cell_candidates)}개라 자동 선택할 수 없습니다.")
+
+        if len(ru_candidates) == 1:
+            self.learn_ru_file.set(ru_candidates[0])
+        elif len(ru_candidates) == 0:
+            missing.append("RU 단위 학습데이터 - Input 폴더에서 인식되는 파일이 없습니다.")
+        else:
+            missing.append(f"RU 단위 학습데이터 - 후보가 {len(ru_candidates)}개라 자동 선택할 수 없습니다.")
+
+        traffic_candidates, energy_candidates = [], []
+        for p in remaining_csv:
+            fname = os.path.basename(p).lower()
+            is_energy_stat = any(k in fname for k in ['energy', 'power', 'ru'])
+            is_traffic = any(k in fname for k in ['traffic', 'sector', 'group'])
+            if is_energy_stat and not is_traffic: energy_candidates.append(p)
+            else: traffic_candidates.append(p)
+
+        if len(traffic_candidates) == 1:
+            self.traffic_file.set(traffic_candidates[0])
+        elif len(traffic_candidates) == 0:
+            missing.append("Traffic Data (CSV) - Input 폴더에서 인식되는 파일이 없습니다.")
+        else:
+            missing.append(f"Traffic Data (CSV) - 후보가 {len(traffic_candidates)}개라 자동 선택할 수 없습니다.")
+
+        if len(energy_candidates) == 1:
+            self.energy_stat_file.set(energy_candidates[0])
+        elif len(energy_candidates) == 0:
+            missing.append("Energy Stat Data (CSV) - Input 폴더에서 인식되는 파일이 없습니다.")
+        else:
+            missing.append(f"Energy Stat Data (CSV) - 후보가 {len(energy_candidates)}개라 자동 선택할 수 없습니다.")
+
+        if missing:
+            messagebox.showwarning("Input 폴더 자동 선택 안내",
+                                    "다음 파일은 Input 폴더에서 자동으로 선택하지 못했습니다. "
+                                    "필요하면 직접 '찾기' 버튼으로 선택하거나 드래그 앤 드롭 해주세요:\n\n" +
+                                    "\n".join(f"- {m}" for m in missing))
 
     def _get_target_cells_str(self, band_names, carrier_df, target_col):
         cells = []
@@ -632,6 +908,21 @@ class AppBase(BaseTk):
         self._build_learning_ui()
 
     def _build_data_io_ui(self):
+        # [r16-후속3] 파일 입출력 폴더(Input/Output) 설정 - 기본값은 앱 폴더 하위 Input/Output이고,
+        # esm_settings.json이 있으면 그 값을 불러온다(_load_app_settings). "현재 설정을 기본값으로 저장"을
+        # 눌러야만 esm_settings.json에 저장되며(수동 저장), 값이 바뀔 때마다 자동으로 저장되지는 않는다.
+        io_dir_frame = ttk.Frame(self.frame_data_io, style='Card.TFrame', padding=15)
+        io_dir_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(io_dir_frame, text="Input 폴더:", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(io_dir_frame, textvariable=self.input_dir, width=50).grid(row=0, column=1, padx=10)
+        ttk.Button(io_dir_frame, text="찾아보기", command=lambda: self._browse_dir(self.input_dir)).grid(row=0, column=2)
+        ttk.Button(io_dir_frame, text="🔄 Input 폴더 다시 스캔", command=self._auto_select_input_files).grid(row=0, column=3, padx=(5, 0))
+        ttk.Label(io_dir_frame, text="Output 폴더:", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(io_dir_frame, textvariable=self.output_dir, width=50).grid(row=1, column=1, padx=10)
+        ttk.Button(io_dir_frame, text="찾아보기", command=lambda: self._browse_dir(self.output_dir)).grid(row=1, column=2)
+        ttk.Button(io_dir_frame, text="💾 현재 설정을 기본값으로 저장", style='Primary.TButton',
+                   command=self._save_app_settings).grid(row=2, column=0, columnspan=3, pady=(10, 0), sticky=tk.W)
+
         file_frame = ttk.Frame(self.frame_data_io, style='Card.TFrame', padding=15)
         file_frame.pack(fill=tk.X, pady=5)
         ttk.Label(file_frame, text="Traffic Data (CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=5)
@@ -1600,7 +1891,7 @@ class ESAnalyzerApp(AppDashboard):
 
             plt.tight_layout(rect=[0, 0.03, 1, 0.97], h_pad=3.0)
 
-            save_dir = os.path.join(os.getcwd(), "TrafficPatternAnalysis", datetime.now().strftime("%Y%m%d"))
+            save_dir = os.path.join(self.output_dir.get(), "TrafficPatternAnalysis", datetime.now().strftime("%Y%m%d"))
             os.makedirs(save_dir, exist_ok=True)
             safe_metric = selected_metric.split()[0].replace(' ', '') if selected_metric != '전체 항목 (All Metrics)' else "AllMetrics"
             if '(Max 30)' in selected_metric: safe_metric += "_Max30"
@@ -1636,7 +1927,7 @@ class ESAnalyzerApp(AppDashboard):
             metrics_cfg = self._get_metric_configs(df)
             global_times = df['Time'].tolist()
 
-            save_dir = os.path.join(os.getcwd(), "TrafficPatternAnalysis", datetime.now().strftime("%Y%m%d"))
+            save_dir = os.path.join(self.output_dir.get(), "TrafficPatternAnalysis", datetime.now().strftime("%Y%m%d"))
             os.makedirs(save_dir, exist_ok=True)
 
             if mode == 'individual':
@@ -3058,7 +3349,11 @@ class ESAnalyzerApp(AppDashboard):
             output_results, intermediate_data_list, rawdata_list = [], [], []
 
             current_time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            base_out_dir = os.path.join(os.getcwd(), "Output", current_time_str)
+            # [r16-후속4] 이번 Optimizer 실행의 Output 타임스탬프 폴더를 기록해둔다 - 이후 Energy Dashboard/
+            # Learning 탭에서 _make_output_dir()을 호출하면(순차적으로 이어서 실행되는 워크플로우) 새
+            # 타임스탬프 폴더를 새로 만들지 않고 이 폴더를 그대로 재사용한다.
+            self.latest_run_timestamp = current_time_str
+            base_out_dir = os.path.join(self.output_dir.get(), current_time_str)
             plot_dir = os.path.join(base_out_dir, "plots")
             os.makedirs(plot_dir, exist_ok=True)
             t_target = self.tput_threshold.get() + self.tput_margin.get()
@@ -3402,25 +3697,17 @@ class ESAnalyzerApp(AppDashboard):
 
     def _classify_learning_files_drop(self, paths):
         """[r12-update] 드롭(또는 다중 선택)된 CSV 파일들을 헤더 컬럼을 보고
-        Cell 단위 학습데이터(learn_cell_file) / RU 단위 학습데이터(learn_ru_file)로 자동 분류한다."""
+        Cell 단위 학습데이터(learn_cell_file) / RU 단위 학습데이터(learn_ru_file)로 자동 분류한다.
+        [r16-후속3] 판별 규칙 자체는 _sniff_learning_csv_kind로 분리해 _auto_select_input_files(Input 폴더
+        자동 스캔)와 공유한다."""
         unclassified = []
         for p in paths:
             if os.path.splitext(p)[1].lower() != '.csv':
                 unclassified.append(p); continue
-            try:
-                header = pd.read_csv(p, nrows=0, encoding='utf-8-sig').columns
-                if len(header) == 1 and '\t' in header[0]:
-                    header = pd.read_csv(p, nrows=0, encoding='utf-8-sig', sep='\t').columns
-            except Exception:
-                unclassified.append(p); continue
-
-            norm = [str(c).strip().lower().replace('_', '').replace('-', '').replace(' ', '') for c in header]
-            is_cell_file = any(c in ['cnum', 'cellid', 'cellnum'] for c in norm) and any(c == 'usedrb' for c in norm)
-            is_ru_file = any(c.startswith('consumedpower') for c in norm)
-
-            if is_cell_file:
+            kind = self._sniff_learning_csv_kind(p)
+            if kind == 'cell':
                 self.learn_cell_file.set(p)
-            elif is_ru_file:
+            elif kind == 'ru':
                 self.learn_ru_file.set(p)
             else:
                 unclassified.append(p)
