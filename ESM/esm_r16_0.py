@@ -372,13 +372,22 @@ ES 적용대상 band 강제 조정:
     시뮬레이션의 절감량 계산) 단계에서 동작하므로 상호작용 없음.
   - **구현**: esm_r15_0.py와 완전히 동일 - `_save_cellru_mapping_file()`/`_auto_load_cellru_mapping()`
     (Input 폴더의 `CellRUMapping_<타임스탬프>.json`), `_enforce_protected_band()`/`_is_emtc_enabled()`/
-    `_is_endc_anchor_enabled()`/`_lookup_cell_attr()`(CarrierConf 우선, cm_map_df_full로 폴백하는 이중
-    조회), `run_analysis`에서 eMTC -> ENDC anchor 순서로 호출해 강제 조정된 band가 있으면 `Note` 컬럼에
-    기록.
+    `_is_endc_anchor_enabled()`/`_lookup_cell_attr()`, `run_analysis`에서 eMTC -> ENDC anchor 순서로
+    호출해 강제 조정된 band가 있으면 `Note` 컬럼에 기록.
   - **검증**: esm_r15_0.py에서 쓴 것과 동일한 테스트(단위 테스트 5종 + 합성 데이터로 `run_analysis` 실제
     실행)를 이 파일에 대해 재실행해 모두 동일하게 통과함을 확인. 기존 v5.4/v5.5(설정 자동 저장/불러오기,
     Output 폴더 통합) 회귀 테스트도 재실행해 이번 변경으로 인한 부작용이 없음을 확인. `python -m
     py_compile` 통과.
+
+[r0-후속] 단순화(esm_r15_0.py에서 먼저 확인된 수정을 그대로 포팅): eMTC/ENDC anchor 속성 조회를
+cm_map_df_full 단일 조회로 단순화:
+  - **배경**: 사용자가 실제 데이터 구조를 확인 - `conf-emtc-switch`/`endc-anchor-type`/`endc-support`는
+    CarrierConf가 아니라 병합된 CM 데이터(cm_map_df_full, eNodeBID+cell-num 인덱스)에만 있고, CarrierConf는
+    band<->cell-num 매핑과 ES priority/ENDC_priority 값만 제공한다는 것이 확정됨.
+  - **수정**: `_lookup_cell_attr`/`_is_emtc_enabled`/`_is_endc_anchor_enabled`에서 CarrierConf 조회
+    분기를 제거하고 cm_map_df_full(eNodeBID+cell-num)만 조회하도록 단순화(esm_r15_0.py와 동일).
+  - **검증**: esm_r15_0.py에서 새 데이터 모델에 맞춰 다시 작성한 테스트를 이 파일에 대해서도 재실행해
+    모두 통과함을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -3384,30 +3393,24 @@ class ESAnalyzerApp(AppDashboard):
 
     _TRUTHY_TOKENS = {'enable', 'enabled', 'true', '1', 'on', 'y', 'yes'}
 
-    def _lookup_cell_attr(self, carrier_row, enodeb, cell_num, col_name):
-        """[r0] eMTC/ENDC anchor 판정에 필요한 셀 속성(conf-emtc-switch/endc-anchor-type/endc-support)을
-        조회한다. 이 속성이 CarrierConf(band당 한 행, ENDC_priority 등과 같은 열)에 있을 수도 있고,
-        CM Data(Cell-RU Mapping, cell-num당 한 행, ru-board-id 등과 같은 열)에 있을 수도 있어 둘 다
-        시도한다 - 먼저 CarrierConf 행에 그 열이 있으면 그 값을 쓰고, 없으면 cm_map_df_full에서
-        (eNodeBID, cell-num)으로 찾는다. 어느 쪽에도 없으면 None(=판정 불가, enabled 아님으로 처리)."""
-        if carrier_row is not None and col_name in carrier_row.index:
-            val = carrier_row.get(col_name)
-            if pd.notna(val) and str(val).strip() != '':
-                return val
-        if cell_num and not self.cm_map_df_full.empty and col_name in self.cm_map_df_full.columns:
-            sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) &
-                                       (self.cm_map_df_full['cell-num'].astype(str) == str(cell_num))]
-            if not sub.empty:
-                return sub.iloc[0][col_name]
-        return None
+    def _lookup_cell_attr(self, enodeb, cell_num, col_name):
+        """[r0-후속] eMTC/ENDC anchor 판정에 필요한 셀 속성(conf-emtc-switch/endc-anchor-type/
+        endc-support)은 병합된 CM 데이터(cm_map_df_full, eNodeBID/cell-num/Sector가 인덱스)에 있다 -
+        (SectorList+CarrierConf로 얻은) cell-num으로 여기서 조회한다. 값이 없으면 None(=판정 불가,
+        enabled 아님으로 처리)."""
+        if not cell_num or self.cm_map_df_full.empty or col_name not in self.cm_map_df_full.columns:
+            return None
+        sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) &
+                                   (self.cm_map_df_full['cell-num'].astype(str) == str(cell_num))]
+        return sub.iloc[0][col_name] if not sub.empty else None
 
-    def _is_emtc_enabled(self, carrier_row, enodeb, cell_num):
-        val = self._lookup_cell_attr(carrier_row, enodeb, cell_num, 'conf-emtc-switch')
+    def _is_emtc_enabled(self, enodeb, cell_num):
+        val = self._lookup_cell_attr(enodeb, cell_num, 'conf-emtc-switch')
         return str(val).strip().lower() in self._TRUTHY_TOKENS if val is not None else False
 
-    def _is_endc_anchor_enabled(self, carrier_row, enodeb, cell_num):
-        anchor_type = self._lookup_cell_attr(carrier_row, enodeb, cell_num, 'endc-anchor-type')
-        support_val = self._lookup_cell_attr(carrier_row, enodeb, cell_num, 'endc-support')
+    def _is_endc_anchor_enabled(self, enodeb, cell_num):
+        anchor_type = self._lookup_cell_attr(enodeb, cell_num, 'endc-anchor-type')
+        support_val = self._lookup_cell_attr(enodeb, cell_num, 'endc-support')
         if anchor_type is None or support_val is None:
             return False
         return str(anchor_type).strip().lower() == 'endc-anchor' and str(support_val).strip().lower() in self._TRUTHY_TOKENS
@@ -3437,7 +3440,7 @@ class ESAnalyzerApp(AppDashboard):
             row_for_band[b_col] = row
             cell_for_band[b_col] = row.get(target_col) if row is not None else None
 
-        enabled_cols = [b_col for b_col in present.index if is_enabled_fn(row_for_band[b_col], enodeb, cell_for_band[b_col])]
+        enabled_cols = [b_col for b_col in present.index if is_enabled_fn(enodeb, cell_for_band[b_col])]
         if not enabled_cols:
             return bands, None, None  # 이 sector엔 해당 서비스가 배치되어 있지 않음 - 규칙 미적용
 

@@ -309,9 +309,15 @@
   * **검증**: `_enforce_protected_band` 단위 테스트로 미배치/이미 보장됨/강제 조정 필요(eMTC·ENDC anchor 각각)/CarrierConf 미보유 시 cm_map_df_full 폴백까지 모두 확인. 합성 데이터로 `run_analysis`를 실제 실행해 강제 제외된 cell이 ES Level 1에서 빠지고 ES Level 7(항상 켜짐)에 포함되며 Note가 정확히 기록됨을 확인. Cell-RU 매핑은 저장 후 재시작 시 가장 최근 파일이 자동 로딩되고, 매핑 파일이 없으면 팝업이 뜨지 않음을 확인. `python -m py_compile` 통과.
   * **적용 순서**: 사용자 지시대로 `esm_r15_0.py`에 먼저 반영·검증한 뒤, 동일한 수정(Cell-RU 매핑 저장/자동 불러오기 + `_enforce_protected_band` 등 eMTC/ENDC anchor 보장 로직)을 `esm_r16_0.py`에도 그대로 포팅 완료(Deep Sleep 로직과는 독립적이라 상호작용 없음). 기존 v5.4/v5.5 회귀 테스트도 재실행해 부작용 없음을 확인. `python -m py_compile` 양쪽 파일 모두 통과.
 
+* **[v5.8 / esm_r15_0.py 우선 반영 후 esm_r16_0.py에 포팅 완료] (2026-07-09) 단순화: eMTC/ENDC anchor 속성 조회를 cm_map_df_full 단일 조회로 단순화**
+  * **배경**: v5.7에서 남겨둔 확인 필요 사항(`conf-emtc-switch`/`endc-anchor-type`/`endc-support`가 CarrierConf/CM Data 중 어디에 있는지)을 사용자가 확인: "conf-emtc-switch/endc-anchor-type/endc-support는 병합된 CM데이터에 있어. eNodeBID, cell-num, Sector 열(인덱스)을 가지고 있어서, SectorList와 CarrierConf를 이용하면, 각 cell-num-Band를 연결할 수 있고, band별 priority 값들도 연결할 수 있어." — 즉 이 세 속성은 CM Data(`cm_map_df_full`, eNodeBID+cell-num 인덱스)에만 있고, CarrierConf는 band<->cell-num 매핑과 ES priority/ENDC_priority 값만 제공.
+  * **수정**: `_lookup_cell_attr`/`_is_emtc_enabled`/`_is_endc_anchor_enabled`에서 CarrierConf 조회 분기(방어적 이중 조회)를 제거하고 `cm_map_df_full`(eNodeBID+cell-num)만 조회하도록 단순화. band<->cell-num 매핑과 priority 조회(carrier_df 기반)는 그대로 유지.
+  * **검증**: 새 데이터 모델(conf-emtc-switch 등은 cm_map_df_full에, ES priority/ENDC_priority는 carrier_df에)에 맞춰 단위 테스트를 다시 작성해 재실행 - 서비스 미배치/이미 보장됨/강제 조정(eMTC·ENDC anchor)/anchor-type 불일치·support=False 케이스 모두 통과. `run_analysis` 합성 데이터 통합 테스트도 갱신해 재확인. `python -m py_compile` 양쪽 파일 모두 통과.
+  * **적용 순서**: `esm_r15_0.py`에 먼저 반영 후 `esm_r16_0.py`에 동일 포팅.
+
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.7(`esm_r15_0.py` + `esm_r16_0.py` 모두 반영 완료) - Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 새 라운드(esm-r0-cellru-mapping 브랜치)의 두 파일 모두에 추가. 이전 v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
+* 현재 상태: v5.8(`esm_r15_0.py` + `esm_r16_0.py` 모두 반영 완료) - eMTC/ENDC anchor 속성(`conf-emtc-switch`/`endc-anchor-type`/`endc-support`) 조회처가 CM Data(`cm_map_df_full`)로 확정되어, v5.7에서 만들었던 CarrierConf 폴백 조회를 제거하고 단순화. 이전 v5.7에서 Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 새 라운드(esm-r0-cellru-mapping 브랜치)의 두 파일 모두에 추가했고, v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -324,7 +330,7 @@
   9. **다음 결정 대기(v5.4)**: 사용자가 실제 로컬 PC에서 `esm_r15.py`/`esm_r16.py`를 실행해 Input 폴더 자동 선택(파일명/헤더 규칙)과 `esm_settings.json` 저장/불러오기가 실제 CM/Traffic/Energy Stat/학습데이터 파일로도 의도대로 동작하는지, 안내 팝업 문구가 실제 상황에 적절한지 확인 필요.
   10. **다음 결정 대기(v5.5)**: 사용자가 실제로 Optimizer 실행 -> Energy Dashboard 사용 순서로 이어서 써보고, 결과가 정말 같은 `Output/<timestamp>/` 폴더에 모이는지, 반복 다운로드 시 생기는 `_2`/`_3` 폴더 분리 방식이 실사용에 괜찮은지(선호하면 파일명 index 방식으로 바꿀 수도 있음) 확인 필요(esm_r15.py/esm_r16.py 양쪽 모두).
   11. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-  12. **다음 결정 대기(v5.7, 중요)**: `conf-emtc-switch`/`endc-anchor-type`/`endc-support`가 CarrierConf(band당 한 행)와 CM Data/Cell-RU Mapping(cell-num당 한 행) 중 실제로 어느 쪽 파일에 있는 컬럼인지 사용자가 실데이터로 확인 필요 — 현재는 양쪽 다 시도하는 방어적 이중 조회(`_lookup_cell_attr`)로 구현되어 있음(esm_r15_0.py/esm_r16_0.py 둘 다 동일). eMTC 판정(`ES priority`가 가장 큰 band 선택)과 ENDC anchor 판정(`ENDC_priority`가 가장 작은 band 선택, -1 제외) 알고리즘 자체도 실데이터로 재검증 필요.
+  12. **다음 결정 대기(v5.8)**: eMTC/ENDC anchor 판정 알고리즘(eMTC: `ES priority`가 가장 큰 band 선택, ENDC anchor: `ENDC_priority`가 가장 작은 band 선택·-1 제외)을 사용자가 실데이터로 재검증 필요 — 데이터 소스(cm_map_df_full)는 확정되었으나 실제 CM Data의 `conf-emtc-switch`/`endc-anchor-type`/`endc-support` 값 표기(Enable/Disable, True/False 등)가 코드의 `_TRUTHY_TOKENS` 판정과 맞는지 확인 필요.
 * 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정)
 
 ---
