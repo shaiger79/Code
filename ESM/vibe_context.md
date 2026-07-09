@@ -285,17 +285,23 @@
   * **배경**: 사용자가 앱을 실행할 때마다 Input/Output 폴더나 각 탭 파라미터를 다시 설정하고, Traffic/Energy Stat/CM/학습데이터 파일을 드래그 앤 드롭이나 '찾기'로 매번 다시 선택하는 게 번거롭다고 요청. 조건: Input/Output 폴더 기본값은 앱이 위치한 폴더 내부의 Input/Output 폴더로, 설정 파일이 없으면 기존 하드코딩 초기값 사용, 자동 저장은 하지 말고 필요할 때만 수동으로 저장, Input 폴더의 파일도 파일명/헤더 규칙으로 자동 선택하고 실패 시 팝업으로 안내.
   * **구현**: `_app_dir()`(스크립트 또는 exe가 위치한 폴더) 기준으로 `input_dir`/`output_dir` 기본값을 `<앱 폴더>/Input`, `<앱 폴더>/Output`으로 설정. 앱 폴더의 `esm_settings.json`이 있으면 `_load_app_settings()`가 그 값과 `_SETTINGS_PARAM_NAMES`(Optimizer/Advanced Settings/Energy Dashboard/Learning 탭의 주요 파라미터, 파일 경로는 제외)를 덮어씀 - 파일이 없으면 기존 초기값 그대로. 저장은 Data I/O 탭의 "현재 설정을 기본값으로 저장" 버튼(`_save_app_settings()`)에서만 수동으로 발생. `_auto_select_input_files()`가 앱 구동 시 Input 폴더를 스캔해 CM Data(확장자), Traffic/Energy Stat Data(기존 `handle_file_drop`과 동일한 파일명 키워드 규칙), Cell/RU 단위 학습데이터(기존 `_classify_learning_files_drop`과 동일한 CSV 헤더 컬럼 시그니처, 공통 로직은 `_sniff_learning_csv_kind`로 분리)를 자동으로 채워줌 - 항목별 후보가 정확히 1개일 때만 자동 선택하고, 0개/2개 이상이면 자동 선택하지 않고 팝업 하나로 모아서 안내. `_make_output_dir`/`run_analysis`/Traffic Pattern 저장 로직의 출력 폴더 기준도 `os.getcwd()`에서 `self.output_dir`로 통일.
   * **검증**: 임시 폴더에 실제 스키마를 반영한 샘플 파일(CM 확장자, Traffic/Energy Stat CSV - Energy Stat은 실제 컬럼명인 `RuPowerTot`/`RuPowerCnt` 사용, Cell/RU 학습데이터 CSV)을 두고 `ESAnalyzerApp`을 실제로 생성해 5개 파일이 모두 정확히 자동 선택되고 경고 팝업이 뜨지 않음을 확인. 파라미터를 바꾸고 저장한 뒤 새 인스턴스를 생성해 Input/Output 폴더와 파라미터가 정확히 재로딩됨을 확인. CM 파일 후보를 2개로 만들었을 때는 자동 선택하지 않고 정확히 그 항목만 안내 팝업에 포함됨을 확인. `python -m py_compile` 통과.
-  * **적용 범위**: `esm_r16.py`에만 적용(Deep Sleep처럼 새 편의 기능이므로 esm_r15.py에는 포팅하지 않음). Input 폴더가 아직 없으면(사용자가 아직 Input 폴더를 만들지 않은 경우) 경고 팝업만 띄우고 정상 구동.
+  * **적용 범위**: 최초 반영은 `esm_r16.py`에만(Deep Sleep과 같은 전례로 판단) — 이후 v5.6에서 사용자가 "r16의 차별화 포인트는 Deep Sleep뿐"이라며 `esm_r15.py`에도 포팅 요청, 반영 완료. Input 폴더가 아직 없으면(사용자가 아직 Input 폴더를 만들지 않은 경우) 경고 팝업만 띄우고 정상 구동.
 
 * **[v5.5 / esm_r16.py 전용] (2026-07-09) 기능 개선: Optimizer와 Energy Dashboard/Learning 결과를 같은 Output 타임스탬프 폴더로 통합 + 같은 종류의 결과를 반복 다운로드해도 서로 덮어쓰지 않도록 폴더 분리**
   * **배경**: ES Policy Optimizer 실행 후 Energy Dashboard(에너지 분석/절감효과 예측/ES Level 시뮬레이션)를 이어서 쓰는 게 정상적인 순차 워크플로우인데, `run_analysis`(Optimizer)와 `_make_output_dir`(Energy Dashboard/Learning 다운로드 공용)이 각자 새 타임스탬프를 만들어 결과가 서로 다른 `Output/<timestamp>/` 폴더에 흩어지는 문제를 사용자가 지적. 또한 Energy Dashboard에서 조합(eNodeBID/Sector/시뮬레이션 조건 등)을 바꿔가며 같은 종류의 결과를 반복 다운로드하면 같은 폴더의 같은 파일명에 매번 덮어써지는 문제도 함께 요청 — 해결 방식은 파일명에 index를 붙이거나 폴더 이름을 다르게 하거나 둘 중 편한 쪽으로 일임.
   * **수정**: `self.latest_run_timestamp`를 신설해 `run_analysis` 실행 시점의 타임스탬프를 기록하고, `_make_output_dir`은 자체적으로 새 타임스탬프를 만들지 않고 이 값을 재사용(Optimizer 미실행 시 첫 호출이 새로 만들고 이후 호출들이 그대로 따름) — Optimizer -> Energy Dashboard/Learning 순서로 이어지는 한 세션의 모든 결과가 하나의 `Output/<timestamp>/` 폴더에 모임. 폴더 충돌은 파일명 index 대신 폴더 이름을 다르게 하는 방식을 선택 — 같은 타임스탬프 폴더 안에서 subfolder(예: `ESLevelSimulation`)가 이미 있으면 `ESLevelSimulation_2`, `_3`…으로 자동으로 새 폴더를 만듦(다운로드 하나가 여러 파일을 한 번에 저장하는 경우가 있어 폴더 단위 분리가 더 간단·일관적).
   * **검증**: `latest_run_timestamp`를 미리 지정한 상태에서 여러 subfolder로 `_make_output_dir`을 호출해 모두 같은 타임스탬프 폴더 아래 생성됨을 확인. 같은 subfolder를 반복 호출하면 `_2`, `_3`으로 이어지며 서로 다른 폴더가 만들어짐을 확인. Optimizer 미실행 상태에서는 첫 호출이 새 타임스탬프를 만들고 이후 호출들이 그 값을 재사용함을 확인. `python -m py_compile` 통과.
-  * **적용 범위**: `esm_r16.py`에만 적용(v5.4와 같은 이유 — esm_r15.py에는 포팅하지 않음).
+  * **적용 범위**: 최초 반영은 `esm_r16.py`에만 — 이후 v5.6에서 `esm_r15.py`에도 함께 포팅 완료(아래 참고).
+
+* **[v5.6 / esm_r15.py로 포팅] (2026-07-09) v5.4·v5.5 편의 기능을 esm_r15.py에도 동일하게 반영**
+  * **배경**: 사용자가 "r_15에도 이번 편의기능들을 적용해줘. r_16의 차별화 포인트는 Deep sleep 반영이니까 말야"라고 요청 — v5.4(설정 저장/자동 불러오기 + Input 폴더 파일 자동 선택)와 v5.5(Optimizer/Energy Dashboard Output 폴더 통합 + 반복 다운로드 폴더 분리)는 Deep Sleep과 무관한 범용 편의 기능이므로, esm_r16.py만의 차별화 요소(Deep Sleep)와 분리해 두 파일 모두에 반영해야 한다는 취지.
+  * **수정**: esm_r16.py의 `_SETTINGS_PARAM_NAMES`, `input_dir`/`output_dir`/`latest_run_timestamp` 상태 변수, `_app_dir`/`_settings_path`/`_load_app_settings`/`_save_app_settings`/`_browse_dir`/`_sniff_learning_csv_kind`/`_auto_select_input_files` 메서드, Data I/O 탭의 Input/Output 폴더 UI + 저장 버튼, `_make_output_dir`의 타임스탬프 재사용·폴더 분리 로직, `run_analysis`의 `latest_run_timestamp` 기록, `_classify_learning_files_drop`의 `_sniff_learning_csv_kind` 재사용 리팩터링을 코드 그대로 `esm_r15.py`에 포팅(Deep Sleep 관련 코드는 esm_r15.py에 애초에 없으므로 그 부분만 자연히 제외됨).
+  * **검증**: esm_r16.py에서 쓴 것과 동일한 두 벌의 테스트(Input 폴더 자동 선택 5종 + 설정 저장/재로딩 + CM 파일 후보 2개 시 안내, `_make_output_dir` 타임스탬프 공유 + 반복 호출 시 `_2`/`_3` 폴더 분리)를 esm_r15.py를 대상으로 재실행해 모두 동일하게 통과함을 확인. `python -m py_compile` 통과.
+  * **적용 범위**: `esm_r15.py` + `esm_r16.py` 모두. 이제 두 파일의 유일한 기능 차이는 Deep Sleep(esm_r16.py 전용)뿐.
 
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.5(`esm_r16.py` 전용) - Optimizer 실행 결과와 이어지는 Energy Dashboard/Learning 다운로드 결과가 같은 `Output/<timestamp>/` 폴더에 모이도록 통합하고, 같은 종류의 결과를 반복 다운로드해도 폴더 이름이 자동으로 나뉘어(`_2`, `_3`…) 서로 덮어쓰지 않게 함. 이전 v5.4(`esm_r16.py` 전용)에서 Input/Output 폴더와 각 탭 파라미터 초기값을 `esm_settings.json`으로 저장/자동 불러오기하고 Input 폴더에서 파일을 자동 선택하는 기능을 추가했고, v5.3(`esm_r15.py`+`esm_r16.py`)에서 ES Level 시뮬레이션의 PRB 조건(%→원시 RB 단위)과 Tput 조건(kbps→Mbps) 단위 불일치를 양쪽 파일 모두 수정했고, v5.2(`esm_r15.py`+`esm_r16.py`)에서 IpThruThpDLTime<=0/NaN 행 통째 제외 버그를 수정했고, v5.1에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
+* 현재 상태: v5.6(`esm_r15.py` + `esm_r16.py` 모두 반영 완료) - v5.4(설정 저장/자동 불러오기 + Input 폴더 파일 자동 선택)와 v5.5(Optimizer/Energy Dashboard Output 폴더 통합 + 반복 다운로드 폴더 분리) 편의 기능을 esm_r16.py에 이어 esm_r15.py에도 동일하게 포팅 — 이제 두 파일의 유일한 기능 차이는 Deep Sleep(esm_r16.py 전용)뿐. v5.3(`esm_r15.py`+`esm_r16.py`)에서 ES Level 시뮬레이션의 PRB 조건(%→원시 RB 단위)과 Tput 조건(kbps→Mbps) 단위 불일치를 양쪽 파일 모두 수정했고, v5.2(`esm_r15.py`+`esm_r16.py`)에서 IpThruThpDLTime<=0/NaN 행 통째 제외 버그를 수정했고, v5.1에서 "시뮬레이션 수행 기간"과 "평가 기간"을 별개 설정으로 분리했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -305,8 +311,8 @@
   6. **다음 결정 대기(v4.2)**: 사용자가 실제 데이터로 Mode 1/2/3 비교 결과를 검토한 뒤 — (a) 최종적으로 어느 모드를 기본으로 채택할지, (b) Initial level을 0이 아닌 값으로 최적화하는 기능을 다음 라운드에 결정.
   7. **다음 결정 대기(v5.0)**: 사용자가 Dual Band RU(RU HW 1개에 ru-port-id 2개)를 어떻게 식별/처리할지 방법을 알려줄 예정 — 현재는 Single Band RU만 지원.
   8. **다음 결정 대기(v5.3)**: 사용자가 실데이터로 재확인해 다른 Sector들도 이제 ES level이 정상적으로 적용되는지 검증 필요(esm_r15.py/esm_r16.py 양쪽 모두).
-  9. **다음 결정 대기(v5.4)**: 사용자가 실제 로컬 PC에서 `esm_r16.py`를 실행해 Input 폴더 자동 선택(파일명/헤더 규칙)과 `esm_settings.json` 저장/불러오기가 실제 CM/Traffic/Energy Stat/학습데이터 파일로도 의도대로 동작하는지, 안내 팝업 문구가 실제 상황에 적절한지 확인 필요.
-  10. **다음 결정 대기(v5.5)**: 사용자가 실제로 Optimizer 실행 -> Energy Dashboard 사용 순서로 이어서 써보고, 결과가 정말 같은 `Output/<timestamp>/` 폴더에 모이는지, 반복 다운로드 시 생기는 `_2`/`_3` 폴더 분리 방식이 실사용에 괜찮은지(선호하면 파일명 index 방식으로 바꿀 수도 있음) 확인 필요.
+  9. **다음 결정 대기(v5.4)**: 사용자가 실제 로컬 PC에서 `esm_r15.py`/`esm_r16.py`를 실행해 Input 폴더 자동 선택(파일명/헤더 규칙)과 `esm_settings.json` 저장/불러오기가 실제 CM/Traffic/Energy Stat/학습데이터 파일로도 의도대로 동작하는지, 안내 팝업 문구가 실제 상황에 적절한지 확인 필요.
+  10. **다음 결정 대기(v5.5)**: 사용자가 실제로 Optimizer 실행 -> Energy Dashboard 사용 순서로 이어서 써보고, 결과가 정말 같은 `Output/<timestamp>/` 폴더에 모이는지, 반복 다운로드 시 생기는 `_2`/`_3` 폴더 분리 방식이 실사용에 괜찮은지(선호하면 파일명 index 방식으로 바꿀 수도 있음) 확인 필요(esm_r15.py/esm_r16.py 양쪽 모두).
   11. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
 * 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정)
 
