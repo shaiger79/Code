@@ -406,6 +406,23 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
   - **검증**: esm_r15_0.py와 동일한 테스트(ES 정책 있는 sector 1개 + 없는 sector 2개, summary_df가
     완전히 비어있는 경우 포함)를 이 파일(Deep Sleep 컬럼 포함)에 대해 재실행해 모두 통과함을 확인.
     `python -m py_compile` 통과.
+
+[r0-후속3] (esm_r15_0.py에서 먼저 확인된 수정을 그대로 포팅) 버그 수정 + 기능 개선: ES 윈도우 진입 시
+최소 1스텝 ES 미적용 강제 문제 수정 + RBlow를 CoveragePriority 기반 Coverage band 선택으로 변경:
+  - **배경**: esm_r15_0.py와 동일 - (1) `_run_es_level_simulation`이 윈도우 진입 첫 스텝마다 이미
+    연속적으로 갱신되어 온 IIR 값을 확인하지도 않고 무조건 Level 0으로 고정해, 매 윈도우(=거의 매일)
+    마다 "ES 미적용 1 sample"이 반복 발생하던 문제. (2) RBlow가 CoveragePriority로 Coverage band를
+    고르긴 했지만 그 band를 ES 적용대상에서 실제로 제외하지 않아 Coverage 기준 band 자체가 ES로 꺼질
+    수 있던 모순.
+  - **수정**: esm_r15_0.py와 완전히 동일 - 윈도우 진입 첫 스텝을 curr=0으로 취급하되 직전 15분의 연속
+    IIR로 Entering 조건을 즉시 평가해 조건 충족 시 그 스텝부터 바로 Level 1 진입(무조건 1스텝 대기
+    제거). 시뮬레이션 구간의 맨 첫 행(i=0)은 그 행 자체의 raw 값(00:00 값)으로 동일하게 판단. 새
+    헬퍼 `_select_coverage_band()`가 eMTC/ENDC anchor 강제 조정 다음 순서로 CoveragePriority 기준
+    Coverage band를 선택하고 RB>0이면 강제로 ES 적용대상에서 제외, `rb_low = coverage_rb * rb_mult`로
+    계산. 기존 `present_bands_names`/`cov_candidates`/`cov_sorted`/`cov_band_rb` 블록은 제거.
+  - **검증**: esm_r15_0.py와 동일한 테스트(윈도우 진입 4케이스, Coverage band 선택 4케이스,
+    `run_analysis` 통합 테스트, 기존 eMTC/ENDC anchor·전 SectorList 포함 회귀 테스트)를 이 파일에
+    대해 재실행해 모두 동일하게 통과함을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -2417,8 +2434,15 @@ class ESAnalyzerApp(AppDashboard):
     def _run_es_level_simulation(self, sim_raw_df, eval_start_date=None, eval_end_date=None, eval_hours=None):
         """[r15] Rawdata(_build_rawdata_for_period 결과, 15분 단위 raw 트래픽 + 레벨별 임계값/예측치 열 포함)를
         받아 (eNodeBID, Sector) 셀 단위로 15분 스텝마다 ES level을 결정해 나가는 시간별 시뮬레이션을 수행한다.
-        - ES_Window_Index==0(운영 윈도우 밖) 시간, 또는 직전 스텝과 윈도우가 바뀌는 첫 스텝은 Level을
-          0(Initial level, 아직 최적화 대상 아님 - 고정)으로 재시작하고 IIR만 raw 값으로 계속 갱신한다.
+        - ES_Window_Index==0(운영 윈도우 밖) 시간은 Level을 0(Initial level)으로 강제하고 IIR만 raw 값으로
+          계속 갱신한다. 직전 스텝과 윈도우가 바뀌는 첫 스텝(윈도우 진입)은 [단위 수정, r0-후속3] curr를
+          무조건 0으로 취급하되(그 윈도우/직전 상태의 레벨을 그대로 이어받지 않음) - IIR 자체는 윈도우
+          경계와 무관하게 전체 기간 연속으로 갱신되고 있으므로, 그 IIR 값(직전 15분 값)으로 Entering
+          조건을 즉시 평가해 조건이 이미 충족되어 있으면 그 첫 스텝부터 바로 Level 1로 진입한다(무조건
+          Level 0에서 최소 1스텝은 대기해야 했던 기존 동작 수정 - 많은 sector에서 "ES 미적용 시간이 1
+          time sample만 잡히는" 패턴의 원인이었음). 시뮬레이션 구간의 맨 첫 행(i=0, 참조할 이전 IIR이
+          아예 없음)도 마찬가지로 win_idx[0]!=0이면 그 행 자체의 raw 값(=시작일 00:00 값)을 기준으로
+          Level 1 진입 여부를 판단한다.
         - 같은 윈도우 안에서는: 1) 감소(Leaving 조건, IIR 기준) -> 2) 증가(Entering 조건, Tput은 raw,
           PRB는 IIR 기준) -> 3) 유지 순으로 판정.
         - 레벨이 적용된 스텝의 cmIPTput은 raw 값 대신 max(cmIPTput*(1-DRB_L(레벨)/(total_rb-UsedRB)), 0)로
@@ -2483,9 +2507,20 @@ class ESAnalyzerApp(AppDashboard):
             rb_iir = np.zeros(n_rows)
             tput_violation = np.zeros(n_rows, dtype=bool)
 
-            cm_input[0] = 0.0 if np.isnan(raw_cm[0]) else raw_cm[0]  # level[0]=0(Initial level) -> 보정 없음
+            cm_input[0] = 0.0 if np.isnan(raw_cm[0]) else raw_cm[0]  # 참조할 이전 IIR이 없으므로 보정 없이 raw 그대로 시드
             cm_iir[0] = cm_input[0]
             rb_iir[0] = 0.0 if np.isnan(raw_rb[0]) else raw_rb[0]
+
+            # [r0-후속3] 맨 첫 행이 이미 ES 운영 윈도우 안이면(win_idx[0] != 0), 참조할 "직전" IIR이 없으므로
+            # 이 행 자체의 raw 값(=시작일 00:00 값)을 기준으로 Level 1 진입 여부를 판단한다 - 무조건
+            # Level 0으로 시작해 다음 스텝까지 기다리게 하지 않는다.
+            if not np.isnan(raw_cm[0]) and int(win_idx[0]) != 0 and max_n >= 1:
+                if (pred_col[1][0] >= ent_tput[1][0]) and (rb_iir[0] <= rb_th_col[1][0]):
+                    level[0] = 1
+                    drb_n = drb_col[1][0]
+                    margin = total_rb - raw_usedrb[0]
+                    cm_input[0] = 0.0 if margin <= 0 else max(raw_cm[0] * (1 - drb_n / margin), 0.0)
+                    cm_iir[0] = cm_input[0]
 
             for i in range(1, n_rows):
                 if np.isnan(raw_cm[i]):
@@ -2498,10 +2533,15 @@ class ESAnalyzerApp(AppDashboard):
                     rb_iir[i] = rb_iir[i - 1]
                     continue
                 w_prev, w_now = int(win_idx[i - 1]), int(win_idx[i])
-                if w_now == 0 or w_prev != w_now:
-                    nxt = 0  # ES 미운영 시간 또는 새 윈도우 진입 -> Initial level(0)로 재시작
+                if w_now == 0:
+                    nxt = 0  # ES 미운영 시간 -> Initial level(0)
                 else:
-                    curr = int(level[i - 1])
+                    # [r0-후속3] 윈도우가 바뀌는 첫 스텝(w_prev != w_now)은 curr를 무조건 0(Initial level)으로
+                    # 취급한다(직전 윈도우/구간의 레벨을 그대로 이어받지 않음) - 단, IIR 자체는 윈도우
+                    # 경계와 무관하게 전체 기간 연속으로 갱신되어 온 값이므로, 그 직전 15분 IIR로 바로 아래
+                    # Entering 조건을 평가해 조건이 이미 충족되어 있으면 이 첫 스텝부터 바로 Level 1로
+                    # 진입한다(예전에는 윈도우 진입 시 조건과 무관하게 항상 Level 0으로 1스텝 대기했음).
+                    curr = 0 if w_prev != w_now else int(level[i - 1])
                     cm_prev, rb_prev = cm_iir[i - 1], rb_iir[i - 1]
                     nxt, decided = curr, False
                     if curr > 0:
@@ -3517,6 +3557,49 @@ class ESAnalyzerApp(AppDashboard):
         bands[forced_col] = -abs(bands[forced_col])
         return bands, forced_col, cell_for_band[forced_col]
 
+    def _select_coverage_band(self, bands, carrier_df):
+        """[r0-후속3] RBlow 계산 기준이 되는 Coverage band를 CarrierConf의 `CoveragePriority` 기준으로
+        선택한다(eMTC/ENDC anchor와 유사한 발상이지만, "이미 보장된 cell이 있는지"를 먼저 확인하는 게
+        아니라 present band 중 CoveragePriority가 가장 낮은(=가장 높은 우선순위) band를 그냥 그대로
+        선택한다는 점이 다르다 - Coverage band는 서비스 on/off 플래그가 아니라 우선순위 하나로 결정되는
+        단일 대표 band이기 때문). 동률이면 기존 로직과 동일하게 `ES capability` -> `ES priority` 순으로
+        타이브레이크한다.
+        선택된 band는 RBlow 계산의 기준이자 "이 band에는 ES를 적용하면 안 된다"는 요구사항에 따라, 이미
+        RB<0(ES 미적용)이면 그대로 두고 RB>0(ES 적용대상)이면 강제로 RB<0으로 전환해 ES 적용대상에서
+        제외한다.
+        반환: (bands, coverage_rb, forced_band_col_or_None) - coverage_rb는 선택된 band의 nRB
+        절대값(present band가 하나도 없으면 0)."""
+        present = bands[bands != 0]
+        if present.empty:
+            return bands, 0.0, None
+
+        row_for_band = {}
+        for b_col in present.index:
+            matches = carrier_df.loc[carrier_df['band'].astype(str) == b_col]
+            row_for_band[b_col] = matches.iloc[0] if not matches.empty else None
+
+        def _num(b_col, col_name):
+            row = row_for_band[b_col]
+            if row is None: return np.nan
+            v = pd.to_numeric(row.get(col_name), errors='coerce')
+            return v if pd.notna(v) else np.nan
+
+        def _sort_key(b_col):
+            cov = _num(b_col, 'CoveragePriority')
+            cap = _num(b_col, 'ES capability')
+            pri = _num(b_col, 'ES priority')
+            return (cov if pd.notna(cov) else 999, cap if pd.notna(cap) else 999, pri if pd.notna(pri) else 999)
+
+        coverage_col = sorted(present.index, key=_sort_key)[0]
+        coverage_rb = abs(bands[coverage_col])
+
+        forced_col = None
+        if bands[coverage_col] > 0:
+            bands = bands.copy()
+            bands[coverage_col] = -abs(bands[coverage_col])
+            forced_col = coverage_col
+        return bands, coverage_rb, forced_col
+
     def run_analysis(self):
         if not self.traffic_file.get(): return messagebox.showerror("오류", "Traffic Data 파일을 선택해주세요.")
 
@@ -3617,6 +3700,16 @@ class ESAnalyzerApp(AppDashboard):
                 if endc_forced_col:
                     protection_notes.append(f"ENDC anchor 서비스 보장을 위해 Band {endc_forced_col.replace('B', '')}"
                                              f"(cell-num {endc_forced_cell})를 ES 적용대상에서 제외함(ES 적용대상 cell 수 1개 감소).")
+
+                # [r0-후속3] Coverage band를 CarrierConf의 CoveragePriority 기준으로 선택 - RBlow는
+                # 더 이상 고정값이 아니라 이 band의 nRB * RBlow multiplier_lte로 계산하고, 선택된 band는
+                # ES 적용대상에서 제외한다(eMTC/ENDC anchor와 동일하게 "이 band에는 ES를 적용하면 안 됨").
+                bands, coverage_rb, coverage_forced_col = self._select_coverage_band(bands, carrier_df)
+                if coverage_forced_col:
+                    protection_notes.append(f"Coverage band 보장을 위해 Band {coverage_forced_col.replace('B', '')}를 "
+                                             f"ES 적용대상에서 제외함(RBlow 산정 기준 band, ES 적용대상 cell 수 1개 감소).")
+                rb_low = np.ceil(coverage_rb * rb_mult)
+
                 sector_note = " ".join(protection_notes)
 
                 positive_bands_series = bands[bands > 0]
@@ -3636,14 +3729,6 @@ class ESAnalyzerApp(AppDashboard):
                 valid_mask = ((group['UsedRB_t_adj'] > 0) & (group['AirMacDLByte'].notna()) & (group['IpThruThpVoDLByte'].notna()))
                 group = group[valid_mask]
                 if group.empty: continue
-
-                present_bands_names = bands[bands != 0].index.tolist()
-                cov_candidates = carrier_df[carrier_df['band'].astype(str).isin(present_bands_names)].copy()
-                cov_band_rb = 0
-                cov_sorted = cov_candidates.sort_values(by=['CoveragePriority', 'ES capability', 'ES priority'])
-                if not cov_sorted.empty:
-                    cov_band_rb = abs(bands.get(str(cov_sorted.iloc[0]['band']), 0))
-                rb_low = np.ceil(cov_band_rb * rb_mult)
 
                 group['SP'] = (group['AirMacDLByte'] * 8) / (900 * group['UsedRB_t_adj'])
                 dl_time_safe = group['IpThruThpDLTime'].where(group['IpThruThpDLTime'] > 0)
