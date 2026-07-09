@@ -303,15 +303,15 @@
 
 * **[라운드 전환] (2026-07-09)** 사용자 지시로 새 브랜치 `esm-r0-cellru-mapping`을 만들고 `esm_r15.py`→`esm_r15_0.py`, `esm_r16.py`→`esm_r16_0.py`로 파일명을 변경(순수 rename + 모듈 docstring 타이틀/출처 한 줄만 수정, 기능 변경 없음). 이 시점부터의 신규 작업은 `esm_r15_0.py`/`esm_r16_0.py`에 반영하고, `esm_r15.py`/`esm_r16.py`는 이전 라운드 상태로 그대로 둔다(브랜치 `new-version`에 보존).
 
-* **[v5.7 / esm_r15_0.py 우선 반영, esm_r16_0.py는 다음 포팅 예정] (2026-07-09) 기능 추가: Cell-RU 매핑 저장/자동 불러오기 + eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정**
+* **[v5.7 / esm_r15_0.py 우선 반영 후 esm_r16_0.py에 포팅 완료] (2026-07-09) 기능 추가: Cell-RU 매핑 저장/자동 불러오기 + eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정**
   * **배경**: 새 라운드에서 사용자가 두 가지 기능을 요청. (1) Data I/O 탭에서 생성하는 Cell-RU 매핑 정보(`cm_map_df_full`)를 파일로 저장해 Input 폴더에 두고, 앱 구동 시 자동으로(동일 이름이 여러 개면 타임스탬프 기준 최신 것) 불러오면서 불러온 경우에만 팝업으로 안내. (2) Optimizer가 ES 정책을 생성할 때 eMTC 서비스와 ENDC anchor 서비스가 각각 최소 하나의 cell에서는 항상 유지되도록(ES 미적용) 보장하는 규칙 — SectorList+CarrierConf로 추출한 cell-num 중 해당 서비스가 켜진 cell이 있는데 이미 RB<0(ES 미적용)인 것이 하나도 없으면, RB>0(ES 적용대상)이고 서비스가 켜진 band 중 우선순위 기준(eMTC: ES priority가 가장 큰 것, ENDC anchor: ENDC_priority가 가장 작은 것 중 -1 제외)으로 하나를 골라 강제로 ES capability 0으로 간주하고, ESM Output에 Note로 기록.
   * **구현**: `_save_cellru_mapping_file()`/`_auto_load_cellru_mapping()`(파일명 `CellRUMapping_<%Y%m%d_%H%M%S>.json`, Input 폴더, 문자열 정렬=시간순 정렬 활용), `run_analysis`에 삽입된 공통 헬퍼 `_enforce_protected_band()`(+`_is_emtc_enabled`/`_is_endc_anchor_enabled`/`_lookup_cell_attr`). eMTC/ENDC anchor 속성(`conf-emtc-switch`/`endc-anchor-type`/`endc-support`)이 CarrierConf(band당 한 행)에 있는지 CM Data/Cell-RU Mapping(cell-num당 한 행)에 있는지 확실치 않아, CarrierConf 행을 먼저 보고 없으면 `cm_map_df_full`에서 (eNodeBID, cell-num)으로 찾는 이중 조회로 방어적으로 구현 — **실데이터로 확인 후 필요하면 한쪽으로 단순화 필요(확인 필요 목록에 추가)**. band 매칭은 기존 `_get_target_cells_str`와 동일하게 SectorList의 Band 컬럼명(예: "B1")을 그대로 사용(기존 DSS 매칭의 'B' 접두어 제거 방식과는 다른 컨벤션 - Target Cell Num 추출이 이미 이 방식으로 동작 중이라 그에 맞춤).
   * **검증**: `_enforce_protected_band` 단위 테스트로 미배치/이미 보장됨/강제 조정 필요(eMTC·ENDC anchor 각각)/CarrierConf 미보유 시 cm_map_df_full 폴백까지 모두 확인. 합성 데이터로 `run_analysis`를 실제 실행해 강제 제외된 cell이 ES Level 1에서 빠지고 ES Level 7(항상 켜짐)에 포함되며 Note가 정확히 기록됨을 확인. Cell-RU 매핑은 저장 후 재시작 시 가장 최근 파일이 자동 로딩되고, 매핑 파일이 없으면 팝업이 뜨지 않음을 확인. `python -m py_compile` 통과.
-  * **적용 순서**: 사용자 지시대로 `esm_r15_0.py`에 먼저 반영·검증. `esm_r16_0.py`에는 다음 라운드에 동일 수정을 포팅 예정(Deep Sleep 로직과는 독립적).
+  * **적용 순서**: 사용자 지시대로 `esm_r15_0.py`에 먼저 반영·검증한 뒤, 동일한 수정(Cell-RU 매핑 저장/자동 불러오기 + `_enforce_protected_band` 등 eMTC/ENDC anchor 보장 로직)을 `esm_r16_0.py`에도 그대로 포팅 완료(Deep Sleep 로직과는 독립적이라 상호작용 없음). 기존 v5.4/v5.5 회귀 테스트도 재실행해 부작용 없음을 확인. `python -m py_compile` 양쪽 파일 모두 통과.
 
 ## 5. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
-* 현재 상태: v5.7(`esm_r15_0.py`만 우선 반영) - Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 추가. **`esm_r16_0.py`에는 아직 미반영 — 다음 라운드에 포팅 필요.** 이전 v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
+* 현재 상태: v5.7(`esm_r15_0.py` + `esm_r16_0.py` 모두 반영 완료) - Cell-RU 매핑 저장/자동 불러오기 기능과 eMTC/ENDC anchor 서비스 보장을 위한 ES 적용대상 band 강제 조정 규칙을 새 라운드(esm-r0-cellru-mapping 브랜치)의 두 파일 모두에 추가. 이전 v5.6(`esm_r15.py`+`esm_r16.py`, 구 라운드)에서 설정 자동 저장/불러오기 + Input 폴더 파일 자동 선택 + Output 폴더 통합 편의 기능을 양쪽 파일 모두에 반영하며 구 라운드를 마무리했고, v5.3에서 ES Level 시뮬레이션의 PRB/Tput 단위 불일치를 수정했고, v5.0(`esm_r16.py`)에서 Deep Sleep 기능을 신규 추가하며 여기까지 도달.
 * 확인 필요:
   1. Google Drive(`VibeCoding/ESM`) 저장 방식 — 사용자가 스킵 요청, 추후 처리 방법 논의 필요.
   2. 실제 Cell 단위/RU 단위 학습데이터 CSV의 실제 컬럼명이 `_parse_learning_cell_file()`/`_parse_learning_ru_file()`의 매핑 규칙과 맞는지, CM의 `PA-shared-cell` 컬럼명이 실제와 일치하는지 실데이터로 확인 필요.
@@ -324,9 +324,8 @@
   9. **다음 결정 대기(v5.4)**: 사용자가 실제 로컬 PC에서 `esm_r15.py`/`esm_r16.py`를 실행해 Input 폴더 자동 선택(파일명/헤더 규칙)과 `esm_settings.json` 저장/불러오기가 실제 CM/Traffic/Energy Stat/학습데이터 파일로도 의도대로 동작하는지, 안내 팝업 문구가 실제 상황에 적절한지 확인 필요.
   10. **다음 결정 대기(v5.5)**: 사용자가 실제로 Optimizer 실행 -> Energy Dashboard 사용 순서로 이어서 써보고, 결과가 정말 같은 `Output/<timestamp>/` 폴더에 모이는지, 반복 다운로드 시 생기는 `_2`/`_3` 폴더 분리 방식이 실사용에 괜찮은지(선호하면 파일명 index 방식으로 바꿀 수도 있음) 확인 필요(esm_r15.py/esm_r16.py 양쪽 모두).
   11. **Energy Dashboard 연동 보류 중(기존)**: Learning Energy Curve 학습 결과(Idle/PA off 보정값, 채택된 Energy Curve 모델)를 절감 예측 로직에 반영할지는 별도로 대기 중.
-  12. **다음 필수 작업(v5.7)**: `esm_r16_0.py`에 이번 Cell-RU 매핑 저장/자동 불러오기 + eMTC/ENDC anchor 보장 규칙을 포팅해야 함.
-  13. **다음 결정 대기(v5.7, 중요)**: `conf-emtc-switch`/`endc-anchor-type`/`endc-support`가 CarrierConf(band당 한 행)와 CM Data/Cell-RU Mapping(cell-num당 한 행) 중 실제로 어느 쪽 파일에 있는 컬럼인지 사용자가 실데이터로 확인 필요 — 현재는 양쪽 다 시도하는 방어적 이중 조회(`_lookup_cell_attr`)로 구현되어 있음. eMTC 판정(`ES priority`가 가장 큰 band 선택)과 ENDC anchor 판정(`ENDC_priority`가 가장 작은 band 선택, -1 제외) 알고리즘 자체도 실데이터로 재검증 필요.
-* 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정 — `esm_r16_0.py`에서 계속 반영)
+  12. **다음 결정 대기(v5.7, 중요)**: `conf-emtc-switch`/`endc-anchor-type`/`endc-support`가 CarrierConf(band당 한 행)와 CM Data/Cell-RU Mapping(cell-num당 한 행) 중 실제로 어느 쪽 파일에 있는 컬럼인지 사용자가 실데이터로 확인 필요 — 현재는 양쪽 다 시도하는 방어적 이중 조회(`_lookup_cell_attr`)로 구현되어 있음(esm_r15_0.py/esm_r16_0.py 둘 다 동일). eMTC 판정(`ES priority`가 가장 큰 band 선택)과 ENDC anchor 판정(`ENDC_priority`가 가장 작은 band 선택, -1 제외) 알고리즘 자체도 실데이터로 재검증 필요.
+* 다음 대기 작업: (사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정)
 
 ---
 *Last Updated: 2026-07-09*
