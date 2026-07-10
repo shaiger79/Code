@@ -124,9 +124,27 @@
   * **검증**: 기존 정상 데이터 시나리오(140/40, 70/0, fallback 30) 값 불변 확인(대수적으로 동일 - 클램프는
     비정상 데이터에서만 차이). PA off<Deep/Super Sleep 잘못된 스펙으로 절감/보너스가 0 clamp되고 음수가
     안 됨을 확인. DS Count가 Wh 계산의 eligible_steps와 정확히 일치함을 확인. `python -m py_compile` 통과.
-  * **사용자 확인 필요**: "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"을 기존
-    `Applied_ES_Level > k`(현재보다 낮은 모든 레벨 대상) 판정과 동일하게 해석했음 - "정확히 한 단계
-    아래만" 의도였다면 알려주면 좁히겠음(esm_r17.py 상단 [v17.3] 항목에도 동일 메모).
+  * **사용자 확인 결과 → [v17.4]에서 수정**: "하나 낮은 레벨까지만 대상"은 `Applied_ES_Level > k` 판정
+    자체가 아니라, 그룹의 "전체가 꺼져있는지" 판정에 있던 실제 버그를 가리키는 코멘트였음.
+
+* **[v17.4] (2026-07-10) Deep Sleep 그룹 판정 버그 수정: 그룹 멤버가 '지금 이 순간의 현재 최고 레벨'이면 그룹 전체 Deep Sleep 불가**
+  * **사용자 예시**: 현재 ES Level 4가 적용 중, Level 1~3의 Target Cell은 이미 꺼져 있음(Deep Sleep
+    후보). Level 2,3의 Deep Sleep Capability=3, Level 1의 Deep Sleep Capability=6, **Level 4(현재 최고
+    레벨) 자신도 Deep Sleep Capability=6** — 이 경우 gid=3인 Level 2,3만 Deep Sleep 가능하고 gid=6인
+    Level 1은 불가능(공유 RU가 Level 4의 fallback 위험에 묶여 있으므로).
+  * **버그**: `_group_all_off_series`가 멤버 `(sector, off_level)`마다 `Applied_ES_Level >= off_level`을
+    검사했는데, `>=`는 "그 sector가 지금 정확히 그 레벨"(=그 멤버가 바로 지금의 현재 최고 레벨)인
+    경우도 "안전하게 꺼짐"으로 잘못 통과시켰음 — 위 예시에서 Level 4 멤버가 이 조건을 만족해버려
+    그룹 gid=6이 잘못 "전체 꺼짐"으로 판정되고 Level 1에 부당하게 보너스가 붙고 있었음.
+  * **수정**: `>=` → `>`(엄격 초과)로 변경 — `passed_k = sector_level > k`와 동일한 기준으로 통일. 부작용
+    (의도된 정상 동작): 어떤 sector의 특정 레벨이 그 sector의 영구적 최상위(ceiling)라면, 그 레벨을
+    공유하는 그룹은 그 sector가 ES 활성인 한 영원히 Deep Sleep 불가(물리적으로 올바름).
+  * **영향 범위**: [v17.3]에서 `_compute_deep_sleep_eligible_steps` 하나를 'Level k DS Count'와 절감 Wh
+    계산이 공유하도록 미리 리팩터해둔 덕분에, 이 함수 하나만 고치면 두 곳 모두에 자동 반영됨.
+  * **검증**: 사용자 예시를 그대로 재현하는 단위 테스트(단일 sector, Level 1~4, gid 6/3/3/6) 추가 —
+    Level 1 eligible_steps==0(항상), Level 2·3==4, Level 4==0(자기 자신), 절감 Wh 300/보너스 80(Level
+    2+3분만)이 손계산과 일치 확인. 기존 cross-sector 테스트는 "공유 레벨이 어느 sector의 영구 ceiling도
+    아닌" 시나리오로 재설계해 140Wh/40Wh 보너스가 여전히 정상 동작함을 재확인. `python -m py_compile` 통과.
 
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
@@ -146,7 +164,7 @@
   13. **[v17.2, v17.3에서 일부 갱신]** rupt(RU profile table)는 [v17.3]부터 Deep Sleep 절감 계산(`_deep_sleep_bonus_delta_for_level`)에 실제로 쓰이기 시작했지만, 다른 탭(`_calculate_est_saving`, `_compute_deep_sleep_capability`, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 나머지 탭도 언제 rupt로 마이그레이션할지는 사용자 지시 대기.
   14. **[v17.2]** ES mode Type이 실제로 "Tx Path Off"/"none"을 산출하려면 DRBn 계산식에 모드별 비율(예: Tx Path Off=0.5배) 반영이 필요 — 현재는 항상 "Cell-Off"만 나오는 것이 의도된 동작(사용자 확인), 비율 반영 기능은 추후 별도 요청 대기.
   15. **[v17.3, 중요]** Deep Sleep 음수 절감 버그의 근본 원인은 RU/MMU Spec DB에 특정 RU Model의 Deep Sleep(또는 Super Sleep) 소비전력이 PA off보다 크게 입력된 데이터 문제일 가능성이 높음 — 0-clamp로 증상은 막았지만, 실제 Spec DB에서 어떤 RU Model이 그런지 사용자가 직접 확인·정정 필요(코드가 자동으로 찾아 알려주진 않음). 'Level k DS Count' 진단 열로 카운트를 확인한 뒤에도 절감량이 기대와 다르면 이 가능성부터 점검 권장.
-  16. **[v17.3]** "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"이라는 표현을 기존 `Applied_ES_Level > k`(현재보다 낮은 모든 레벨이 대상, k+1 하나만이 아님) 판정과 동일한 것으로 해석해 그대로 유지 — "정확히 한 단계 아래만"이 의도였다면 사용자 확인 후 좁혀야 함.
+  16. **[v17.3에서 제기 → v17.4에서 해결]** "하나 낮은 레벨까지만 대상" 문의는 실제로는 그룹 판정의 `>=`/`>` 버그를 가리킨 것으로 확인되어 [v17.4]에서 수정 완료(esm_r17.py [v17.4] 항목 참고).
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---

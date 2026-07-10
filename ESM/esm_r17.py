@@ -568,10 +568,39 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     절감 Wh 계산에 실제 쓰인 eligible_steps와 정확히 일치함을 확인(4, 0, fallback 시 3). rupt 단위
     테스트에 PA off<Deep/Super Sleep인 잘못된 스펙 케이스 추가(CellOff는 Idle 기준이라 영향 없음,
     DeepSleep/SuperSleep만 0으로 clamp). `python -m py_compile` 통과.
-  - **사용자 확인 필요(설계 노트)**: "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"이라는
-    문구를 기존 "Applied_ES_Level > k"(현재 레벨보다 낮은 모든 레벨이 대상, k+1 하나만이 아님) 판정과
-    동일한 것으로 해석해 그대로 유지했다 - 만약 "정확히 현재 레벨 바로 아래 한 단계만" 대상으로 좁혀야
-    하는 의도였다면 알려주면 수정하겠다.
+  - **사용자 확인 결과 → [v17.4]에서 수정**: "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"은
+    "Applied_ES_Level > k" 판정 자체는 맞지만, 그룹의 "전체가 꺼져있는지" 판정에 있는 실제 버그를
+    가리키는 코멘트였음 - 아래 [v17.4] 참고.
+
+[v17.4] (2026-07-10) Deep Sleep 그룹 판정 버그 수정: 그룹 멤버가 '지금 이 순간의 현재 최고 레벨'이면
+그 그룹 전체가 Deep Sleep 불가해야 한다:
+  - **사용자 제시 예시**: 현재 적용된 ES Level이 4라고 하자. Level 1~3의 Target Cell은 모두 이미 꺼져
+    있다(Deep Sleep 후보). 그런데 Level 2,3의 Deep Sleep Capability가 3이고, Level 1의 Deep Sleep
+    Capability가 6, **Level 4(=지금의 현재 최고 레벨) 자신의 Deep Sleep Capability도 6**이라면, gid=3인
+    Level 2,3만 Deep Sleep이 가능하고 gid=6인 Level 1은 불가능하다 - Level 1이 공유하는 물리 RU(gid=6)를
+    Level 4(현재 최고 레벨, fallback 위험으로 PA off까지만 허용)도 함께 쓰기 때문에, 그 RU 전체가
+    Level 4의 fallback 위험에 묶여 있어서다.
+  - **버그**: `_group_all_off_series`(그룹 멤버가 모두 안전하게 꺼져 있는지 판정)가 각 멤버
+    `(sector, off_level)`에 대해 `Applied_ES_Level >= off_level`을 검사했는데, `>=`는 "그 sector가
+    지금 정확히 off_level에 있는" 경우(=그 멤버가 바로 지금 이 순간의 현재 최고 레벨이라는 뜻)도
+    "안전하게 꺼짐"으로 잘못 통과시켰다. 위 예시에서 Level 4 멤버는 Applied_ES_Level(4)>=off_level(4)가
+    참이므로 그룹 gid=6이 "전체 꺼짐"으로 잘못 판정되어 Level 1에도 부당하게 Deep Sleep 보너스가
+    적용되고 있었다.
+  - **수정**: `>=`를 `>`로 변경(`Applied_ES_Level > off_level`) - 각 멤버가 자기 sector에서 **엄격하게
+    초과**해야 안전한 것으로 인정한다(레벨 k 자신의 "지나갔는지" 판정 `passed_k = sector_level > k`와
+    동일한 기준으로 통일). 부작용: 어떤 sector의 특정 레벨이 그 sector의 **영구적인 최상위 레벨**(다른
+    레벨로 올라갈 수 없는 ceiling)이라면, 그 레벨을 공유하는 그룹은 그 sector가 ES 활성 상태인 한
+    **영원히** Deep Sleep 불가가 된다(그 레벨이 곧 그 sector의 상시 "현재 최고 레벨"이므로) - 물리적으로
+    올바른 동작이다.
+  - **영향 범위**: `_compute_deep_sleep_eligible_steps` 하나만 고치면 `_run_es_level_simulation`의
+    'Level k DS Count'와 `_calc_es_level_simulation_savings`의 절감 Wh 계산 양쪽에 동시에 반영됨
+    ([v17.3]에서 두 곳이 이 함수 하나를 공유하도록 미리 리팩터해둔 덕분).
+  - **검증**: 사용자 예시를 그대로 재현하는 단위 테스트(단일 sector, ES Level 1~4, gid 6/3/3/6) 추가 -
+    Level 1의 eligible_steps==0(항상), Level 2·3==4(현재 최고 레벨 도달 후), Level 4==0(자기 자신)을
+    확인, 절감 Wh(300)/Deep Sleep 보너스(80, Level 2+3분만)가 손계산과 일치함을 확인. 기존
+    cross-sector 테스트는 "공유 레벨이 어느 쪽 sector의 영구 ceiling도 아닌" 시나리오로 재설계(두
+    sector 모두 공유 레벨 위로 올라갈 여유를 줌)해 여전히 140Wh/40Wh 보너스로 정상 동작함을 재확인,
+    fallback(30Wh) 케이스도 재확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -2846,14 +2875,19 @@ class ESAnalyzerApp(AppDashboard):
         return total
 
     def _compute_deep_sleep_eligible_steps(self, timeline_df):
-        """[r17-후속2] Deep Sleep 교차-Sector 판정을 (eNodeBID, Sector, ES Level k)별 '적격 스텝 수'로
-        계산해 `_run_es_level_simulation`(진단용 'Level k DS Count' 열)과
-        `_calc_es_level_simulation_savings`(실제 절감 Wh 계산)가 공유하게 한다 - 두 곳의 숫자가 항상
-        일치해야 절감량 계산 오류를 카운트만 보고 바로 검증할 수 있다.
+        """[r17-후속2, r17-후속3에서 그룹 판정 버그 수정] Deep Sleep 교차-Sector 판정을 (eNodeBID,
+        Sector, ES Level k)별 '적격 스텝 수'로 계산해 `_run_es_level_simulation`(진단용 'Level k DS
+        Count' 열)과 `_calc_es_level_simulation_savings`(실제 절감 Wh 계산)가 공유하게 한다 - 두 곳의
+        숫자가 항상 일치해야 절감량 계산 오류를 카운트만 보고 바로 검증할 수 있다.
         적격 스텝 = 그 15분 Time에 (a) 그 Sector의 Applied_ES_Level이 k보다 커서(레벨 k가 이미 지나감)
         그 레벨의 Target Cell이 PA off 이상 상태이고, (b) 같은 'Deep Sleep Capability' 그룹의 모든
-        멤버(다른 Sector에 있을 수 있음)가 그 순간 자기 자신의 off-level 이상으로 동시에 꺼져 있음.
-        Deep Sleep 옵션이 꺼져 있거나 'Deep Sleep Capability' 열이 없으면 빈 dict.
+        멤버(다른 Sector/다른 ES Level에 있을 수 있음)가 그 순간 자기 자신의 off-level을 **초과**해서
+        꺼져 있음(그 sector의 Applied_ES_Level이 그 member의 off-level과 정확히 같다면 그 member가
+        바로 '지금 이 순간의 현재 최고 레벨'이라 fallback 위험이 있으므로 안전하지 않다고 간주 -
+        `_group_all_off_series` 참고. 예: ES Level 1과 ES Level 4가 같은 Deep Sleep Capability 그룹을
+        공유하는데 지금 Applied_ES_Level==4라면, Level 4 member가 '초과'가 아니라 '같음'이므로 그
+        그룹(Level 1 포함)은 지금 Deep Sleep 불가). Deep Sleep 옵션이 꺼져 있거나 'Deep Sleep
+        Capability' 열이 없으면 빈 dict.
         반환: {(enodeb, sector): {level: eligible_steps}, ...} - 여기서는 집계 카운트로 clamp하지 않은
         원시 값(호출부가 필요하면 자체 안전장치를 적용한다)."""
         result = {}
@@ -2882,13 +2916,21 @@ class ESAnalyzerApp(AppDashboard):
             level_group_by_sector.setdefault((enb, sec), {})[lv] = gid
 
         def _group_all_off_series(enodeb, members):
+            """[r17-후속3, 버그 수정] member(sector, off_level)가 "안전하게 꺼져 있다"고 인정되려면 그
+            sector의 Applied_ES_Level이 off_level을 '초과'해야 한다(>, 이전에는 >= 였음) - off_level과
+            정확히 같다는 것은 그 member가 바로 '지금 이 순간의 현재 최고 레벨'(=fallback 위험이 있어
+            PA off까지만 허용되는 레벨)이라는 뜻이라 안전하지 않다. 예: group id가 같은 ES Level 1과
+            ES Level 4를 공유하는 RU에서, 지금 Applied_ES_Level==4(현재 최고 레벨)라면 Level 4 member는
+            '초과'가 아니라 '같음'이므로 그룹 전체(Level 1 포함)가 Deep Sleep 불가 - Level 4 자신의
+            fallback 위험이 이 RU를 공유하는 다른 모든 member에게도 적용되기 때문(물리적으로 하나의
+            RU HW이므로)."""
             wide = level_wide_by_enb.get(enodeb)
             if wide is None or wide.empty: return None
             res = None
             for sector, off_level in members:
                 if sector not in wide.columns:
                     return pd.Series(False, index=wide.index)
-                col_ok = wide[sector].fillna(0) >= off_level
+                col_ok = wide[sector].fillna(0) > off_level
                 res = col_ok if res is None else (res & col_ok)
             return res
 
