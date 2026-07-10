@@ -168,6 +168,26 @@
     1회), 잘못된 Spec으로도 음수 안 됨(end-to-end) 확인. 기존 Deep Sleep capability/rupt/ES mode Type
     회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
 
+* **[v17.6] (2026-07-10) 전체 코드 리뷰(정독) - 버그 6건 수정 + 최적화 1건 (판단 4건은 사용자 인터뷰로 확정)**
+  * **[중요] Coe_paoff 누락(v17.5 회귀)**: rupt 기반 절감 계산에서 실측 보정계수 Coe_paoff가 조용히
+    빠져 NC2 경로와 불일치 → rupt 열은 순수 Spec 값 유지, 절감 Wh 계산 시 신규 `_rupt_model_coe_map`
+    (3단계 매칭, 미매칭 1.0)을 CellOff/Deep Sleep 양쪽에 곱함(사용자 확인).
+  * **[중요] RU 에너지 매칭에 eNB_ID 누락**: `_sector_total_energy_wh`/`_calc_all_savings`가 RU 번호
+    (Bid/RuPort/Cascade)만으로 Energy Stat을 매칭해 같은 번호의 다른 사이트 RU 에너지가 합산됐음 →
+    eNB_ID를 키에 포함. 동시에 `_sector_energy_wh_map`으로 벡터화(sector×RU 재스캔 → groupby+merge 1회).
+  * **PA-shared 유령 cell(사용자 확인: 표기 포함+절감 차단)**: CM에 행이 없는 참조 cell을 rupt PA
+    shared에 포함(스펙 '합집합')하고 절감 판정은 자동 차단(보수적). 토큰 파싱도 정규식 숫자 추출로
+    강화("(120)" 등 수용).
+  * **수동 모드 Rawdata 24h(사용자 확인)**: 수동 ES 시간 모드에서 트래픽을 미리 시간 필터해 Rawdata가
+    ES 시간만 담기던 것 수정 - 정책 학습은 기존과 동일(ES 시간만), Rawdata는 auto 모드처럼 24시간
+    전체(여러 날 윈도우 이어붙음/진입 재판정 누락으로 인한 과대 절감 해소).
+  * **'에너지 분석 실행' overlay(사용자 확인)**: 특정 eNodeBID/Sector 선택 시에도 시뮬레이션은 전체
+    sector로 돌리고 표시만 선택 행 합산으로 변경 - cross-sector 판정 정상화(v17.0 '알려진 한계' 이
+    화면에서는 해소) + 절감률 분모를 선택 부분 실제 소모(total_wh)로 통일.
+  * **자잘한 결함**: `_load_auto_jsons` CWD 의존(앱 폴더 기준으로), `_filter_cm_tree` 빈 DataFrame 가드.
+  * **검증**: 신규 test_r17_fixes.py(Coe 2배/절반 일관성, 유령 cell 표기+차단, eNB 분리 200/1998Wh,
+    수동 모드 run_analysis 스모크 - 24h Rawdata + 윈도우 0~5시 + 정책 불변) + 기존 회귀 전체 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -181,7 +201,7 @@
   8. ES 윈도우 진입 "1 sample 미적용" 패턴이 실데이터에서 실제로 사라졌는지, Coverage band 선택이 기대대로 동작하는지(특히 band 1~2개뿐인 sector에서 eMTC/ENDC anchor와 겹쳐 ES 적용대상 0개가 되는 빈도) 확인 필요.
   9. eMTC/ENDC anchor 판정 알고리즘(우선순위 선택 기준)과 실제 CM Data의 `conf-emtc-switch`/`endc-anchor-type`/`endc-support` 값 표기가 코드의 `_TRUTHY_TOKENS` 판정과 맞는지 확인 필요.
   10. ES Level 없는 sector를 절감효과 결과표에 포함하는 로직은 시뮬레이션 기반(Mode 2/3)에만 적용됨 — NC2 기반(Mode 1)도 필요한지 결정 대기.
-  11. **[v17.0, 중요]** Deep Sleep 기능을 실제로 켜서 실데이터로 검증 필요 — board-type 컬럼명 매칭, 여러 sector에 걸친 RU 공유 실제 사례와 그룹 id 결과, 그리고 위 "알려진 한계"(특정 sector로 필터된 호출부의 교차-Sector 판정 누락) 문제.
+  11. **[v17.0, 중요 / v17.6에서 일부 해소]** Deep Sleep 기능을 실제로 켜서 실데이터로 검증 필요 — board-type 컬럼명 매칭, 여러 sector에 걸친 RU 공유 실제 사례와 그룹 id 결과. "알려진 한계"(특정 sector로 필터된 호출부의 교차-Sector 판정 누락)는 '에너지 분석 실행' overlay에 한해 [v17.6]에서 해소(항상 전체 sector 시뮬레이션 후 선택부만 추출) — 다른 호출부는 애초에 필터하지 않아 해당 없음.
   12. Energy Dashboard 연동 보류 중: Learning Energy Curve의 Idle/PA off 보정값·채택 모델을 절감 예측에 반영할지는 별도 대기.
   13. **[v17.2, v17.3/v17.5에서 갱신]** rupt(RU profile table)는 [v17.5]부터 ES Level 시뮬레이션의 절감 Wh 계산(CellOff+Deep Sleep 모두) 핵심 데이터 소스가 되었지만, 다른 탭(`_calculate_est_saving`=Optimizer의 Est. Saving 열, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 나머지 탭도 언제 rupt로 마이그레이션할지는 사용자 지시 대기.
   14. **[v17.2]** ES mode Type이 실제로 "Tx Path Off"/"none"을 산출하려면 DRBn 계산식에 모드별 비율(예: Tx Path Off=0.5배) 반영이 필요 — 현재는 항상 "Cell-Off"만 나오는 것이 의도된 동작(사용자 확인), 비율 반영 기능은 추후 별도 요청 대기.
