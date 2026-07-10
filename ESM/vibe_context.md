@@ -109,6 +109,25 @@
     합집합·중복제거/3단계 매칭 3케이스+실패 시 전체 -1/빈 입력 처리/신규 Spec 행 Super Sleep 포함을 확인.
     기존 Deep Sleep 회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
 
+* **[v17.3] (2026-07-10) rupt DeepSleep/SuperSleep 공식 변경(PA off 기준) + Deep Sleep 절감 음수 버그 수정 + 'Level k DS Count' 진단 열**
+  * **버그**: 실 Spec 데이터로 Deep Sleep을 켜니 "Deep Sleep 추가 절감 [Wh]"이 음수로 나오는 사례 발견.
+    원인은 기존 `elevated_delta`(Idle-Deep Sleep, Idle 기준)가 RU/MMU Spec에 Deep Sleep 소비전력이
+    PA off보다 크게 잘못 입력된 RU Model에서 pa_off_delta보다 작아져도 클램프가 없었기 때문.
+  * rupt의 DeepSleep/SuperSleep을 PA off 기준(`PA off-Deep Sleep`/`PA off-Super Sleep`, 결과 음수면 0
+    clamp)으로 재정의(CellOff/TxPathOff는 Idle 기준 그대로). `_power_deltas_for_level`은 pa_off_delta만
+    반환하도록 단순화하고, Deep Sleep 추가절감은 신규 `_deep_sleep_bonus_delta_for_level`이 rupt에서
+    직접 가져온다 - **이번 라운드부터 rupt가 실제로 절감 계산 경로에 쓰이기 시작함**(§6의 기존 "인프라만"
+    메모 갱신).
+  * 신규 공유 헬퍼 `_compute_deep_sleep_eligible_steps` + `_attach_deep_sleep_ds_counts`로 Sector 요약
+    표(`_run_es_level_simulation` 반환 summary_df)에 'Level k DS Count' 열 추가 - 절감 Wh 계산과 동일한
+    함수를 공유해 두 표의 숫자가 항상 일치, 카운트×rupt DeepSleep 값으로 손 검산 가능.
+  * **검증**: 기존 정상 데이터 시나리오(140/40, 70/0, fallback 30) 값 불변 확인(대수적으로 동일 - 클램프는
+    비정상 데이터에서만 차이). PA off<Deep/Super Sleep 잘못된 스펙으로 절감/보너스가 0 clamp되고 음수가
+    안 됨을 확인. DS Count가 Wh 계산의 eligible_steps와 정확히 일치함을 확인. `python -m py_compile` 통과.
+  * **사용자 확인 필요**: "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"을 기존
+    `Applied_ES_Level > k`(현재보다 낮은 모든 레벨 대상) 판정과 동일하게 해석했음 - "정확히 한 단계
+    아래만" 의도였다면 알려주면 좁히겠음(esm_r17.py 상단 [v17.3] 항목에도 동일 메모).
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -124,8 +143,10 @@
   10. ES Level 없는 sector를 절감효과 결과표에 포함하는 로직은 시뮬레이션 기반(Mode 2/3)에만 적용됨 — NC2 기반(Mode 1)도 필요한지 결정 대기.
   11. **[v17.0, 중요]** Deep Sleep 기능을 실제로 켜서 실데이터로 검증 필요 — board-type 컬럼명 매칭, 여러 sector에 걸친 RU 공유 실제 사례와 그룹 id 결과, 그리고 위 "알려진 한계"(특정 sector로 필터된 호출부의 교차-Sector 판정 누락) 문제.
   12. Energy Dashboard 연동 보류 중: Learning Energy Curve의 Idle/PA off 보정값·채택 모델을 절감 예측에 반영할지는 별도 대기.
-  13. **[v17.2]** rupt(RU profile table)는 아직 신규 인프라일 뿐 기존 탭(예: `_calculate_est_saving`, `_compute_deep_sleep_capability`, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 언제/어떤 탭부터 rupt로 마이그레이션할지는 사용자 지시 대기(이번 라운드는 신설만 요청됨).
+  13. **[v17.2, v17.3에서 일부 갱신]** rupt(RU profile table)는 [v17.3]부터 Deep Sleep 절감 계산(`_deep_sleep_bonus_delta_for_level`)에 실제로 쓰이기 시작했지만, 다른 탭(`_calculate_est_saving`, `_compute_deep_sleep_capability`, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 나머지 탭도 언제 rupt로 마이그레이션할지는 사용자 지시 대기.
   14. **[v17.2]** ES mode Type이 실제로 "Tx Path Off"/"none"을 산출하려면 DRBn 계산식에 모드별 비율(예: Tx Path Off=0.5배) 반영이 필요 — 현재는 항상 "Cell-Off"만 나오는 것이 의도된 동작(사용자 확인), 비율 반영 기능은 추후 별도 요청 대기.
+  15. **[v17.3, 중요]** Deep Sleep 음수 절감 버그의 근본 원인은 RU/MMU Spec DB에 특정 RU Model의 Deep Sleep(또는 Super Sleep) 소비전력이 PA off보다 크게 입력된 데이터 문제일 가능성이 높음 — 0-clamp로 증상은 막았지만, 실제 Spec DB에서 어떤 RU Model이 그런지 사용자가 직접 확인·정정 필요(코드가 자동으로 찾아 알려주진 않음). 'Level k DS Count' 진단 열로 카운트를 확인한 뒤에도 절감량이 기대와 다르면 이 가능성부터 점검 권장.
+  16. **[v17.3]** "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"이라는 표현을 기존 `Applied_ES_Level > k`(현재보다 낮은 모든 레벨이 대상, k+1 하나만이 아님) 판정과 동일한 것으로 해석해 그대로 유지 — "정확히 한 단계 아래만"이 의도였다면 사용자 확인 후 좁혀야 함.
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---

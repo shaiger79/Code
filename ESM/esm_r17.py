@@ -523,8 +523,9 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
       NE ID 내에서 PA를 공유하는 cell-num 그룹 전체(자신 포함, 중복 제거)를 콤마로 기재.
     - CellOff/TxPathOff/DeepSleep/SuperSleep: RU Model로 RU/MMU Spec DB를 3단계 fallback 매칭
       (`_rupt_match_ru_spec_row`) - (1) 전체 문자열 완전일치, (2) 마지막 한 글자 제외 접두어로 시작하는
-      첫 값, (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 매칭되면 각각 Idle-PA off/Idle-Tx path off/
-      Idle-Deep Sleep/Idle-Super Sleep(개별 값이 없으면 그 항목만 -1), 셋 다 실패하면 네 열 모두 -1.
+      첫 값, (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 매칭되면 CellOff=Idle-PA off, TxPathOff=
+      Idle-Tx path off, DeepSleep/SuperSleep은 [v17.3]에서 PA off 기준으로 재정의(아래 참고). 개별 값이
+      없으면 그 항목만 -1, 매칭 자체가 실패하면 네 열 모두 -1.
     - RU/MMU Spec DB 편집기 신규 행 기본 템플릿에 'Super Sleep' 열 추가(Deep Sleep 도입 때와 동일한
       패턴) - 기존 저장된 Spec 파일에는 없을 수 있으며, 그 경우 SuperSleep 계산 시 해당 항목만 -1로 처리.
   - **검증**: `_calc_es_mode_type` 단위 테스트(사용자 제시 예시 325-275=50==target 50 → "Cell-Off" 포함,
@@ -533,6 +534,44 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     동의어 통합, PA shared 합집합/중복제거/-1 제외(상호 참조 포함), 3단계 RU Model fallback 매칭 3케이스
     + 매칭 실패 시 4열 모두 -1, 빈 cm_map_df_full 처리, 신규 Spec 행에 Super Sleep 포함을 확인. 기존
     Deep Sleep capability/savings 회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
+
+[v17.3] (2026-07-10) rupt DeepSleep/SuperSleep 공식을 PA off 기준으로 재정의 + Deep Sleep 절감 계산의
+음수 버그 수정 + 진단용 'Level k DS Count' 열 추가:
+  - **배경(버그)**: 실 Spec 데이터로 Deep Sleep을 켜고 돌려보니 "Deep Sleep 추가 절감 [Wh]"이 음수로
+    나오는 사례 발견. 원인: 기존 `_power_deltas_for_level`의 `elevated_delta`가 `Idle-Deep Sleep`(Idle
+    기준)으로 계산되어 있어서, RU/MMU Spec DB에 Deep Sleep 소비전력이 PA off보다 크게 잘못 입력된
+    RU Model이 있으면 `elevated_delta < pa_off_delta`가 되어 보너스(`elevated_delta - pa_off_delta`)가
+    음수가 됨 - 클램프가 전혀 없었음.
+  - **rupt 공식 변경** (`_rupt_power_state_values`): DeepSleep=`PA off-Deep Sleep`, SuperSleep=
+    `PA off-Super Sleep`로 변경(요청대로, Idle 기준이 아님) - 이미 PA off 절감을 매 스텝 기본 적용하고
+    Deep/Super Sleep은 그 위에 얹는 "추가" 절감이므로 PA off가 기준점이어야 중복 차감이 없다. 결과가
+    음수면(Spec DB에 Deep/Super Sleep 소비전력이 PA off보다 큰 잘못된 값이 입력된 경우 등) 0으로
+    clamp(요청대로) - "추가 절감 없음"으로 안전하게 귀결되고 손해로 계산되지 않는다. 값이 없으면 -1은
+    그대로.
+  - **절감 계산 리팩터** (`_calc_es_level_simulation_savings`): `_power_deltas_for_level`을 pa_off_delta
+    만 반환하도록 단순화(elevated_delta 계산 제거). Deep Sleep 추가절감은 신규 `_deep_sleep_bonus_delta_for_level`
+    이 rupt의 DeepSleep 열(BID+CID로 식별한 고유 RU HW별)에서 직접 가져와 `eligible_steps × 0.25h`로
+    합산한다 - `saved_wh = Σ_k[pa_off_delta(k)×count(Level==k or >k)×0.25h + ds_delta(k)×eligible_steps(k)×0.25h]`.
+  - **'Level k DS Count' 진단 열**: "같은 Deep Sleep Capability 그룹의 모든 cell이 PA off된 상태 +
+    현재 적용된 ES level보다 하나라도 낮은 레벨까지만 대상"(=Applied_ES_Level>k, 기존 판정과 동일)인
+    15분 스텝 수를 신규 공유 헬퍼 `_compute_deep_sleep_eligible_steps`(교차-Sector 판정 로직을
+    `_calc_es_level_simulation_savings`에서 분리)로 계산해, `_run_es_level_simulation`이 반환하는
+    summary_df(Sector 요약 표)에 `_attach_deep_sleep_ds_counts`로 덧붙인다(Deep Sleep이 꺼져 있으면 열
+    자체를 추가하지 않음). 절감 Wh 계산과 **동일한 함수**를 공유하므로 두 표의 숫자가 항상 일치해,
+    카운트×rupt의 DeepSleep 값으로 손으로 보너스를 검산할 수 있다. 단, summary_df의 DS Count는 원시
+    값이고 Wh 계산 쪽은 집계 카운트 초과 방지를 위해 `count_gt_k`로 clamp한 값을 쓰므로 아주 드물게
+    (교차-Sector 타임스탬프 정렬 오차 등) 두 값이 다를 수 있음 - 다르면 그 자체가 진단 신호.
+  - **검증**: 기존 Deep Sleep 절감 테스트(PA off < Deep Sleep인 정상 데이터, 140Wh/40Wh·70Wh/0·fallback시
+    30Wh 시나리오)가 리팩터 후에도 완전히 동일한 값을 냄을 재확인(대수적으로 동일 - 클램프는 비정상
+    데이터에서만 차이남). 신규: PA off보다 Deep Sleep 소비전력이 큰 잘못된 Spec 데이터로 절감/보너스가
+    0으로 clamp되고 음수가 되지 않음을 확인. `_attach_deep_sleep_ds_counts`가 만든 'Level k DS Count'가
+    절감 Wh 계산에 실제 쓰인 eligible_steps와 정확히 일치함을 확인(4, 0, fallback 시 3). rupt 단위
+    테스트에 PA off<Deep/Super Sleep인 잘못된 스펙 케이스 추가(CellOff는 Idle 기준이라 영향 없음,
+    DeepSleep/SuperSleep만 0으로 clamp). `python -m py_compile` 통과.
+  - **사용자 확인 필요(설계 노트)**: "현재 적용된 ES level보다 하나 낮은 ES level까지만 대상"이라는
+    문구를 기존 "Applied_ES_Level > k"(현재 레벨보다 낮은 모든 레벨이 대상, k+1 하나만이 아님) 판정과
+    동일한 것으로 해석해 그대로 유지했다 - 만약 "정확히 현재 레벨 바로 아래 한 단계만" 대상으로 좁혀야
+    하는 의도였다면 알려주면 수정하겠다.
 """
 
 import tkinter as tk
@@ -2718,32 +2757,52 @@ class ESAnalyzerApp(AppDashboard):
 
         timeline_df = pd.concat(timeline_parts, ignore_index=True) if timeline_parts else pd.DataFrame()
         summary_df = pd.DataFrame(summary_rows) if summary_rows else pd.DataFrame()
+        summary_df = self._attach_deep_sleep_ds_counts(summary_df, timeline_df)
         return timeline_df, summary_df
 
+    def _attach_deep_sleep_ds_counts(self, summary_df, timeline_df):
+        """[r17-후속2] 진단용 'Level k DS Count' 열을 summary_df에 덧붙인다 - Deep Sleep 절감 계산
+        (`_calc_es_level_simulation_savings`)과 동일한 교차-Sector 판정(`_compute_deep_sleep_eligible_steps`)을
+        그대로 재사용해, Sector 요약 표에서 카운트만 보고도 절감 Wh 계산이 맞는지 손으로 검증할 수
+        있게 한다(Deep Sleep이 꺼져 있으면 열 자체를 추가하지 않는다)."""
+        if summary_df is None or summary_df.empty:
+            return summary_df
+        summary_df = summary_df.copy()
+        ds_eligible = self._compute_deep_sleep_eligible_steps(timeline_df)
+        if ds_eligible:
+            for idx, srow in summary_df.iterrows():
+                key = (str(srow['eNodeBID']), str(srow['Sector']))
+                for k, cnt in ds_eligible.get(key, {}).items():
+                    summary_df.loc[idx, f'Level {k} DS Count'] = cnt
+        return summary_df
+
     def _power_deltas_for_level(self, enodeb, target_cells_str):
-        """[r16] ES Level별 고유 Target Cell에 연결된 RU HW의 전력차(W)를 두 가지 기준으로 계산한다.
-        - pa_off_delta: 기존과 동일한 (Idle - PA off) × Coe_paoff 합(=이전 `_power_delta_for_cells`).
-        - elevated_delta: 해당 RU HW가 Deep Sleep을 지원하면(RU/MMU Spec의 'Deep Sleep' 열 값 > 0)
-          (Idle - Deep Sleep 소모전력) × Coe_paoff, 지원하지 않으면 pa_off_delta와 동일한 값.
-        [Deep Sleep 기능, r16] RU HW는 ru-board-id + ru-cascade-id로 식별한다(현재는 Single Band RU만
-        가정하므로 ru-port-id는 물리 RU 1개당 1개뿐이라 이 식별만으로 충분 — Dual Band RU(포트 2개)
-        지원은 추후 라운드에서 반영). '모든 RU path가 shutdown'되어야 한다는 조건은, 레벨의 Target Cell
-        Num이 이미 그 RU(path)에 연결된 모든 Cell을 포함하도록 구성되어 있어(PA-shared-cell 해석 결과)
-        Single Band 가정 하에서는 레벨 단위로 자동 충족된다.
-        반환: (pa_off_delta 합계, elevated_delta 합계) — 둘 다 W 단위."""
-        if not target_cells_str or pd.isna(target_cells_str) or str(target_cells_str) == '-1': return 0.0, 0.0
-        if self.cm_map_df_full.empty or self.ru_spec_df_internal.empty: return 0.0, 0.0
+        """[r16, r17-후속2에서 PA off 절감분만 남기고 단순화] ES Level별 고유 Target Cell에 연결된 RU
+        HW의 PA off 전력차(W) = (Idle - PA off) × Coe_paoff 합. RU HW는 ru-board-id + ru-cascade-id로
+        식별한다(현재는 Single Band RU만 가정하므로 ru-port-id는 물리 RU 1개당 1개뿐이라 이 식별만으로
+        충분 — Dual Band RU(포트 2개) 지원은 추후 라운드에서 반영). '모든 RU path가 shutdown'되어야
+        한다는 조건은, 레벨의 Target Cell Num이 이미 그 RU(path)에 연결된 모든 Cell을 포함하도록
+        구성되어 있어(PA-shared-cell 해석 결과) Single Band 가정 하에서는 레벨 단위로 자동 충족된다.
+        [r17-후속2] Deep Sleep 추가절감(예전의 elevated_delta)은 더 이상 여기서 계산하지 않는다 - PA
+        off 대비 상대값(PA off-Deep Sleep)이어야 하는데 여기서는 Idle 대비로 계산해 PA off보다 Deep
+        Sleep 소비전력이 큰 경우 절감량이 음수가 되는 버그가 있었다. rupt(RU profile table)의
+        DeepSleep 열이 이미 PA off 기준 + 0 이상 clamp로 이 값을 올바르게 제공하므로,
+        `_calc_es_level_simulation_savings`가 `_deep_sleep_bonus_delta_for_level`을 통해 rupt에서
+        직접 가져다 쓴다.
+        반환: pa_off_delta 합계(W)."""
+        if not target_cells_str or pd.isna(target_cells_str) or str(target_cells_str) == '-1': return 0.0
+        if self.cm_map_df_full.empty or self.ru_spec_df_internal.empty: return 0.0
         try:
             cells = re.findall(r'\d+', str(target_cells_str))
-            if not cells: return 0.0, 0.0
+            if not cells: return 0.0
             cm_sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) & (self.cm_map_df_full['cell-num'].astype(str).isin(cells))]
-            if cm_sub.empty: return 0.0, 0.0
+            if cm_sub.empty: return 0.0
             ru_hw_keys = ['ru-board-id', 'ru-cascade-id']  # [r16] RU HW(물리 RU) 식별 - Single Band 가정, port 무관
             avail_keys = [c for c in ru_hw_keys if c in cm_sub.columns]
             spec_bcol = next((c for c in self.ru_spec_df_internal.columns if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
             btype_col = next((c for c in cm_sub.columns if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
-            if not spec_bcol or not btype_col: return 0.0, 0.0
-            pa_off_total, elevated_total = 0.0, 0.0
+            if not spec_bcol or not btype_col: return 0.0
+            pa_off_total = 0.0
             if avail_keys:
                 unique_rus = cm_sub[avail_keys + [btype_col]].drop_duplicates(subset=avail_keys)
                 for _, ru in unique_rus.iterrows():
@@ -2755,19 +2814,108 @@ class ESAnalyzerApp(AppDashboard):
                         pa_off = float(spec_row.iloc[0].get('PA off', 0))
                         coe_val = spec_row.iloc[0].get('Coe_paoff', 1.0)
                         coe_paoff = float(coe_val) if pd.notna(coe_val) and str(coe_val).strip() != '' else 1.0
-                        pa_off_delta = (idle - pa_off) * coe_paoff
-                        pa_off_total += pa_off_delta
-
-                        deep_val = spec_row.iloc[0].get('Deep Sleep', 0)
-                        deep_sleep_power = float(deep_val) if pd.notna(deep_val) and str(deep_val).strip() != '' else 0.0
-                        if deep_sleep_power > 0:
-                            elevated_total += (idle - deep_sleep_power) * coe_paoff
-                        else:
-                            elevated_total += pa_off_delta
+                        pa_off_total += (idle - pa_off) * coe_paoff
                     except Exception: pass
-            return pa_off_total, elevated_total
+            return pa_off_total
         except Exception:
-            return 0.0, 0.0
+            return 0.0
+
+    def _deep_sleep_bonus_delta_for_level(self, rupt, enodeb, target_cells_str):
+        """[r17-후속2] rupt(RU profile table)의 'DeepSleep' 열(=PA off-Deep Sleep, 이미 0 이상으로
+        clamp된 '추가' 절감 W)을 이용해, 레벨의 Target Cell Num에 연결된 고유 RU HW(BID+CID 기준 -
+        `_power_deltas_for_level`과 동일한 Single Band 식별 기준)별 Deep Sleep 추가절감을 합산한다.
+        RU Model이 RU/MMU Spec에서 매칭되지 않은 RU(rupt의 DeepSleep==-1)는 0으로 취급(추가절감 없음)."""
+        if rupt is None or rupt.empty or not target_cells_str or pd.isna(target_cells_str) or str(target_cells_str) == '-1':
+            return 0.0
+        cells = re.findall(r'\d+', str(target_cells_str))
+        if not cells:
+            return 0.0
+        sub = rupt[(rupt['NE ID'].astype(str) == str(enodeb)) & (rupt['Cell ID'].astype(str).isin(cells))]
+        if sub.empty:
+            return 0.0
+        ru_hw_keys = [c for c in ['BID', 'CID'] if c in sub.columns]
+        unique_rus = sub.drop_duplicates(subset=ru_hw_keys) if ru_hw_keys else sub.drop_duplicates(subset=['DeepSleep'])
+        total = 0.0
+        for v in unique_rus['DeepSleep']:
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv > 0:
+                total += fv
+        return total
+
+    def _compute_deep_sleep_eligible_steps(self, timeline_df):
+        """[r17-후속2] Deep Sleep 교차-Sector 판정을 (eNodeBID, Sector, ES Level k)별 '적격 스텝 수'로
+        계산해 `_run_es_level_simulation`(진단용 'Level k DS Count' 열)과
+        `_calc_es_level_simulation_savings`(실제 절감 Wh 계산)가 공유하게 한다 - 두 곳의 숫자가 항상
+        일치해야 절감량 계산 오류를 카운트만 보고 바로 검증할 수 있다.
+        적격 스텝 = 그 15분 Time에 (a) 그 Sector의 Applied_ES_Level이 k보다 커서(레벨 k가 이미 지나감)
+        그 레벨의 Target Cell이 PA off 이상 상태이고, (b) 같은 'Deep Sleep Capability' 그룹의 모든
+        멤버(다른 Sector에 있을 수 있음)가 그 순간 자기 자신의 off-level 이상으로 동시에 꺼져 있음.
+        Deep Sleep 옵션이 꺼져 있거나 'Deep Sleep Capability' 열이 없으면 빈 dict.
+        반환: {(enodeb, sector): {level: eligible_steps}, ...} - 여기서는 집계 카운트로 clamp하지 않은
+        원시 값(호출부가 필요하면 자체 안전장치를 적용한다)."""
+        result = {}
+        deep_sleep_on = (bool(self.deep_sleep_enabled.get()) and self.latest_optimizer_results is not None
+                          and not self.latest_optimizer_results.empty
+                          and 'Deep Sleep Capability' in self.latest_optimizer_results.columns)
+        if not deep_sleep_on or timeline_df is None or timeline_df.empty or 'eNodeBID' not in timeline_df.columns:
+            return result
+
+        level_wide_by_enb = {}
+        tdf = timeline_df[timeline_df['In_Eval_Window']] if 'In_Eval_Window' in timeline_df.columns else timeline_df
+        for enb, grp in tdf.groupby(tdf['eNodeBID'].astype(str)):
+            try:
+                level_wide_by_enb[enb] = grp.pivot_table(index='Time', columns=grp['Sector'].astype(str), values='Applied_ES_Level', aggfunc='first')
+            except Exception:
+                pass
+
+        ds_rows = self.latest_optimizer_results[self.latest_optimizer_results['ES Level'] != 7]
+        group_members, level_group_by_sector = {}, {}
+        for _, r in ds_rows.iterrows():
+            try: gid = int(r.get('Deep Sleep Capability', -1))
+            except Exception: gid = -1
+            enb, sec, lv = str(r['eNodeBID']), str(r['Sector']), int(r['ES Level'])
+            if gid != -1:
+                group_members.setdefault(enb, {}).setdefault(gid, []).append((sec, lv))
+            level_group_by_sector.setdefault((enb, sec), {})[lv] = gid
+
+        def _group_all_off_series(enodeb, members):
+            wide = level_wide_by_enb.get(enodeb)
+            if wide is None or wide.empty: return None
+            res = None
+            for sector, off_level in members:
+                if sector not in wide.columns:
+                    return pd.Series(False, index=wide.index)
+                col_ok = wide[sector].fillna(0) >= off_level
+                res = col_ok if res is None else (res & col_ok)
+            return res
+
+        _all_off_cache = {}
+        def _group_all_off_cached(enodeb, gid):
+            key = (enodeb, gid)
+            if key not in _all_off_cache:
+                members = group_members.get(enodeb, {}).get(gid, [])
+                _all_off_cache[key] = _group_all_off_series(enodeb, members)
+            return _all_off_cache[key]
+
+        for (enb, sec), lvl_gids in level_group_by_sector.items():
+            wide = level_wide_by_enb.get(enb)
+            sector_level_series = wide[sec] if (wide is not None and sec in wide.columns) else None
+            per_level = {}
+            for k, gid in lvl_gids.items():
+                if gid == -1 or sector_level_series is None:
+                    per_level[k] = 0
+                    continue
+                all_off = _group_all_off_cached(enb, gid)
+                if all_off is None:
+                    per_level[k] = 0
+                    continue
+                passed_k = sector_level_series.reindex(all_off.index).fillna(0) > k
+                per_level[k] = int((passed_k & all_off).sum())
+            result[(enb, sec)] = per_level
+        return result
 
     def _parse_energy_stat_for_range(self, start_date, end_date, eval_hours=None):
         """[r15-후속] Energy Dashboard 탭의 날짜 위젯과 무관하게, 지정한 임의의 [start_date, end_date] +
@@ -2830,19 +2978,21 @@ class ESAnalyzerApp(AppDashboard):
         재점등이 필요할 수 있어 Deep Sleep의 5분 기상 시간을 감당 못 함)인 구간은 PA off 기준 전력차만
         적용한다(하위 호환 유지).
 
-        [Deep Sleep 판정, r17 재작성] "Applied_ES_Level > k"(이미 현재 레벨보다 낮아 최소 한 스텝 이상
-        여유가 있는 구간)인 스텝이라고 곧바로 Deep Sleep 전력차를 적용하지 않는다 - `run_analysis`가
-        미리 계산해 둔 'Deep Sleep Capability'(RU 공유 그룹 id, -1이면 불가)가 이 레벨에 있어야 하고,
-        그 그룹의 다른 멤버(다른 Sector에 있을 수 있음)들도 "지금 이 순간(같은 15분 Time)" 자기 자신의
-        off-level 이상으로 꺼져 있어야만 Deep Sleep 전력차를 적용한다 - `timeline_df`를 eNodeBID 내
-        Sector별로 피벗해 Time 기준으로 교차 확인(Sector 간 15분 타임스탬프 정밀 동기화). 그 조건을
-        만족하지 못하는 "Level>k" 스텝은 PA off 전력차로 폴백한다. 즉:
-        절감 에너지 = Σ_k [ pa_off_delta(k) × count(Level==k) × 0.25h
-                           + elevated_delta(k) × count(Level>k, 그룹 전체 동시 off) × 0.25h
-                           + pa_off_delta(k) × count(Level>k, 그룹 전체 동시 off 아님) × 0.25h ] × Gamma2
-        (Deep Sleep 기능이 꺼져 있거나 'Deep Sleep Capability' 열이 없으면(=run_analysis 실행 당시
-        옵션이 꺼져 있었음) 이 판정 자체를 건너뛰고 기존 count(Level>=k) 공식과 동일하게 귀결됨 — 하위
-        호환 보장).
+        [Deep Sleep 판정, r17 재작성, r17-후속2에서 rupt 기반으로 재정리] "Applied_ES_Level > k"(이미
+        현재 레벨보다 낮아 최소 한 스텝 이상 여유가 있는 구간)인 스텝이라고 곧바로 Deep Sleep 전력차를
+        적용하지 않는다 - `run_analysis`가 미리 계산해 둔 'Deep Sleep Capability'(RU 공유 그룹 id, -1이면
+        불가)가 이 레벨에 있어야 하고, 그 그룹의 다른 멤버(다른 Sector에 있을 수 있음)들도 "지금 이
+        순간(같은 15분 Time)" 자기 자신의 off-level 이상으로 꺼져 있어야만 Deep Sleep 전력차를
+        적용한다(`_compute_deep_sleep_eligible_steps`가 이 교차-Sector 판정을 전담). 그 조건을 만족하지
+        못하는 "Level>k" 스텝은 PA off 전력차만 적용한다. 즉:
+        절감 에너지 = Σ_k [ pa_off_delta(k) × count(Level==k or Level>k) × 0.25h
+                           + ds_delta(k) × eligible_steps(Level>k, 그룹 전체 동시 off) × 0.25h ] × Gamma2
+        여기서 ds_delta(k)는 rupt(RU profile table)의 'DeepSleep' 열(=PA off 대비 '추가' 절감분, 이미 0
+        이상으로 clamp됨 - PA off보다 Deep Sleep 전력이 큰 잘못된 Spec 데이터가 있어도 음수 절감이 될 수
+        없다)에서 그 레벨의 Target Cell Num에 연결된 RU HW별로 가져온다(`_deep_sleep_bonus_delta_for_level`).
+        (Deep Sleep 기능이 꺼져 있거나 'Deep Sleep Capability' 열이 없으면(=run_analysis 실행 당시 옵션이
+        꺼져 있었음) ds_delta는 항상 0이 되어 기존 count(Level>=k)×pa_off_delta 공식과 동일하게 귀결됨 —
+        하위 호환 보장).
 
         [r0-후속2] ES 적용대상 cell/band를 찾지 못해(eMTC/ENDC anchor 강제 조정 등으로) ES Level 1조차
         생성되지 않은 sector는 `_run_es_level_simulation`이 애초에 시뮬레이션을 수행하지 않으므로
@@ -2859,52 +3009,10 @@ class ESAnalyzerApp(AppDashboard):
             try: df_estat = self._parse_energy_stat_for_range(start_date, end_date, eval_hours=eval_hours)
             except Exception: df_estat = None
 
-        # [r17] Deep Sleep 교차-Sector 판정 준비: eNodeBID별 (Time x Sector) Applied_ES_Level 피벗과,
-        # (eNodeBID, group_id) -> [(sector, off_level), ...] 멤버 목록. Deep Sleep이 꺼져 있으면 비워 둔다
-        # (아래 계산에서 자동으로 기존 방식으로 폴백).
-        level_wide_by_enb = {}
-        group_members = {}
-        if deep_sleep_on and timeline_df is not None and not timeline_df.empty and 'eNodeBID' in timeline_df.columns:
-            tdf = timeline_df[timeline_df['In_Eval_Window']] if 'In_Eval_Window' in timeline_df.columns else timeline_df
-            for enb, grp in tdf.groupby(tdf['eNodeBID'].astype(str)):
-                try:
-                    level_wide_by_enb[enb] = grp.pivot_table(index='Time', columns=grp['Sector'].astype(str), values='Applied_ES_Level', aggfunc='first')
-                except Exception:
-                    pass
-
-            ds_rows = self.latest_optimizer_results[self.latest_optimizer_results['ES Level'] != 7]
-            for _, r in ds_rows.iterrows():
-                try: gid = int(r.get('Deep Sleep Capability', -1))
-                except Exception: gid = -1
-                if gid == -1: continue
-                enb = str(r['eNodeBID'])
-                group_members.setdefault(enb, {}).setdefault(gid, []).append((str(r['Sector']), int(r['ES Level'])))
-
-        def _group_all_off_series(enodeb, members):
-            """members(=[(sector, off_level), ...])가 전부 자기 sector에서 off_level 이상으로 꺼져 있는
-            시각들의 불리언 Series(Time 인덱스)를 반환 - 데이터가 없는 sector가 하나라도 있으면 보수적으로
-            항상 False(=Deep Sleep 조건 미충족으로 간주, 과다 절감 방지)."""
-            wide = level_wide_by_enb.get(enodeb)
-            if wide is None or wide.empty: return None
-            result = None
-            for sector, off_level in members:
-                if sector not in wide.columns:
-                    return pd.Series(False, index=wide.index)
-                col_ok = wide[sector].fillna(0) >= off_level
-                result = col_ok if result is None else (result & col_ok)
-            return result
-
-        # [최적화] 같은 (eNodeBID, group_id)는 여러 band/level(여러 sector에 걸칠 수도 있음)에서 반복
-        # 참조될 수 있는데, 매번 다시 계산하면 동일한 "그룹 전체 off" Series를 중복 계산하게 된다 -
-        # 한 번 계산한 결과는 캐시해 재사용한다.
-        _all_off_cache = {}
-
-        def _group_all_off_series_cached(enodeb, gid):
-            cache_key = (enodeb, gid)
-            if cache_key not in _all_off_cache:
-                members = group_members.get(enodeb, {}).get(gid, [])
-                _all_off_cache[cache_key] = _group_all_off_series(enodeb, members)
-            return _all_off_cache[cache_key]
+        # [r17-후속2] Deep Sleep 교차-Sector 적격 스텝 수 - _run_es_level_simulation의 'Level k DS Count'와
+        # 동일한 결과를 재사용(숫자 일치 보장). ds_delta(k)는 rupt에서 가져온다(_build_ru_profile_table).
+        ds_eligible = self._compute_deep_sleep_eligible_steps(timeline_df) if deep_sleep_on else {}
+        rupt = self._build_ru_profile_table() if deep_sleep_on else pd.DataFrame()
 
         rows = []
         covered_pairs = set()
@@ -2917,39 +3025,27 @@ class ESAnalyzerApp(AppDashboard):
                     (self.latest_optimizer_results['Sector'].astype(str) == sector) &
                     (self.latest_optimizer_results['ES Level'] != 7)
                 ]
-                # [최적화] level_deltas/level_group을 cell_res를 두 번 순회하며 각각 만들던 것을 한 번의
-                # 순회로 합침.
-                level_deltas, level_group = {}, {}
-                has_capability_col = deep_sleep_on and 'Deep Sleep Capability' in cell_res.columns
+                level_pa_off, level_target_cells = {}, {}
                 for _, r in cell_res.iterrows():
                     lv = int(r['ES Level'])
-                    level_deltas[lv] = self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
-                    if has_capability_col:
-                        try: level_group[lv] = int(r.get('Deep Sleep Capability', -1))
-                        except Exception: level_group[lv] = -1
+                    level_pa_off[lv] = self._power_deltas_for_level(enodeb, r.get('Target Cell Num', ''))
+                    level_target_cells[lv] = r.get('Target Cell Num', '')
 
-                wide = level_wide_by_enb.get(enodeb) if deep_sleep_on else None
-                sector_level_series = wide[sector] if (wide is not None and sector in wide.columns) else None
+                sector_ds_eligible = ds_eligible.get((enodeb, sector), {})
 
                 saved_wh, deep_sleep_bonus_raw = 0.0, 0.0
                 for k in range(1, max_n + 1):
-                    pa_off_delta, elevated_delta = level_deltas.get(k, (0.0, 0.0))
+                    pa_off_delta = level_pa_off.get(k, 0.0)
                     count_eq_k = int(srow.get(f'Level {k} Count', 0))
                     count_gt_k = sum(int(srow.get(f'Level {lv} Count', 0)) for lv in range(k + 1, max_n + 1))
 
-                    eligible_steps = 0
-                    gid = level_group.get(k, -1)
-                    if gid != -1 and sector_level_series is not None:
-                        all_off = _group_all_off_series_cached(enodeb, gid)
-                        if all_off is not None:
-                            passed_k = sector_level_series.reindex(all_off.index).fillna(0) > k
-                            eligible_steps = min(int((passed_k & all_off).sum()), count_gt_k)  # 집계 카운트 초과 방지(안전장치)
-                    fallback_steps = count_gt_k - eligible_steps
+                    raw_eligible = sector_ds_eligible.get(k, 0)
+                    eligible_steps = min(raw_eligible, count_gt_k)  # 집계 카운트 초과 방지(안전장치)
+                    ds_delta = self._deep_sleep_bonus_delta_for_level(rupt, enodeb, level_target_cells.get(k, '')) if eligible_steps > 0 else 0.0
 
-                    saved_wh += pa_off_delta * count_eq_k * 0.25
-                    saved_wh += elevated_delta * eligible_steps * 0.25
-                    saved_wh += pa_off_delta * fallback_steps * 0.25
-                    deep_sleep_bonus_raw += (elevated_delta - pa_off_delta) * eligible_steps * 0.25
+                    saved_wh += pa_off_delta * (count_eq_k + count_gt_k) * 0.25
+                    saved_wh += ds_delta * eligible_steps * 0.25
+                    deep_sleep_bonus_raw += ds_delta * eligible_steps * 0.25
                 saved_wh *= gamma2
                 deep_sleep_bonus_wh = deep_sleep_bonus_raw * gamma2
 
@@ -4602,23 +4698,34 @@ class ESAnalyzerApp(AppDashboard):
         return None
 
     def _rupt_power_state_values(self, spec_row):
-        """spec_row(매칭된 RU/MMU Spec 행 또는 None)로부터 (CellOff, TxPathOff, DeepSleep, SuperSleep) =
-        각각 (Idle-PA off, Idle-Tx path off, Idle-Deep Sleep, Idle-Super Sleep)을 계산. spec_row가
-        None이면 4개 모두 -1. 개별 상태 값이 spec에 없거나(NaN) Idle이 없으면 그 상태만 -1."""
+        """spec_row(매칭된 RU/MMU Spec 행 또는 None)로부터 (CellOff, TxPathOff, DeepSleep, SuperSleep)을
+        계산. CellOff/TxPathOff는 Idle 기준(Idle-PA off/Idle-Tx path off - 하위 호환). [r17-후속2]
+        DeepSleep/SuperSleep은 PA off 대비 '추가' 절감분(PA off-Deep Sleep/PA off-Super Sleep)이다 -
+        Idle 기준이 아닌 이유: `_calc_es_level_simulation_savings`가 이미 PA off 절감을 기본으로 매 스텝
+        적용하고, Deep Sleep은 그 위에 얹는 추가 절감이기 때문(Idle 기준으로 계산하면 PA off 절감분을
+        중복 차감하게 됨). 결과가 음수(=Spec DB에 Deep/Super Sleep 소비전력이 PA off보다 크게 잘못
+        입력된 경우 등)이면 0으로 clamp한다(추가 절감이 없을 뿐, 손해로 계산되면 안 됨). spec_row가
+        None이거나 개별 상태 값이 spec에 없으면(NaN) 그 항목은 -1."""
         if spec_row is None:
             return (-1, -1, -1, -1)
 
-        def _delta(state_col):
+        def _delta(base_col, state_col, clamp_zero=False):
             try:
-                idle = float(spec_row.get('Idle', np.nan))
+                base = float(spec_row.get(base_col, np.nan))
                 val = float(spec_row.get(state_col, np.nan))
             except (TypeError, ValueError):
                 return -1
-            if pd.isna(idle) or pd.isna(val):
+            if pd.isna(base) or pd.isna(val):
                 return -1
-            return idle - val
+            d = base - val
+            return max(d, 0.0) if (clamp_zero and d < 0) else d
 
-        return (_delta('PA off'), _delta('Tx path off'), _delta('Deep Sleep'), _delta('Super Sleep'))
+        return (
+            _delta('Idle', 'PA off'),
+            _delta('Idle', 'Tx path off'),
+            _delta('PA off', 'Deep Sleep', clamp_zero=True),
+            _delta('PA off', 'Super Sleep', clamp_zero=True),
+        )
 
     def _build_ru_profile_table(self):
         """[r17] RU profile table(rupt) - 각 탭의 CM/RU 관련 동작에서 공유해 재사용하기 위한 표.
