@@ -686,9 +686,33 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     run_analysis 스모크 테스트 - Rawdata가 24시간 전체를 담고 ES_Window_Index가 0~5시에만 표시되며
     정책(Operating Hours)은 기존과 동일함을 확인. 기존 회귀 테스트 전체(capability/ES mode Type/rupt/
     RU-centric savings/DS Count) 재실행해 모두 통과(Coe=1.0 fixture라 값 불변). `python -m py_compile` 통과.
+
+[v17.7] (2026-07-10) GUI 색감/편의성 개선(사용자 요청 "더 밝고 멋지게" + 리뷰 중 발견한 불편 사항):
+  - **팔레트/스타일 전면 정리**(AppBase.__init__): 더 밝고 청량한 배경(#F3F7FD) + 탭/표/입력창/버튼/
+    스크롤바까지 일관된 스타일 적용. 탭(Notebook)은 선택 시 카드처럼 흰 배경+파란 글자로 떠 보이게,
+    Treeview는 행 높이 26px/파스텔 블루 헤더/파란 선택색, 입력창(Entry/Combobox/Spinbox)은 포커스 시
+    파란 테두리 강조, 기본 버튼도 hover/pressed 반응이 있는 소프트 블루로. 창 제목을
+    "ESM — Energy Saving Manager (r17)"로 갱신하고 minsize(1000x720) 지정.
+  - **모든 표(Treeview) 공통 마감 처리** (`_finalize_tree` - _update_tree/_update_tree_precise/
+    _refresh_editor_tree/_update_cm_treeview/결과 뷰어에 일괄 적용):
+    (a) 줄무늬(zebra) 행 배경으로 가독성 개선. (b) 열 너비 자동 조정(헤더+상위 60행 실측 폭, 70~360px
+    클램프) - 기존 고정 100~140px로 긴 헤더/값이 잘리던 불편 해소. (c) **헤더 클릭 정렬**을 모든 표로
+    확대(기존에는 CM 표만 지원) - 표시값 기준 in-place 정렬이라("1,234.56" 콤마 표기도 숫자로 인식,
+    재클릭 시 역순) 편집기 표의 iid↔DataFrame index 매핑(더블클릭 편집/행 삭제)도 깨지지 않는다.
+    기존 _sort_cm_tree(DataFrame 재렌더링 방식)는 이 공용 정렬로 대체.
+  - **마우스 휠 스크롤 확대**: Learning 탭에만 있던 휠 스크롤(Enter/Leave 동안만 bind_all)을 공용
+    헬퍼 `_enable_canvas_mousewheel`로 승격해 일괄 저장 팝업(eNodeBID 체크리스트)과 DB Editors의 행
+    편집 팝업에도 적용(팝업이 닫힌 뒤 휠 이벤트가 남는 경우 방어 처리 포함).
+  - **자잘한 UX**: 고급 설정 버튼이 접힘/펼침 상태를 ▼/▲로 반영(Optimizer/Energy Dashboard 둘 다),
+    _update_tree의 NaN이 'nan' 대신 'N/A'로 표시(_update_tree_precise와 통일), 행 편집 팝업 배경색 통일.
+  - **검증**: 신규 test_gui_polish.py - 창 제목/minsize, 탭·헤더·rowheight 스타일 반영, NaN='N/A'
+    포맷, zebra 태그(정렬 후 재적용 포함), 긴 헤더 열 자동 확장, 숫자 인식 정렬 asc/desc, 편집기 표
+    정렬 후 iid 매핑 유지, ▼/▲ 토글, 빈 CM 검색 가드까지 자동 확인. 기존 회귀 테스트 전체 재실행
+    통과. `python -m py_compile` 통과(GUI 변경은 스타일/표 렌더링 계층에 한정 - 계산 로직 무변경).
 """
 
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk, simpledialog
 import pandas as pd
 import numpy as np
@@ -763,9 +787,13 @@ class AppBase(BaseTk):
     def __init__(self):
         super().__init__()
 
-        self.BG_COLOR, self.ACCENT_BLUE, self.ACCENT_GREEN = '#F4F7FB', '#3B82F6', '#10B981'
-        self.TEXT_COLOR, self.FRAME_BG = '#1F2937', '#FFFFFF'
+        # [r17-후속6] GUI 색감/편의성 개선 - 더 밝고 청량한 팔레트 + 탭/표/입력창/스크롤바까지 일관된 스타일.
+        self.BG_COLOR, self.ACCENT_BLUE, self.ACCENT_GREEN = '#F3F7FD', '#3B82F6', '#10B981'
+        self.TEXT_COLOR, self.FRAME_BG = '#1E293B', '#FFFFFF'
         self.PLOT_BG, self.AXES_BG, self.GRID_COLOR = '#FFFFFF', '#F8FAFC', '#CBD5E1'
+        self.HEADING_BG, self.HEADING_FG = '#E3EDFB', '#1E3A8A'   # Treeview 헤더
+        self.ZEBRA_EVEN = '#F3F8FF'                                # Treeview 짝수행 줄무늬
+        self.SELECT_BG = '#BFDBFE'                                 # Treeview 선택행
 
         self.style = ttk.Style(self)
         if 'clam' in self.style.theme_names(): self.style.theme_use('clam')
@@ -774,14 +802,55 @@ class AppBase(BaseTk):
         self.style.configure('Card.TFrame', background=self.FRAME_BG, relief='flat')
         self.style.configure('TLabel', background=self.BG_COLOR, foreground=self.TEXT_COLOR, font=('Segoe UI', 10))
         self.style.configure('Card.TLabel', background=self.FRAME_BG, foreground=self.TEXT_COLOR, font=('Segoe UI', 10))
-        self.style.configure('TButton', font=('Segoe UI', 10, 'bold'), padding=6)
-        self.style.configure('Primary.TButton', font=('Segoe UI', 10, 'bold'), background=self.ACCENT_BLUE, foreground='white')
-        self.style.map('Primary.TButton', background=[('active', '#2563EB')])
-        self.style.configure('Success.TButton', font=('Segoe UI', 11, 'bold'), background=self.ACCENT_GREEN, foreground='white')
-        self.style.map('Success.TButton', background=[('active', '#059669')])
 
-        self.title("Energy Saving Policy Optimizer (Final Unified)")
+        # 버튼: 기본 버튼도 부드러운 하늘색 배경 + hover/pressed 반응을 준다.
+        self.style.configure('TButton', font=('Segoe UI', 10, 'bold'), padding=(10, 6),
+                             background='#E8F0FC', foreground=self.HEADING_FG, borderwidth=0)
+        self.style.map('TButton', background=[('pressed', '#C2D8F7'), ('active', '#D4E4FA')])
+        self.style.configure('Primary.TButton', font=('Segoe UI', 10, 'bold'), background=self.ACCENT_BLUE, foreground='white')
+        self.style.map('Primary.TButton', background=[('pressed', '#1D4ED8'), ('active', '#2563EB')])
+        self.style.configure('Success.TButton', font=('Segoe UI', 11, 'bold'), background=self.ACCENT_GREEN, foreground='white')
+        self.style.map('Success.TButton', background=[('pressed', '#047857'), ('active', '#059669')])
+
+        # 탭(Notebook): 선택된 탭이 카드처럼 떠 보이도록 흰 배경 + 파란 글자.
+        self.style.configure('TNotebook', background=self.BG_COLOR, borderwidth=0, tabmargins=(8, 6, 8, 0))
+        self.style.configure('TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=(16, 8),
+                             background='#DCE7F7', foreground='#64748B')
+        self.style.map('TNotebook.Tab', background=[('selected', self.FRAME_BG)],
+                       foreground=[('selected', self.ACCENT_BLUE)])
+
+        # 표(Treeview): 행 높이/헤더/선택색 - 줄무늬(zebra)는 _finalize_tree에서 행 태그로 적용.
+        self.style.configure('Treeview', background=self.FRAME_BG, fieldbackground=self.FRAME_BG,
+                             foreground=self.TEXT_COLOR, rowheight=26, font=('Segoe UI', 10), borderwidth=0)
+        self.style.configure('Treeview.Heading', font=('Segoe UI', 10, 'bold'), background=self.HEADING_BG,
+                             foreground=self.HEADING_FG, relief='flat', padding=(6, 6))
+        self.style.map('Treeview.Heading', background=[('active', '#D0E1F9')])
+        self.style.map('Treeview', background=[('selected', self.SELECT_BG)], foreground=[('selected', self.TEXT_COLOR)])
+
+        # LabelFrame/입력 위젯: 옅은 파란 테두리 + 포커스 시 파란 강조.
+        self.style.configure('TLabelframe', background=self.BG_COLOR, bordercolor='#C9D9F0',
+                             lightcolor='#C9D9F0', darkcolor='#C9D9F0')
+        self.style.configure('TLabelframe.Label', background=self.BG_COLOR, foreground=self.HEADING_FG, font=('Segoe UI', 10, 'bold'))
+        for field_style in ('TEntry', 'TCombobox', 'TSpinbox'):
+            self.style.configure(field_style, fieldbackground=self.FRAME_BG, bordercolor='#C3D4EC',
+                                 lightcolor='#C3D4EC', padding=4)
+            self.style.map(field_style, bordercolor=[('focus', self.ACCENT_BLUE)],
+                           lightcolor=[('focus', self.ACCENT_BLUE)],
+                           fieldbackground=[('readonly', self.FRAME_BG)])
+        self.style.configure('TCheckbutton', background=self.FRAME_BG, foreground=self.TEXT_COLOR, font=('Segoe UI', 10))
+        self.style.map('TCheckbutton', background=[('active', self.FRAME_BG)])
+        self.style.configure('TRadiobutton', background=self.BG_COLOR, foreground=self.TEXT_COLOR, font=('Segoe UI', 10))
+        self.style.map('TRadiobutton', background=[('active', self.BG_COLOR)])
+
+        # 스크롤바: 트랙은 배경색에 녹이고 썸만 옅은 파랑으로.
+        for sb in ('Vertical.TScrollbar', 'Horizontal.TScrollbar'):
+            self.style.configure(sb, background='#C9D9F0', troughcolor=self.BG_COLOR,
+                                 bordercolor=self.BG_COLOR, arrowcolor='#5B7BB2')
+            self.style.map(sb, background=[('active', '#A9C3E8')])
+
+        self.title("ESM — Energy Saving Manager (r17)")
         self.geometry("1150x950")
+        self.minsize(1000, 720)
         self.configure(bg=self.BG_COLOR)
 
         self.traffic_file, self.cm_file, self.ciq_file, self.energy_stat_file = tk.StringVar(), tk.StringVar(), tk.StringVar(), tk.StringVar()
@@ -1211,8 +1280,13 @@ class AppBase(BaseTk):
             self.lbl_time.config(foreground=self.TEXT_COLOR); self.entry_time.config(state='normal')
 
     def toggle_advanced(self):
-        if self.show_advanced: self.advanced_frame.pack_forget(); self.show_advanced = False
-        else: self.advanced_frame.pack(fill=tk.X, before=self.run_btn.master); self.show_advanced = True
+        # [r17-후속6] 접힘/펼침 상태가 버튼 화살표(▼/▲)에 반영되도록 개선.
+        if self.show_advanced:
+            self.advanced_frame.pack_forget(); self.show_advanced = False
+            self.advanced_btn.config(text="고급 설정 (Advanced Settings) ▼")
+        else:
+            self.advanced_frame.pack(fill=tk.X, before=self.run_btn.master); self.show_advanced = True
+            self.advanced_btn.config(text="고급 설정 (Advanced Settings) ▲")
 
     def _create_empty_treeview(self, parent):
         tree_container = ttk.Frame(parent)
@@ -1223,6 +1297,79 @@ class AppBase(BaseTk):
         scroll_y.pack(side=tk.RIGHT, fill=tk.Y); scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         return tree
+
+    def _apply_tree_zebra(self, tree):
+        """[r17-후속6] Treeview 행에 줄무늬(zebra) 태그를 (재)적용한다 - 정렬로 행 순서가 바뀐 뒤에도 호출."""
+        tree.tag_configure('zebra_odd', background=self.FRAME_BG)
+        tree.tag_configure('zebra_even', background=self.ZEBRA_EVEN)
+        for i, iid in enumerate(tree.get_children('')):
+            tree.item(iid, tags=('zebra_even' if i % 2 else 'zebra_odd',))
+
+    def _sort_tree_by_column(self, tree, col, reverse):
+        """[r17-후속6] 어떤 방식으로 채워진 Treeview든 표시 중인 값 기준으로 그 자리에서 정렬한다
+        (숫자로 해석되는 값은 숫자로, 아니면 문자열로 - "1,234.56" 같은 천단위 콤마 표기도 숫자 인식).
+        iid를 옮기기만 하므로 편집기 트리의 iid↔DataFrame index 매핑도 그대로 유지된다."""
+        def _key(iid):
+            s = str(tree.set(iid, col)).replace(',', '').strip()
+            try:
+                return (0, float(s), '')
+            except ValueError:
+                return (1, 0.0, s.lower())
+        items = sorted(tree.get_children(''), key=_key, reverse=reverse)
+        for pos, iid in enumerate(items):
+            tree.move(iid, '', pos)
+        self._apply_tree_zebra(tree)
+        tree.heading(col, command=lambda: self._sort_tree_by_column(tree, col, not reverse))
+
+    def _finalize_tree(self, tree):
+        """[r17-후속6] 데이터가 채워진 직후 모든 Treeview에 공통으로 적용하는 마감 처리:
+        1) 줄무늬(zebra) 행 배경, 2) 열 너비 자동 조정(헤더+상위 60행 실측 폭 기준, 70~360px 클램프 -
+        기존에는 고정 100~140px이라 긴 헤더/값이 잘렸음), 3) 헤더 클릭 정렬(다시 클릭하면 역순)."""
+        self._apply_tree_zebra(tree)
+        try:
+            body_font = tkfont.Font(family='Segoe UI', size=10)
+            head_font = tkfont.Font(family='Segoe UI', size=10, weight='bold')
+        except Exception:
+            body_font = head_font = None
+        sample = tree.get_children('')[:60]
+        for col in tree['columns']:
+            if body_font is not None:
+                max_px = head_font.measure(str(col))
+                for iid in sample:
+                    max_px = max(max_px, body_font.measure(str(tree.set(iid, col))))
+                tree.column(col, width=min(max(max_px + 28, 70), 360), anchor=tk.CENTER)
+            tree.heading(col, command=lambda t=tree, c=col: self._sort_tree_by_column(t, c, False))
+
+    def _enable_canvas_mousewheel(self, canvas, hover_widget=None):
+        """[r17-후속6] 캔버스 기반 스크롤 영역에 마우스 휠을 연결한다. 캔버스 위에 자식 위젯이 겹쳐
+        있어도 동작하도록, 마우스가 영역에 들어와 있는 동안만 bind_all로 전역 휠 이벤트를 연결하고
+        벗어나면 즉시 해제한다(Learning 탭 시각화 영역에서 쓰던 방식을 공용 헬퍼로 승격 - 이제 일괄
+        저장 팝업/행 편집 팝업 등 다른 캔버스 스크롤 영역도 휠 스크롤이 된다)."""
+        target = hover_widget or canvas
+
+        def _on_wheel(event):
+            if not canvas.winfo_exists():  # 팝업이 휠 이벤트 처리 중 닫힌 경우 방어
+                return
+            if getattr(event, 'num', None) == 4: canvas.yview_scroll(-1, 'units')
+            elif getattr(event, 'num', None) == 5: canvas.yview_scroll(1, 'units')
+            elif getattr(event, 'delta', 0): canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
+
+        def _bind(_event):
+            target.bind_all('<MouseWheel>', _on_wheel)
+            target.bind_all('<Button-4>', _on_wheel)
+            target.bind_all('<Button-5>', _on_wheel)
+
+        def _unbind(_event):
+            try:
+                target.unbind_all('<MouseWheel>')
+                target.unbind_all('<Button-4>')
+                target.unbind_all('<Button-5>')
+            except Exception:
+                pass
+
+        target.bind('<Enter>', _bind)
+        target.bind('<Leave>', _unbind)
+        target.bind('<Destroy>', _unbind)
 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self)
@@ -1493,6 +1640,9 @@ class AppEditors(AppBase):
             tree.column(col, width=100, anchor=tk.CENTER)
         for idx, row in df.iterrows():
             tree.insert("", tk.END, iid=str(idx), values=list(row))
+        # [r17-후속6] 줄무늬/열 너비 자동 조정/헤더 클릭 정렬 - iid(=df index)는 정렬해도 유지되므로
+        # 더블클릭 편집/행 삭제의 매핑이 깨지지 않는다.
+        self._finalize_tree(tree)
 
     def _load_editor_excel(self, mode):
         filepath = filedialog.askopenfilename(filetypes=[("Files", "*.xlsx *.xls *.csv")])
@@ -1598,7 +1748,8 @@ class AppEditors(AppBase):
         popup = tk.Toplevel(self)
         popup.title("행 편집")
         popup.geometry("350x550")
-        canvas = tk.Canvas(popup)
+        popup.configure(bg=self.BG_COLOR)
+        canvas = tk.Canvas(popup, bg=self.BG_COLOR, highlightthickness=0)
         scrollbar = ttk.Scrollbar(popup, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
         scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -1606,6 +1757,7 @@ class AppEditors(AppBase):
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self._enable_canvas_mousewheel(canvas, hover_widget=popup)  # [r17-후속6] 열이 많을 때 휠 스크롤 지원
 
         entries = {}
         for i, col in enumerate(df.columns):
@@ -1702,13 +1854,16 @@ class AppDashboard(AppEditors):
         self.energy_plot_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
     def _toggle_energy_adv(self):
+        # [r17-후속6] 접힘/펼침 상태가 버튼 화살표(▼/▲)에 반영되도록 개선.
         if self.show_energy_adv:
             self.energy_adv_frame.pack_forget()
             self.show_energy_adv = False
+            self.energy_adv_btn.config(text="고급 설정 (Advanced Settings) ▼")
         else:
             # [수정] before=self.energy_plot_frame 속성 제거 (부모 프레임 계층 충돌 해결)
             self.energy_adv_frame.pack(fill=tk.X, pady=5)
             self.show_energy_adv = True
+            self.energy_adv_btn.config(text="고급 설정 (Advanced Settings) ▲")
 
 
     # ... 기존 _process_cm_ciq_data 등 나머지 메서드는 그대로 유지 ...
@@ -1833,9 +1988,12 @@ class AppDashboard(AppEditors):
         cols = list(df.columns)
         self.tree_map["columns"] = cols
         for col in cols:
-            self.tree_map.heading(col, text=col, command=lambda c=col: self._sort_cm_tree(c, False))
+            self.tree_map.heading(col, text=col)
             self.tree_map.column(col, width=120, anchor=tk.CENTER)
         for _, row in df.iterrows(): self.tree_map.insert("", tk.END, values=list(row))
+        # [r17-후속6] 헤더 클릭 정렬을 공용 in-place 정렬(_finalize_tree)로 통일 - 기존 _sort_cm_tree
+        # (DataFrame 재렌더링 방식) 대체.
+        self._finalize_tree(self.tree_map)
 
     def _filter_cm_tree(self, *args):
         query = self.search_var.get().lower()
@@ -1845,11 +2003,6 @@ class AppDashboard(AppEditors):
         if not query: return self._update_cm_treeview(self.cm_map_df_full)
         mask = np.column_stack([self.cm_map_df_full[col].astype(str).str.lower().str.contains(query, na=False) for col in self.cm_map_df_full])
         self._update_cm_treeview(self.cm_map_df_full.loc[mask.any(axis=1)])
-
-    def _sort_cm_tree(self, col, reverse):
-        df_sorted = self.cm_map_df_full.sort_values(by=col, ascending=not reverse)
-        self._update_cm_treeview(df_sorted)
-        self.tree_map.heading(col, command=lambda: self._sort_cm_tree(col, not reverse))
 
     def _parse_energy_stat_raw(self):
         """Energy Stat CSV를 로드/정규화만 하고 Dashboard의 날짜/시간 필터는 적용하지 않는 원본 파서.
@@ -2158,6 +2311,8 @@ class ESAnalyzerApp(AppDashboard):
 
             canvas.pack(side="left", fill="both", expand=True)
             scrollbar.pack(side="right", fill="y")
+
+            self._enable_canvas_mousewheel(canvas, hover_widget=frame_list)  # [r17-후속6] 휠 스크롤 지원
 
             self.check_vars = {}
             for enb in enodeb_list:
@@ -2695,8 +2850,10 @@ class ESAnalyzerApp(AppDashboard):
         for col in df.columns:
             tree.heading(col, text=col); tree.column(col, width=130, anchor=tk.CENTER)
         for _, row in df.iterrows():
-            formatted = [f"{v:,.2f}" if isinstance(v, (float, np.floating)) else v for v in row]
+            # [r17-후속6] NaN이 'nan'으로 표시되던 것을 'N/A'로(_update_tree_precise와 동일 규칙).
+            formatted = [("N/A" if pd.isna(v) else f"{v:,.2f}") if isinstance(v, (float, np.floating)) else v for v in row]
             tree.insert("", tk.END, values=formatted)
+        self._finalize_tree(tree)
 
     def _update_tree_precise(self, tree, df, precise_cols=()):
         """[Learning Energy Curve 전용] Slope처럼 값이 매우 작은 컬럼은 유효숫자 기준으로,
@@ -2716,6 +2873,7 @@ class ESAnalyzerApp(AppDashboard):
                 else:
                     formatted.append(v)
             tree.insert("", tk.END, values=formatted)
+        self._finalize_tree(tree)
 
     def _run_es_level_simulation(self, sim_raw_df, eval_start_date=None, eval_end_date=None, eval_hours=None):
         """[r15] Rawdata(_build_rawdata_for_period 결과, 15분 단위 raw 트래픽 + 레벨별 임계값/예측치 열 포함)를
@@ -4545,6 +4703,7 @@ class ESAnalyzerApp(AppDashboard):
             for col in df.columns:
                 tree.heading(col, text=col); tree.column(col, width=120, anchor=tk.CENTER)
             for _, row in df.iterrows(): tree.insert("", tk.END, values=list(row))
+            self._finalize_tree(tree)  # [r17-후속6] 줄무늬/열 너비/헤더 정렬
 
         create_treeview(frame_res, result_df)
         create_treeview(frame_int, inter_df)
@@ -4681,27 +4840,9 @@ class ESAnalyzerApp(AppDashboard):
         self.learning_plot_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         plot_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # [r13-update] 마우스 휠 스크롤 지원: 캔버스 위젯에만 bind하면 그 위에 그려진 matplotlib
-        # 차트(자식 위젯)에 마우스가 있을 때는 휠 이벤트가 전달되지 않으므로, 시각화 탭 영역에
-        # 마우스가 들어와 있는 동안만 bind_all로 전역 휠 이벤트를 캔버스 스크롤에 연결한다(탭을
-        # 벗어나면 즉시 해제해 다른 스크롤 가능 위젯에 영향을 주지 않는다).
-        def _on_mousewheel(event):
-            if getattr(event, 'num', None) == 4: self.learning_plot_canvas.yview_scroll(-1, "units")
-            elif getattr(event, 'num', None) == 5: self.learning_plot_canvas.yview_scroll(1, "units")
-            elif getattr(event, 'delta', 0): self.learning_plot_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-        def _bind_wheel(_event):
-            plot_outer.bind_all("<MouseWheel>", _on_mousewheel)
-            plot_outer.bind_all("<Button-4>", _on_mousewheel)
-            plot_outer.bind_all("<Button-5>", _on_mousewheel)
-
-        def _unbind_wheel(_event):
-            plot_outer.unbind_all("<MouseWheel>")
-            plot_outer.unbind_all("<Button-4>")
-            plot_outer.unbind_all("<Button-5>")
-
-        plot_outer.bind("<Enter>", _bind_wheel)
-        plot_outer.bind("<Leave>", _unbind_wheel)
+        # [r13-update, r17-후속6에서 공용 헬퍼로 통합] 마우스 휠 스크롤 지원: 캔버스 위에 그려진
+        # matplotlib 차트(자식 위젯)에 마우스가 있어도 동작하도록 Enter/Leave 동안만 bind_all 연결.
+        self._enable_canvas_mousewheel(self.learning_plot_canvas, hover_widget=plot_outer)
 
         # [r13-update] 창 크기에 따라 그래프 폭도 함께 변하도록, 탭 영역 크기가 바뀔 때마다
         # (드래그 중 매 픽셀이 아니라 크기 변경이 멈춘 뒤) 마지막 학습 결과로 그래프를 다시 그린다.
