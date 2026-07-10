@@ -709,6 +709,33 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     포맷, zebra 태그(정렬 후 재적용 포함), 긴 헤더 열 자동 확장, 숫자 인식 정렬 asc/desc, 편집기 표
     정렬 후 iid 매핑 유지, ▼/▲ 토글, 빈 CM 검색 가드까지 자동 확인. 기존 회귀 테스트 전체 재실행
     통과. `python -m py_compile` 통과(GUI 변경은 스타일/표 렌더링 계층에 한정 - 계산 로직 무변경).
+
+[v17.8] (2026-07-10) 사용자 버그 리포트 2건 대응: 절감 에너지 전부 0 회귀 수정 + "Max ES Level은
+1인데 ES Level 1 행이 없는" 사유 가시화:
+  - **[버그 수정, 중요] rupt RU Model↔Spec 매칭 대소문자 회귀**: `_rupt_match_ru_spec_row`만 대소문자를
+    구분해서(기존의 다른 모든 Spec 조회 경로는 `.lower()` 비교), CM의 board-type과 RU/MMU Spec DB의
+    표기 케이스가 다르면(실데이터에서 흔함) 3단계 fallback 전부 미매칭 → rupt의 CellOff/TxPathOff/
+    DeepSleep/SuperSleep이 전부 -1 → v17.5(rupt 기반 절감 계산)부터 **모든 sector의 절감 에너지가
+    0으로 나오는 회귀**가 있었다. 3단계 모두 대소문자 무시로 수정(`_rupt_model_coe_map`도 같은 함수를
+    쓰므로 자동 반영). "이전에는(v17.4 이하, 소문자 비교하던 옛 경로) 안 그랬는데 지금은 전부 0"이라는
+    증상과 정확히 일치.
+  - **[가시화] 임계값 탐색 실패로 인한 ES Level 행 미생성 사유를 Note로 표기**: Max ES Level=N인데
+    레벨 행이 없고 ES Level 7만 있는 것은 버그가 아니라 기존 설계 동작 - `_generate_core_policy`가
+    어떤 레벨의 RB 임계값도 목표 Tput(t_target)·Guarantee Ratio를 만족시키지 못하면 그 band를
+    ES 미적용(ES7)으로 편입한다(대표 원인: 해당 운영시간에 DL 트래픽이 없어 SP=0 → alpha=0 → 예측
+    Tput이 항상 0 < 목표). 다만 그동안 화면에 아무 설명이 없어 혼란스러웠으므로, ES7 행의 Note에
+    "임계값 탐색 실패로 ES 미적용 전환된 band: ... (alpha=...)"를 기록한다. run_analysis의 Note
+    병합도 sector 공통 Note(eMTC/ENDC/Coverage)와 행별 Note를 덮어쓰지 않고 합치도록 수정.
+  - **[가시화] 절감 효과 표에 '비고' 열 신설**: 절감이 0인 sector에 그 사유를 자동 표기 -
+    (a) "RU Model '...'이 RU/MMU Spec에 미매칭(CellOff=-1)", (b) "PA 공유 cell(...)의 off 시점
+    불명(ES Level 미배정/유령 cell) → 그룹 절감 차단", (c) "시뮬레이션 timeline에 해당 sector 데이터
+    없음", (d) "평가 기간 내 PA 그룹 전체 동시 off 스텝 0회", (e) 정책 자체가 없는 SectorList sector는
+    "ES Level 정책 없음(ESM Output Result의 Note 참고)". 실데이터에서 절감 0의 원인을 표에서 바로
+    확인할 수 있다(`_calc_cell_off_savings_by_ru`의 diag 파라미터).
+  - **검증**: 신규 test_bug_report_fixes.py - 케이스 불일치 데이터로 3단계 매칭 전부 성공(CellOff=40,
+    -1 아님) + end-to-end 절감 70Wh 복원, 진짜 미매칭/유령 cell/정책 없음 각각의 '비고' 문구 확인,
+    alpha=0 시나리오에서 ES7 행 Note에 탈락 band·alpha 표기 확인, 정상 alpha에서는 Level 1 행이
+    기존대로 생성되고 실패 Note가 없음(회귀 없음) 확인. 기존 회귀 테스트 전체 통과.
 """
 
 import tkinter as tk
@@ -3112,7 +3139,7 @@ class ESAnalyzerApp(AppDashboard):
                     result[key] = (sec, lv)
         return result
 
-    def _calc_cell_off_savings_by_ru(self, rupt, cell_off_level, level_wide_by_enb):
+    def _calc_cell_off_savings_by_ru(self, rupt, cell_off_level, level_wide_by_enb, diag=None):
         """[r17-후속4] CellOff(PA off 이상) 절감을 물리 RU(BID/PID/CID) + PA shared(공유 PA cell 집합)
         단위로 계산한다(Deep Sleep 옵션과 무관하게 항상 동작 - 이 부분은 base ES 절감 자체의 정확도
         개선이다). 'PA shared'는 같은 PA를 공유하는 cell 전체 집합을 뜻하므로, 그 안의 모든 cell이
@@ -3124,6 +3151,9 @@ class ESAnalyzerApp(AppDashboard):
         (사용자 확인).
         [r17-후속5] 절감 W값은 rupt의 CellOff(순수 Spec 차이값)에 그 RU Model의 Coe_paoff(실측
         보정계수, `_rupt_model_coe_map`)를 곱해 사용한다 - 기존(r16~v17.2) 동작 복원.
+        [r17-후속7] diag dict를 넘기면 절감이 발생하지 못한 RU 그룹의 사유를 {(enodeb, sector):
+        {사유 문자열,...}}로 채워준다 - 실데이터에서 "왜 이 sector 절감이 0인가"를 결과 표의 '비고'
+        열로 바로 확인할 수 있게 하기 위함.
         반환: {(enodeb, sector): raw_wh(감마 적용 전)}."""
         acc = {}
         if rupt is None or rupt.empty or not cell_off_level:
@@ -3135,8 +3165,9 @@ class ESAnalyzerApp(AppDashboard):
             ne_id = str(r['NE ID'])
             key = (ne_id, r.get('BID', ''), r.get('PID', ''), r.get('CID', ''))
             pa_shared = str(r.get('PA shared', '') or '')
+            model = str(r.get('RU Model', '') or '')
             entry = ru_groups.setdefault(key, {}).setdefault(pa_shared, {
-                'members': set(), 'cell_off': r.get('CellOff', -1), 'coe': coe_map.get(r.get('RU Model', ''), 1.0)})
+                'members': set(), 'cell_off': r.get('CellOff', -1), 'coe': coe_map.get(model, 1.0), 'model': model})
             entry['members'].update(re.findall(r'\d+', pa_shared))
 
         for (ne_id, bid, pid, cid), pa_map in ru_groups.items():
@@ -3144,35 +3175,45 @@ class ESAnalyzerApp(AppDashboard):
             if n_groups == 0:
                 continue
             for pa_str, info in pa_map.items():
+                # 멤버 cell들의 (sector, off_level)을 먼저 해석해, 실패 사유를 관련 sector에 귀속시킨다.
+                resolved, missing = [], []
+                for c in sorted(info['members']):
+                    m = cell_off_level.get((ne_id, c))
+                    if m is None: missing.append(c)
+                    else: resolved.append(m)
+                diag_sectors = sorted(set(s for s, _ in resolved))
+
+                def _note(msg):
+                    if diag is None: return
+                    for s in diag_sectors:
+                        diag.setdefault((ne_id, s), set()).add(msg)
+
                 try:
                     cell_off_val = float(info['cell_off'])
                 except (TypeError, ValueError):
                     continue
                 if cell_off_val < 0:  # rupt 매칭 실패(-1) - 절감 데이터 없음
+                    _note(f"RU Model '{info['model']}'이 RU/MMU Spec에 미매칭(CellOff=-1)")
                     continue
                 cell_off_val *= info['coe']
-                members = []
-                ok = True
-                for c in info['members']:
-                    m = cell_off_level.get((ne_id, c))
-                    if m is None:
-                        ok = False
-                        break
-                    members.append(m)
-                if not ok or not members:
+                if missing:
+                    _note(f"PA 공유 cell({','.join(missing)})의 off 시점 불명(ES Level 미배정/유령 cell) → 그룹 절감 차단")
                     continue
-                all_off = self._members_all_off_series(level_wide_by_enb.get(ne_id), members, strict=False)
+                if not resolved:
+                    continue
+                all_off = self._members_all_off_series(level_wide_by_enb.get(ne_id), resolved, strict=False)
                 if all_off is None:
+                    _note("시뮬레이션 timeline에 해당 sector 데이터 없음")
                     continue
                 eligible_steps = int(all_off.sum())
                 if eligible_steps <= 0:
+                    _note("평가 기간 내 PA 그룹 전체 동시 off 스텝 0회")
                     continue
                 wh = (cell_off_val / n_groups) * eligible_steps * 0.25
-                sectors_involved = sorted(set(s for s, _ in members))
-                if not sectors_involved:
+                if not diag_sectors:
                     continue
-                share = wh / len(sectors_involved)
-                for s in sectors_involved:
+                share = wh / len(diag_sectors)
+                for s in diag_sectors:
                     acc_key = (ne_id, s)
                     acc[acc_key] = acc.get(acc_key, 0.0) + share
         return acc
@@ -3438,7 +3479,10 @@ class ESAnalyzerApp(AppDashboard):
         level_wide_by_enb = self._build_level_wide_by_enb(timeline_df)
         rupt = self._build_ru_profile_table()
         cell_off_level = self._build_cell_off_level_map()
-        cell_off_acc = self._calc_cell_off_savings_by_ru(rupt, cell_off_level, level_wide_by_enb)
+        # [r17-후속7] 절감이 0인 sector의 사유(RU Model 미매칭/PA 그룹 차단/동시 off 스텝 0 등)를
+        # 결과 표의 '비고' 열로 노출 - 실데이터 디버깅용.
+        saving_diag = {}
+        cell_off_acc = self._calc_cell_off_savings_by_ru(rupt, cell_off_level, level_wide_by_enb, diag=saving_diag)
         ds_bonus_acc = self._calc_deep_sleep_bonus_by_group(rupt, level_wide_by_enb) if deep_sleep_on else {}
         # [r17-후속5] sector×RU마다 df_estat를 재스캔하지 않고 (eNodeBID, Sector)별 소모 Wh를 한 번에 계산.
         sector_energy = self._sector_energy_wh_map(df_estat)
@@ -3462,12 +3506,15 @@ class ESAnalyzerApp(AppDashboard):
                 pct = (saved_wh / consumed_wh * 100) if consumed_wh else np.nan
                 violation_ratio = (violation_cnt / es_active) if es_active else 0.0
 
+                # [r17-후속7] 절감이 0으로 나온 sector에는 진단 사유를 '비고'로 함께 표기.
+                remark = '; '.join(sorted(saving_diag.get(key, []))) if saved_wh == 0 else ''
                 rows.append({
                     'eNodeBID': enodeb, 'Sector': sector,
                     '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': round(saved_wh, 2),
                     '중 Deep Sleep 추가 절감 [Wh]': round(deep_sleep_bonus_wh, 2),
                     '절감률 (%)': round(pct, 2) if pd.notna(pct) else np.nan,
                     'Tput Violation Count': violation_cnt, 'Tput Violation Ratio': round(violation_ratio, 4),
+                    '비고': remark,
                 })
 
         # [r0-후속2] ES Level이 없어 시뮬레이션 자체가 수행되지 않은 SectorList sector - 절감 0으로 채움.
@@ -3481,6 +3528,9 @@ class ESAnalyzerApp(AppDashboard):
                 '중 Deep Sleep 추가 절감 [Wh]': 0.0,
                 '절감률 (%)': 0.0 if consumed_wh else np.nan,
                 'Tput Violation Count': 0, 'Tput Violation Ratio': 0.0,
+                # [r17-후속7] ES Level 정책이 아예 없는 sector - 임계값 탐색 실패로 전 band가 ES7로
+                # 편입된 경우가 대표적(ESM Output Result의 Note에 상세 사유 기재됨).
+                '비고': 'ES Level 정책 없음(ESM Output Result의 Note 참고)',
             })
 
         result_df = pd.DataFrame(rows)
@@ -3495,6 +3545,7 @@ class ESAnalyzerApp(AppDashboard):
                 '절감률 (%)': round(total_saved / total_consumed * 100, 2) if total_consumed else np.nan,
                 'Tput Violation Count': int(total_violation),
                 'Tput Violation Ratio': round(total_violation / total_active, 4) if total_active else 0.0,
+                '비고': '',
             }
             result_df = pd.concat([result_df, pd.DataFrame([total_row])], ignore_index=True)
         return result_df
@@ -3972,11 +4023,21 @@ class ESAnalyzerApp(AppDashboard):
         if es7_bands:
             es7_target_cells = self._get_target_cells_str(es7_bands, carrier_df, target_col)
             if es7_target_cells:
+                # [r17-후속7] 임계값 탐색 실패로 ES 적용대상에서 탈락한 band는 그동안 조용히 ES7로
+                # 편입되어, "Max ES Level은 1인데 ES Level 1 행이 없는" 결과가 왜 나왔는지 화면에서
+                # 알 수 없었다 - 탈락 band와 그 원인(알파값)을 Note로 남긴다(run_analysis가 sector
+                # 공통 Note와 합쳐 최종 표기).
+                fail_note = ''
+                if failed_es_bands:
+                    fail_note = (f"임계값 탐색 실패로 ES 미적용(ES Level 7) 전환된 band: "
+                                 f"{', '.join(failed_es_bands)} (alpha={alpha:.4f}"
+                                 f"{', DL 트래픽 없음/SP=0으로 예측 Tput 산출 불가' if alpha == 0 else ''}"
+                                 f" - 예측 Tput이 목표({t_target:.2f}Mbps)를 Guarantee Ratio 이상 만족하는 임계값 없음).")
                 sector_results.append({
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6), 'Max ES Level': max_n, 'ES Level': 7,
                     'ES mode Type': '', 'Target Cell Num': es7_target_cells, 'DRBn': 0, 'RBlow': rb_low, 'RBThreshold': -1,
                     **self._build_th_cols(-1, total_rb, t_target),
-                    'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
+                    'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0, 'Note': fail_note
                 })
 
         ax.axhline(y=t_target, color='#EF4444', linestyle='-', linewidth=2, label=f'Target (t)={t_target}')
@@ -4622,7 +4683,9 @@ class ESAnalyzerApp(AppDashboard):
                     res, inter, raw = self._do_manual_mode(group, str(enodeb), str(sector), max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, rb_mult, plot_dir)
 
                 # [r0] eMTC/ENDC anchor 보장으로 인한 강제 제외가 있었으면 이 sector의 모든 결과 행에 note로 기록.
-                for r in res: r['Note'] = sector_note
+                # [r17-후속7] 정책 생성 단계에서 행별로 남긴 Note(임계값 탐색 실패 안내 등)를 덮어쓰지 않고 병합.
+                for r in res:
+                    r['Note'] = " ".join(x for x in [sector_note, r.get('Note', '')] if x).strip()
 
                 output_results.extend(res)
                 intermediate_data_list.extend(inter)
@@ -5073,11 +5136,15 @@ class ESAnalyzerApp(AppDashboard):
     def _rupt_match_ru_spec_row(self, ru_model, spec, spec_bcol):
         """[r17] RU Model 문자열로 RU/MMU Spec DB(spec)에서 일치하는 행을 찾는다. 3단계 fallback:
         (1) 전체 문자열 완전일치, (2) 마지막 한 글자를 제외한 접두어로 시작하는 첫 값,
-        (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 셋 다 실패하면 None(호출부에서 4개 열 모두 -1)."""
+        (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 셋 다 실패하면 None(호출부에서 4개 열 모두 -1).
+        [r17-후속7, 버그 수정] 비교를 대소문자 무시로 수정 - 기존 다른 모든 Spec 조회 경로
+        (`_calculate_est_saving`/`_compute_deep_sleep_capability` 등)는 `.lower()` 비교인데 여기만
+        대소문자를 구분해서, CM과 Spec DB의 표기 케이스가 다르면(실데이터에서 흔함) 전부 미매칭(-1)
+        처리되어 v17.5부터 절감 에너지가 모든 sector에서 0으로 나오는 회귀가 있었다."""
         if not ru_model or spec_bcol is None or spec is None or spec.empty:
             return None
-        model = str(ru_model).strip()
-        spec_vals = spec[spec_bcol].astype(str).str.strip()
+        model = str(ru_model).strip().lower()
+        spec_vals = spec[spec_bcol].astype(str).str.strip().str.lower()
 
         exact = spec[spec_vals == model]
         if not exact.empty:
