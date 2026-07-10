@@ -87,6 +87,87 @@
   * `_calc_es_level_simulation_savings`: 같은 (eNodeBID, group id)가 여러 band/level에서 반복 참조될 때 "그룹 전체 off" Series를 캐시해 재사용, `level_deltas`/`level_group` 구성도 `cell_res` 2회 순회를 1회로 통합.
   * **검증**: v17.0에서 작성한 모든 단위/통합 테스트를 재실행해 계산 결과가 최적화 전과 완전히 동일함을 확인. `python -m py_compile` 통과.
 
+* **[v17.2] (2026-07-10) 'ES mode Type' 열 추가 + 탭 간 공유용 RU profile table(rupt) 신설**
+  * **ES mode Type** (`_calc_es_mode_type`): ESM Output Result의 'ES Level' 바로 오른쪽에 추가. ES Level n의
+    delta=DRBn(n)-DRBn(n-1)(N=1이면 DRBn(0)=0)을 n번째 band의 SectorList RB값(target_nrb)과 비교해
+    delta>=target_nrb→"Cell-Off", 0<delta<target_nrb→"Tx Path Off", delta<=0→"none"(ES Level 7은 공란).
+    **설계 노트(사용자 확인, 중요)**: 현재 drb_n이 순수 누적합이라 delta는 항상 target_nrb와 정확히 같아
+    지금은 "Cell-Off"만 나오는 것이 정상 동작 — 추후 DRBn 계산에 모드별 비율(예: Tx Path Off=0.5배)이
+    반영되면 이 로직이 그대로 Tx Path Off/none을 구분해낸다(현재는 그 준비 단계).
+  * **RU profile table(rupt)** (`_build_ru_profile_table`, `self.ru_profile_df`): 열
+    `NE ID/Cell ID/RU Model/BID/PID/CID/PA shared/CellOff/TxPathOff/DeepSleep/SuperSleep`을
+    `cm_map_df_full` + `ru_spec_df_internal`로부터 구성해 앞으로 각 탭이 공유·재사용할 수 있게 함(별도
+    캐싱 없이 매번 새로 빌드 — CM 재처리 시점마다 `self.ru_profile_df` 자동 갱신, RU/MMU Spec 편집 후
+    최신 상태가 필요하면 `_build_ru_profile_table()`을 직접 재호출). RU Model/BID/PID/CID는 지정된 동의어
+    후보군을 정규화 비교로 찾아 우선순위상 가장 앞선 유효값('-'/빈값 제외) 채택. PA shared는 cell-num과
+    PA-shared-cell(다중값, -1 제외)을 union-find로 묶어 그룹 전체(중복 제거)를 기재. CellOff/TxPathOff/
+    DeepSleep/SuperSleep은 RU Model을 RU/MMU Spec DB에 3단계 fallback(완전일치→마지막 글자 제외 접두어→
+    첫 '-' 이전 접두어)으로 매칭해 Idle-각 상태 값을 계산, 매칭 실패 시 4열 모두 -1. RU/MMU Spec DB 편집기
+    신규 행 기본 템플릿에 'Super Sleep' 열 추가(Deep Sleep 도입 때와 동일 패턴).
+  * **검증**: `_calc_es_mode_type` 단위 테스트(사용자 제시 예시 포함) + `_generate_core_policy` 통합
+    테스트로 열 위치 확인. `_build_ru_profile_table` 단위 테스트로 우선순위 선택/동의어 통합/PA shared
+    합집합·중복제거/3단계 매칭 3케이스+실패 시 전체 -1/빈 입력 처리/신규 Spec 행 Super Sleep 포함을 확인.
+    기존 Deep Sleep 회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
+
+* **[v17.3] (2026-07-10) rupt DeepSleep/SuperSleep 공식 변경(PA off 기준) + Deep Sleep 절감 음수 버그 수정 + 'Level k DS Count' 진단 열**
+  * **버그**: 실 Spec 데이터로 Deep Sleep을 켜니 "Deep Sleep 추가 절감 [Wh]"이 음수로 나오는 사례 발견.
+    원인은 기존 `elevated_delta`(Idle-Deep Sleep, Idle 기준)가 RU/MMU Spec에 Deep Sleep 소비전력이
+    PA off보다 크게 잘못 입력된 RU Model에서 pa_off_delta보다 작아져도 클램프가 없었기 때문.
+  * rupt의 DeepSleep/SuperSleep을 PA off 기준(`PA off-Deep Sleep`/`PA off-Super Sleep`, 결과 음수면 0
+    clamp)으로 재정의(CellOff/TxPathOff는 Idle 기준 그대로). `_power_deltas_for_level`은 pa_off_delta만
+    반환하도록 단순화하고, Deep Sleep 추가절감은 신규 `_deep_sleep_bonus_delta_for_level`이 rupt에서
+    직접 가져온다 - **이번 라운드부터 rupt가 실제로 절감 계산 경로에 쓰이기 시작함**(§6의 기존 "인프라만"
+    메모 갱신).
+  * 신규 공유 헬퍼 `_compute_deep_sleep_eligible_steps` + `_attach_deep_sleep_ds_counts`로 Sector 요약
+    표(`_run_es_level_simulation` 반환 summary_df)에 'Level k DS Count' 열 추가 - 절감 Wh 계산과 동일한
+    함수를 공유해 두 표의 숫자가 항상 일치, 카운트×rupt DeepSleep 값으로 손 검산 가능.
+  * **검증**: 기존 정상 데이터 시나리오(140/40, 70/0, fallback 30) 값 불변 확인(대수적으로 동일 - 클램프는
+    비정상 데이터에서만 차이). PA off<Deep/Super Sleep 잘못된 스펙으로 절감/보너스가 0 clamp되고 음수가
+    안 됨을 확인. DS Count가 Wh 계산의 eligible_steps와 정확히 일치함을 확인. `python -m py_compile` 통과.
+  * **사용자 확인 결과 → [v17.4]에서 수정**: "하나 낮은 레벨까지만 대상"은 `Applied_ES_Level > k` 판정
+    자체가 아니라, 그룹의 "전체가 꺼져있는지" 판정에 있던 실제 버그를 가리키는 코멘트였음.
+
+* **[v17.4] (2026-07-10) Deep Sleep 그룹 판정 버그 수정: 그룹 멤버가 '지금 이 순간의 현재 최고 레벨'이면 그룹 전체 Deep Sleep 불가**
+  * **사용자 예시**: 현재 ES Level 4가 적용 중, Level 1~3의 Target Cell은 이미 꺼져 있음(Deep Sleep
+    후보). Level 2,3의 Deep Sleep Capability=3, Level 1의 Deep Sleep Capability=6, **Level 4(현재 최고
+    레벨) 자신도 Deep Sleep Capability=6** — 이 경우 gid=3인 Level 2,3만 Deep Sleep 가능하고 gid=6인
+    Level 1은 불가능(공유 RU가 Level 4의 fallback 위험에 묶여 있으므로).
+  * **버그**: `_group_all_off_series`가 멤버 `(sector, off_level)`마다 `Applied_ES_Level >= off_level`을
+    검사했는데, `>=`는 "그 sector가 지금 정확히 그 레벨"(=그 멤버가 바로 지금의 현재 최고 레벨)인
+    경우도 "안전하게 꺼짐"으로 잘못 통과시켰음 — 위 예시에서 Level 4 멤버가 이 조건을 만족해버려
+    그룹 gid=6이 잘못 "전체 꺼짐"으로 판정되고 Level 1에 부당하게 보너스가 붙고 있었음.
+  * **수정**: `>=` → `>`(엄격 초과)로 변경 — `passed_k = sector_level > k`와 동일한 기준으로 통일. 부작용
+    (의도된 정상 동작): 어떤 sector의 특정 레벨이 그 sector의 영구적 최상위(ceiling)라면, 그 레벨을
+    공유하는 그룹은 그 sector가 ES 활성인 한 영원히 Deep Sleep 불가(물리적으로 올바름).
+  * **영향 범위**: [v17.3]에서 `_compute_deep_sleep_eligible_steps` 하나를 'Level k DS Count'와 절감 Wh
+    계산이 공유하도록 미리 리팩터해둔 덕분에, 이 함수 하나만 고치면 두 곳 모두에 자동 반영됨.
+  * **검증**: 사용자 예시를 그대로 재현하는 단위 테스트(단일 sector, Level 1~4, gid 6/3/3/6) 추가 —
+    Level 1 eligible_steps==0(항상), Level 2·3==4, Level 4==0(자기 자신), 절감 Wh 300/보너스 80(Level
+    2+3분만)이 손계산과 일치 확인. 기존 cross-sector 테스트는 "공유 레벨이 어느 sector의 영구 ceiling도
+    아닌" 시나리오로 재설계해 140Wh/40Wh 보너스가 여전히 정상 동작함을 재확인. `python -m py_compile` 통과.
+
+* **[v17.5] (2026-07-10) 절감 에너지 계산을 "ES Level 단위"→"물리 RU(BID/PID/CID)+PA shared 단위"로 전면 재작성 + Deep Sleep 보너스 중복계산(그룹당 여러 번 합산) 버그 수정**
+  * **배경(사용자 요청)**: RU 소비전력은 BID/PID/CID로 측정되고, rupt의 'PA shared'는 같은 PA를 공유하는
+    cell 전체 집합이므로, 그 집합의 **모든** cell이 동시에 off일 때만 그 RU가 실제로 PA off 이득을
+    실현한다. 예전 계산은 레벨 하나의 Target Cell Num이 CarrierConf 설정만으로 PA 공유를 이미 다
+    반영했다고 가정했는데, 이제는 rupt의 실제 PA shared 데이터로 직접 검증한다.
+  * **CellOff 재계산**(`_calc_cell_off_savings_by_ru`, Deep Sleep 옵션과 무관하게 항상 동작): rupt를
+    (NE ID,BID,PID,CID)로 묶고, 같은 물리 RU에 서로 다른 PA shared 그룹이 N개 있으면(Dual Band RU 등)
+    CellOff 전력차를 N분의 1씩 배분(사용자 요청, 중복 계상 방지). 적격 스텝은 그룹의 모든 멤버가
+    자기 off_level **이상**(fallback 위험 없는 base CellOff라 `>=`, Deep Sleep의 `>`와 다름)일 때.
+  * **Deep Sleep 보너스 재계산**(`_calc_deep_sleep_bonus_by_group`, 버그 수정): 같은 Deep Sleep
+    Capability 그룹 인덱스를 여러 ES Level이 공유해도 그룹당 **정확히 1회만** 계산 - 예전에는 레벨마다
+    따로 계산해 합산해서 그 그룹을 공유하는 레벨 수만큼 부풀려졌음(사용자가 직접 지적, 확인). CellOff와
+    달리 N분의 1 분할은 적용하지 않음(그룹 인덱스 기준 1회, 물리 RU가 여러 개면 합산해서 1회 적용).
+  * **Cross-sector 귀속**: 그룹 멤버가 여러 Sector에 걸치면 절감량을 관련 Sector에 균등 분배(사용자 확인).
+  * **제거**: `_power_deltas_for_level` 삭제, `_build_level_wide_by_enb`/`_members_all_off_series`
+    (strict 플래그로 CellOff `>=`/Deep Sleep `>` 통일) 공용 헬퍼로 대체.
+  * **검증**: test_ru_centric_savings.py 신규(옛 test_deep_sleep_savings.py 대체) - 단일 cell 기본
+    CellOff, 같은 Sector PA-shared 2 cell(모두 off일 때만 절감), cross-sector 균등분배(25/25), 같은
+    RU N=2 분할(30Wh, 안 나누면 60Wh), gid 6/3/3/6 복합 시나리오(150Wh=CellOff 110+DS보너스 40, 그룹당
+    1회), 잘못된 Spec으로도 음수 안 됨(end-to-end) 확인. 기존 Deep Sleep capability/rupt/ES mode Type
+    회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -96,14 +177,20 @@
   4. `Recommended Model`(자동 추천)이 실데이터에서 그룹별로 타당한지 최종 확인.
   5. `Better Axis (R² 기준)` 비교 결과로 Active_RB 축 단일화 여부 결정.
   6. Optimizer Auto Time Mode 1/2/3 중 기본값 채택 및 Initial level 최적화 여부 결정.
-  7. Dual Band RU(RU HW 1개에 ru-port-id 2개) 식별/처리 방법 — 현재 Deep Sleep RU 공유 판정은 board-type+port-id 기준이라 이 이슈와 무관해졌을 가능성 있음, 재확인 필요.
+  7. **[v17.5에서 CellOff 부분 해결]** Dual Band RU(RU HW 1개에 서로 다른 PA shared 그룹 여럿) — CellOff 절감 계산은 [v17.5]에서 같은 BID/PID/CID에 PA shared 그룹이 N개면 N분의 1로 나누도록 반영됨. Deep Sleep Capability 그룹핑 자체(`_compute_deep_sleep_capability`, board-type+port-id 기준)는 여전히 미변경 — 실사례로 재확인 필요.
   8. ES 윈도우 진입 "1 sample 미적용" 패턴이 실데이터에서 실제로 사라졌는지, Coverage band 선택이 기대대로 동작하는지(특히 band 1~2개뿐인 sector에서 eMTC/ENDC anchor와 겹쳐 ES 적용대상 0개가 되는 빈도) 확인 필요.
   9. eMTC/ENDC anchor 판정 알고리즘(우선순위 선택 기준)과 실제 CM Data의 `conf-emtc-switch`/`endc-anchor-type`/`endc-support` 값 표기가 코드의 `_TRUTHY_TOKENS` 판정과 맞는지 확인 필요.
   10. ES Level 없는 sector를 절감효과 결과표에 포함하는 로직은 시뮬레이션 기반(Mode 2/3)에만 적용됨 — NC2 기반(Mode 1)도 필요한지 결정 대기.
   11. **[v17.0, 중요]** Deep Sleep 기능을 실제로 켜서 실데이터로 검증 필요 — board-type 컬럼명 매칭, 여러 sector에 걸친 RU 공유 실제 사례와 그룹 id 결과, 그리고 위 "알려진 한계"(특정 sector로 필터된 호출부의 교차-Sector 판정 누락) 문제.
   12. Energy Dashboard 연동 보류 중: Learning Energy Curve의 Idle/PA off 보정값·채택 모델을 절감 예측에 반영할지는 별도 대기.
+  13. **[v17.2, v17.3/v17.5에서 갱신]** rupt(RU profile table)는 [v17.5]부터 ES Level 시뮬레이션의 절감 Wh 계산(CellOff+Deep Sleep 모두) 핵심 데이터 소스가 되었지만, 다른 탭(`_calculate_est_saving`=Optimizer의 Est. Saving 열, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 나머지 탭도 언제 rupt로 마이그레이션할지는 사용자 지시 대기.
+  14. **[v17.2]** ES mode Type이 실제로 "Tx Path Off"/"none"을 산출하려면 DRBn 계산식에 모드별 비율(예: Tx Path Off=0.5배) 반영이 필요 — 현재는 항상 "Cell-Off"만 나오는 것이 의도된 동작(사용자 확인), 비율 반영 기능은 추후 별도 요청 대기.
+  15. **[v17.3, 중요]** Deep Sleep 음수 절감 버그의 근본 원인은 RU/MMU Spec DB에 특정 RU Model의 Deep Sleep(또는 Super Sleep) 소비전력이 PA off보다 크게 입력된 데이터 문제일 가능성이 높음 — 0-clamp로 증상은 막았지만, 실제 Spec DB에서 어떤 RU Model이 그런지 사용자가 직접 확인·정정 필요(코드가 자동으로 찾아 알려주진 않음). 'Level k DS Count' 진단 열로 카운트를 확인한 뒤에도 절감량이 기대와 다르면 이 가능성부터 점검 권장.
+  16. **[v17.3에서 제기 → v17.4에서 해결]** "하나 낮은 레벨까지만 대상" 문의는 실제로는 그룹 판정의 `>=`/`>` 버그를 가리킨 것으로 확인되어 [v17.4]에서 수정 완료(esm_r17.py [v17.4] 항목 참고).
+  17. **[v17.5, 중요]** CellOff/Deep Sleep 절감이 이제 rupt의 실제 'PA shared'/'BID'/'PID'/'CID' 값에 크게 의존하므로, 실제 CM 데이터에서 이 값들이 올바르게 채워지는지(특히 PA-shared-cell 원본 컬럼명이 실제 Excel과 일치하는지, Dual Band RU 케이스가 실데이터에 실제로 존재하는지) 실데이터로 검증 필요.
+  18. **[v17.5]** Cross-sector 그룹의 절감량을 관련 Sector에 "균등 분배"하기로 결정했는데, 이는 각 Sector의 개별 절감량이 실제 물리적 기여도가 아니라 대표값 성격이라는 뜻 — 전체 합계는 정확하지만 Sector별 순위/비교가 필요한 용도라면 이 점을 유의해야 함(사용자에게 이미 설명함, 추가 확인 불필요하나 리포트 사용 시 참고).
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---
-*Last Updated: 2026-07-09*
+*Last Updated: 2026-07-10*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
