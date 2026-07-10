@@ -212,6 +212,15 @@
   * **검증**: test_bug_report_fixes.py(케이스 불일치 3단계 매칭+70Wh 복원, 비고 3종, alpha=0 Note,
     정상 케이스 무회귀) + 기존 회귀 전체 통과.
 
+* **[v17.9] (2026-07-10) 대소문자 감사 후속 - Learning 탭 ref_lookup 수정**
+  * board-type/RU Model↔Spec DB 대조 경로를 전수 감사. `_calculate_est_saving`/`_calc_all_savings`/
+    `_compute_deep_sleep_capability`/`_rupt_match_ru_spec_row`는 이미 `.lower()` 일관됐고, Learning
+    Energy Curve 탭의 `ref_lookup`(Board Type별 Idle/PA off 레퍼런스)만 원본 케이스로 조회하고 있었음.
+  * CM 'AAU-Q' vs Spec 'aau-q'처럼 케이스가 다르면 Idle/PA off Reference가 NaN → Delta/Coe 보정 컬럼
+    전부 깨짐. 키 생성·조회 양쪽을 `.strip().lower()`로 통일(first-wins). 이로써 5개 경로 전부 일관.
+  * **검증**: test_learning_case_insensitive.py(케이스 불일치 합성데이터 end-to-end, Idle Ref=111/
+    PAoff Ref=55 정상 매칭) + 기존 회귀 전체(9종) 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:

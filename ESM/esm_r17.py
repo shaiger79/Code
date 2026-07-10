@@ -736,6 +736,24 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     -1 아님) + end-to-end 절감 70Wh 복원, 진짜 미매칭/유령 cell/정책 없음 각각의 '비고' 문구 확인,
     alpha=0 시나리오에서 ES7 행 Note에 탈락 band·alpha 표기 확인, 정상 alpha에서는 Level 1 행이
     기존대로 생성되고 실패 Note가 없음(회귀 없음) 확인. 기존 회귀 테스트 전체 통과.
+
+[v17.9] (2026-07-10) 대소문자 감사 후속: Learning Energy Curve 탭에 남아 있던 마지막 case-sensitive
+Spec 조회 수정:
+  - **배경**: [v17.8]에서 rupt 매칭을 대소문자 무시로 고친 뒤, 사용자가 "RU Model을 못 찾았다 →
+    대소문자 차이 같다 → 대문자든 소문자든 동일하게"라고 재확인 요청. board-type/RU Model을 RU/MMU
+    Spec DB와 대조하는 **모든** 경로를 전수 감사한 결과, `_calculate_est_saving`/`_calc_all_savings`/
+    `_compute_deep_sleep_capability`/`_rupt_match_ru_spec_row`는 이미 양쪽 `.lower()`로 일관됐지만,
+    Learning Energy Curve 탭의 `ref_lookup`(Board Type별 Idle/PA off 레퍼런스 조회)만 원본 케이스로
+    dict 키를 만들고 원본 케이스로 조회하고 있었다.
+  - **증상**: CM board-type과 Spec DB 표기 케이스가 다르면(예: CM 'AAU-Q' vs Spec 'aau-q') Learning
+    탭의 Idle/PA off Reference가 NaN이 되어, 그에 파생되는 Idle/PA off Delta·Coe(실측/레퍼런스) 보정
+    컬럼이 전부 NaN으로 깨졌다(rupt와 별개 탭이라 [v17.8] 수정 범위 밖이었음).
+  - **수정**: `ref_lookup` 키 생성과 조회 양쪽을 `.strip().lower()`로 통일(대소문자만 다른 중복 행은
+    다른 조회들의 `.iloc[0]`/first-wins 관례와 동일하게 먼저 나온 행 우선). 이로써 board-type↔Spec
+    대조 5개 경로가 모두 대소문자 무시로 완전히 일관됨.
+  - **검증**: 신규 test_learning_case_insensitive.py - CM 'AAU-Q'(대문자)/Spec 'aau-q'(소문자) 합성
+    데이터로 `_run_energy_curve_learning`을 end-to-end 실행해 Idle Reference=111.0/PAoff Reference=55.0가
+    정상 매칭되고(NaN 아님) Idle/PA off Delta가 계산됨을 확인. 기존 회귀 테스트 전체(9종) 통과.
 """
 
 import tkinter as tk
@@ -5597,10 +5615,17 @@ class ESAnalyzerApp(AppDashboard):
             # --- 5. RU HW DB(RU/MMU Spec 에디터)에서 Board Type별 Idle/PA off 레퍼런스(Lab test) 조회 ---
             spec_bcol = next((c for c in self.ru_spec_df_internal.columns
                                if str(c).strip().lower().replace('-', '').replace('_', '').replace(' ', '') in ['boardtype', 'ruboardtype']), None)
+            # [r17-후속8, 버그 수정] board-type 조회를 대소문자 무시로 통일 - 다른 모든 Spec 조회 경로
+            # (_calculate_est_saving/_compute_deep_sleep_capability/rupt 등)와 동일하게 소문자 키를
+            # 쓴다. 기존에는 원본 케이스 그대로 키를 만들고(bt) 조회 측(board_type)도 원본 케이스라,
+            # CM과 Spec DB의 표기 케이스가 다르면 레퍼런스가 NaN이 되어 Learning 탭의 Idle/PA off 보정값·
+            # 계수 컬럼이 전부 깨졌다. 같은 board-type이 대소문자만 다른 여러 행으로 있으면 먼저 나온
+            # 행을 우선(다른 경로의 .iloc[0]/first-wins 관례와 동일).
             ref_lookup = {}
             if spec_bcol is not None and not self.ru_spec_df_internal.empty:
                 for _, r in self.ru_spec_df_internal.iterrows():
-                    bt = str(r[spec_bcol]).strip()
+                    bt = str(r[spec_bcol]).strip().lower()
+                    if bt in ref_lookup: continue
                     try: ref_idle = float(r.get('Idle', np.nan))
                     except (TypeError, ValueError): ref_idle = np.nan
                     try: ref_paoff = float(r.get('PA off', np.nan))
@@ -5644,7 +5669,7 @@ class ESAnalyzerApp(AppDashboard):
                 paoff_measured = off_rows['Consumed_Power'].mean() if len(off_rows) > 0 else np.nan
                 idle_measured = idle_rows['Consumed_Power'].mean() if len(idle_rows) > 0 else np.nan
 
-                ref_idle, ref_paoff = ref_lookup.get(str(board_type), (np.nan, np.nan))
+                ref_idle, ref_paoff = ref_lookup.get(str(board_type).strip().lower(), (np.nan, np.nan))
                 delta_idle = (idle_measured - ref_idle) if (pd.notna(idle_measured) and pd.notna(ref_idle)) else np.nan
                 delta_paoff = (paoff_measured - ref_paoff) if (pd.notna(paoff_measured) and pd.notna(ref_paoff)) else np.nan
                 coe_idle = (idle_measured / ref_idle) if (pd.notna(idle_measured) and pd.notna(ref_idle) and ref_idle != 0) else np.nan
