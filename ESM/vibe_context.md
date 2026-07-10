@@ -200,6 +200,18 @@
   * **검증**: 신규 test_gui_polish.py(제목/minsize/스타일/zebra/자동 너비/정렬/iid 매핑/토글/빈 CM
     가드) + 기존 회귀 전체 통과. 계산 로직 무변경.
 
+* **[v17.8] (2026-07-10) 사용자 버그 리포트 2건 대응**
+  * **[중요] 절감 에너지 전부 0 회귀 수정**: `_rupt_match_ru_spec_row`만 대소문자를 구분해(다른 모든
+    Spec 조회는 `.lower()`), CM board-type과 Spec DB의 케이스가 다르면 rupt CellOff 등이 전부 -1 →
+    v17.5부터 모든 sector 절감 0. 3단계 매칭 전부 대소문자 무시로 수정.
+  * **"Max ES Level=1인데 ES Level 1 행 없음" 가시화**: 임계값 탐색 실패(대표 원인: 그 운영시간 DL
+    트래픽 없음 → SP=0 → alpha=0 → 예측 Tput 항상 0)로 band가 ES7로 편입되는 기존 설계 동작 -
+    이제 ES7 행 Note에 탈락 band와 alpha를 기록(run_analysis Note 병합도 덮어쓰기→합치기로 수정).
+  * **절감 효과 표 '비고' 열 신설**: 절감 0 sector의 사유(RU Model 미매칭/PA 공유 cell off 불명/
+    timeline 없음/동시 off 스텝 0회/정책 없음)를 자동 표기 - 실데이터 디버깅용.
+  * **검증**: test_bug_report_fixes.py(케이스 불일치 3단계 매칭+70Wh 복원, 비고 3종, alpha=0 Note,
+    정상 케이스 무회귀) + 기존 회귀 전체 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
