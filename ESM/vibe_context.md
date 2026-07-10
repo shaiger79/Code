@@ -87,6 +87,28 @@
   * `_calc_es_level_simulation_savings`: 같은 (eNodeBID, group id)가 여러 band/level에서 반복 참조될 때 "그룹 전체 off" Series를 캐시해 재사용, `level_deltas`/`level_group` 구성도 `cell_res` 2회 순회를 1회로 통합.
   * **검증**: v17.0에서 작성한 모든 단위/통합 테스트를 재실행해 계산 결과가 최적화 전과 완전히 동일함을 확인. `python -m py_compile` 통과.
 
+* **[v17.2] (2026-07-10) 'ES mode Type' 열 추가 + 탭 간 공유용 RU profile table(rupt) 신설**
+  * **ES mode Type** (`_calc_es_mode_type`): ESM Output Result의 'ES Level' 바로 오른쪽에 추가. ES Level n의
+    delta=DRBn(n)-DRBn(n-1)(N=1이면 DRBn(0)=0)을 n번째 band의 SectorList RB값(target_nrb)과 비교해
+    delta>=target_nrb→"Cell-Off", 0<delta<target_nrb→"Tx Path Off", delta<=0→"none"(ES Level 7은 공란).
+    **설계 노트(사용자 확인, 중요)**: 현재 drb_n이 순수 누적합이라 delta는 항상 target_nrb와 정확히 같아
+    지금은 "Cell-Off"만 나오는 것이 정상 동작 — 추후 DRBn 계산에 모드별 비율(예: Tx Path Off=0.5배)이
+    반영되면 이 로직이 그대로 Tx Path Off/none을 구분해낸다(현재는 그 준비 단계).
+  * **RU profile table(rupt)** (`_build_ru_profile_table`, `self.ru_profile_df`): 열
+    `NE ID/Cell ID/RU Model/BID/PID/CID/PA shared/CellOff/TxPathOff/DeepSleep/SuperSleep`을
+    `cm_map_df_full` + `ru_spec_df_internal`로부터 구성해 앞으로 각 탭이 공유·재사용할 수 있게 함(별도
+    캐싱 없이 매번 새로 빌드 — CM 재처리 시점마다 `self.ru_profile_df` 자동 갱신, RU/MMU Spec 편집 후
+    최신 상태가 필요하면 `_build_ru_profile_table()`을 직접 재호출). RU Model/BID/PID/CID는 지정된 동의어
+    후보군을 정규화 비교로 찾아 우선순위상 가장 앞선 유효값('-'/빈값 제외) 채택. PA shared는 cell-num과
+    PA-shared-cell(다중값, -1 제외)을 union-find로 묶어 그룹 전체(중복 제거)를 기재. CellOff/TxPathOff/
+    DeepSleep/SuperSleep은 RU Model을 RU/MMU Spec DB에 3단계 fallback(완전일치→마지막 글자 제외 접두어→
+    첫 '-' 이전 접두어)으로 매칭해 Idle-각 상태 값을 계산, 매칭 실패 시 4열 모두 -1. RU/MMU Spec DB 편집기
+    신규 행 기본 템플릿에 'Super Sleep' 열 추가(Deep Sleep 도입 때와 동일 패턴).
+  * **검증**: `_calc_es_mode_type` 단위 테스트(사용자 제시 예시 포함) + `_generate_core_policy` 통합
+    테스트로 열 위치 확인. `_build_ru_profile_table` 단위 테스트로 우선순위 선택/동의어 통합/PA shared
+    합집합·중복제거/3단계 매칭 3케이스+실패 시 전체 -1/빈 입력 처리/신규 Spec 행 Super Sleep 포함을 확인.
+    기존 Deep Sleep 회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -102,8 +124,10 @@
   10. ES Level 없는 sector를 절감효과 결과표에 포함하는 로직은 시뮬레이션 기반(Mode 2/3)에만 적용됨 — NC2 기반(Mode 1)도 필요한지 결정 대기.
   11. **[v17.0, 중요]** Deep Sleep 기능을 실제로 켜서 실데이터로 검증 필요 — board-type 컬럼명 매칭, 여러 sector에 걸친 RU 공유 실제 사례와 그룹 id 결과, 그리고 위 "알려진 한계"(특정 sector로 필터된 호출부의 교차-Sector 판정 누락) 문제.
   12. Energy Dashboard 연동 보류 중: Learning Energy Curve의 Idle/PA off 보정값·채택 모델을 절감 예측에 반영할지는 별도 대기.
+  13. **[v17.2]** rupt(RU profile table)는 아직 신규 인프라일 뿐 기존 탭(예: `_calculate_est_saving`, `_compute_deep_sleep_capability`, Learning Energy Curve의 RU 판정)은 여전히 각자의 inline 로직을 그대로 사용 — 언제/어떤 탭부터 rupt로 마이그레이션할지는 사용자 지시 대기(이번 라운드는 신설만 요청됨).
+  14. **[v17.2]** ES mode Type이 실제로 "Tx Path Off"/"none"을 산출하려면 DRBn 계산식에 모드별 비율(예: Tx Path Off=0.5배) 반영이 필요 — 현재는 항상 "Cell-Off"만 나오는 것이 의도된 동작(사용자 확인), 비율 반영 기능은 추후 별도 요청 대기.
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---
-*Last Updated: 2026-07-09*
+*Last Updated: 2026-07-10*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*

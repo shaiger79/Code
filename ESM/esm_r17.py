@@ -499,6 +499,40 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     (Deep Sleep capability 4케이스, 교차-Sector 절감 시나리오, eMTC/ENDC anchor, 전 SectorList 포함,
     윈도우 진입, Coverage band, 설정 자동 저장/불러오기, Output 폴더 통합)를 다시 실행해 값이 최적화
     전과 완전히 동일함을 확인. `python -m py_compile` 통과.
+
+[v17.2] (2026-07-10) ESM Output Result에 'ES mode Type' 열 추가 + 탭 간 공유용 RU profile table(rupt) 신설:
+  - **ES mode Type**(`_calc_es_mode_type`): ESM Output Result의 'ES Level' 바로 오른쪽에 추가. ES Level
+    n의 delta=DRBn(n)-DRBn(n-1)(n=1이면 DRBn(0)=0)을 n번째 band 자체의 SectorList RB값(target_nrb, DRBn
+    누적합에 아직 비율이 적용되지 않은 '전체' RB)과 비교해 delta>=target_nrb면 "Cell-Off", 0<delta<
+    target_nrb면 "Tx Path Off", delta<=0이면 "none". ES Level 7(정책 없음) 행은 공란. **설계 노트(사용자
+    확인)**: 현재 drb_n 계산식(`positive_bands_values[:n].sum()`)이 누적합이라 delta는 항상 target_nrb와
+    정확히 같아 지금은 "Cell-Off"만 나오는 것이 의도된 정상 동작 - 추후 DRBn 계산에 모드별 비율(예:
+    Tx Path Off는 0.5배)이 반영되면 delta가 target_nrb보다 작아지는 케이스가 생기며 이 로직이 그대로
+    Tx Path Off/none을 구분해낸다. target_nrb를 구할 수 없는 경우(NaN)는 공란("-") 처리.
+  - **RU profile table(rupt)** (`_build_ru_profile_table`, `self.ru_profile_df`): 앞으로 각 탭 동작에서
+    공유·재사용할 CM/RU 통합 표. 열: `NE ID/Cell ID/RU Model/BID/PID/CID/PA shared/CellOff/TxPathOff/
+    DeepSleep/SuperSleep`. `self.cm_map_df_full`(이미 eNB_ID/cell-num으로 정규화됨)에서 매번 새로 구성
+    (별도 캐싱 없음 - CM/Spec 편집 직후에도 항상 최신 반영). CM 데이터 (재)처리 시점(`_process_cm_ciq_data`,
+    `_auto_load_cellru_mapping`)마다 `self.ru_profile_df`를 자동 갱신하지만, RU/MMU Spec 편집 후 최신
+    상태가 보장되어야 하는 호출부는 `_build_ru_profile_table()`을 직접 다시 호출해야 한다(스펙 편집
+    자체는 별도 갱신 훅을 걸지 않음 - 편집 중 매 조작마다 재계산하지 않기 위함).
+    - RU Model/BID/PID/CID: 각각 지정된 원본 열 이름 후보군(예: RU Model=board-type>ru-board-type>
+      board type>product-code>serial-number)을 정규화(대소문자/구분자 무시) 비교로 찾아 우선순위상 가장
+      앞선 열 중 '-'/빈값이 아닌 첫 값을 채택(`_rupt_resolve_priority_cols`/`_rupt_first_valid`).
+    - PA shared: cell-num과 PA-shared-cell(콤마/세미콜론 등 다중값, -1 제외)을 union-find로 묶어
+      NE ID 내에서 PA를 공유하는 cell-num 그룹 전체(자신 포함, 중복 제거)를 콤마로 기재.
+    - CellOff/TxPathOff/DeepSleep/SuperSleep: RU Model로 RU/MMU Spec DB를 3단계 fallback 매칭
+      (`_rupt_match_ru_spec_row`) - (1) 전체 문자열 완전일치, (2) 마지막 한 글자 제외 접두어로 시작하는
+      첫 값, (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 매칭되면 각각 Idle-PA off/Idle-Tx path off/
+      Idle-Deep Sleep/Idle-Super Sleep(개별 값이 없으면 그 항목만 -1), 셋 다 실패하면 네 열 모두 -1.
+    - RU/MMU Spec DB 편집기 신규 행 기본 템플릿에 'Super Sleep' 열 추가(Deep Sleep 도입 때와 동일한
+      패턴) - 기존 저장된 Spec 파일에는 없을 수 있으며, 그 경우 SuperSleep 계산 시 해당 항목만 -1로 처리.
+  - **검증**: `_calc_es_mode_type` 단위 테스트(사용자 제시 예시 325-275=50==target 50 → "Cell-Off" 포함,
+    Tx Path Off/none/NaN-공란 케이스) + `_generate_core_policy` 통합 테스트로 열 위치가 'ES Level' 바로
+    오른쪽임을 확인. `_build_ru_profile_table` 단위 테스트로 RU Model 우선순위+'-' 무시, BID/PID/CID
+    동의어 통합, PA shared 합집합/중복제거/-1 제외(상호 참조 포함), 3단계 RU Model fallback 매칭 3케이스
+    + 매칭 실패 시 4열 모두 -1, 빈 cm_map_df_full 처리, 신규 Spec 행에 Super Sleep 포함을 확인. 기존
+    Deep Sleep capability/savings 회귀 테스트 전체 재실행해 영향 없음 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -632,6 +666,7 @@ class AppBase(BaseTk):
         self.ru_spec_df_internal = pd.DataFrame()
         self.ciq_df_internal = pd.DataFrame()
         self.cm_map_df_full = pd.DataFrame()
+        self.ru_profile_df = pd.DataFrame()  # [r17] RU profile table(rupt) - 탭 간 공유, _build_ru_profile_table() 참고
         self.hourly_eval_records = []
         self.latest_optimizer_results = None
         self.latest_optimizer_rawdata = None  # [r14] Energy Dashboard용 24시간 전체 Rawdata(ES 윈도우 밖 시간 포함)
@@ -1376,7 +1411,7 @@ class AppEditors(AppBase):
             if self.sector_df_internal.empty: self.sector_df_internal = pd.DataFrame(columns=['Cat_ID', 'eNB_ID', 'Sector'])
             self.sector_df_internal = pd.concat([self.sector_df_internal, pd.DataFrame([{c: "" for c in self.sector_df_internal.columns}])], ignore_index=True)
         elif mode == 'ru_spec':
-            if self.ru_spec_df_internal.empty: self.ru_spec_df_internal = pd.DataFrame(columns=['board-type', 'Tech', 'I/F', 'S_PA', 'Idle', 'Tx path off', 'PA off', 'Coe_paoff', 'Deep Sleep'])
+            if self.ru_spec_df_internal.empty: self.ru_spec_df_internal = pd.DataFrame(columns=['board-type', 'Tech', 'I/F', 'S_PA', 'Idle', 'Tx path off', 'PA off', 'Coe_paoff', 'Deep Sleep', 'Super Sleep'])
             self.ru_spec_df_internal = pd.concat([self.ru_spec_df_internal, pd.DataFrame([{c: "" for c in self.ru_spec_df_internal.columns}])], ignore_index=True)
         else:
             if self.ciq_df_internal.empty: self.ciq_df_internal = pd.DataFrame(columns=['eNB_ID', 'cell-num', 'Azimuth'])
@@ -1559,6 +1594,7 @@ class AppDashboard(AppEditors):
                 cm_df = pd.merge(cm_df, ciq_sub, on=['eNB_ID', 'cell-num'], how='left')
 
             self.cm_map_df_full = cm_df
+            self.ru_profile_df = self._build_ru_profile_table()
             self._update_cm_treeview(self.cm_map_df_full)
             self.status_label.config(text="CM 처리 완료", fg=self.ACCENT_GREEN)
 
@@ -1619,6 +1655,7 @@ class AppDashboard(AppEditors):
             return
 
         self.cm_map_df_full = df
+        self.ru_profile_df = self._build_ru_profile_table()
         self._update_cm_treeview(self.cm_map_df_full)
         if 'eNB_ID' in df.columns:
             enbs = sorted([e for e in df['eNB_ID'].unique() if e != ''])
@@ -3286,6 +3323,27 @@ class ESAnalyzerApp(AppDashboard):
             'Leaving Th_Tput': round(leaving_tput, 2),
         }
 
+    def _calc_es_mode_type(self, n, drb_n, positive_bands_values):
+        """[r17] ES Level n의 'ES mode Type'. delta=DRBn(n)-DRBn(n-1)(=n번째 Target Cell Num이 이번
+        레벨에서 새로 절감하는 RB량)을 n번째 band 자체의 SectorList RB값(target_nrb, 아직 비율 미적용된
+        '전체' RB)과 비교한다. delta>=target_nrb면 Cell-Off, 0<delta<target_nrb면 Tx Path Off, delta<=0이면
+        none. 현재는 drb_n 계산에 비율이 적용되지 않아 delta는 항상 target_nrb와 정확히 같으므로 Cell-Off만
+        나오는 것이 정상 동작이다 - 추후 DRBn 계산에 모드별 비율(예: Tx Path Off=0.5)이 반영되면 delta가
+        target_nrb보다 작아지는 케이스가 생기며 이 로직이 그대로 Tx Path Off/none을 구분해낸다."""
+        if n <= 0 or n > len(positive_bands_values):
+            return ''
+        target_nrb = positive_bands_values[n - 1]
+        if pd.isna(target_nrb):
+            return ''
+        prev_drb_n = positive_bands_values[:n - 1].sum() if n > 1 else 0
+        delta = drb_n - prev_drb_n
+        if delta >= target_nrb:
+            return 'Cell-Off'
+        elif delta > 0:
+            return 'Tx Path Off'
+        else:
+            return 'none'
+
     def _generate_core_policy(self, group, enodeb, sector, max_n, total_rb, positive_bands_names, positive_bands_values, negative_bands_names, carrier_df, target_col, rb_low, t_target, is_low_util, hours_str, suffix, plot_dir):
         sector_results = []
         if is_low_util:
@@ -3300,7 +3358,8 @@ class ESAnalyzerApp(AppDashboard):
 
                 sector_results.append({
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': alpha,
-                    'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells, 'DRBn': drb_n,
+                    'Max ES Level': max_n, 'ES Level': n, 'ES mode Type': self._calc_es_mode_type(n, drb_n, positive_bands_values),
+                    'Target Cell Num': target_cells, 'DRBn': drb_n,
                     'RBlow': rb_low, 'RBThreshold': fixed_rb_threshold,
                     **self._build_th_cols(fixed_rb_threshold, total_rb, t_target, is_low_util=True),
                     'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': active_samples
@@ -3313,7 +3372,8 @@ class ESAnalyzerApp(AppDashboard):
                 if es7_target_cells:
                     sector_results.append({
                         'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': alpha,
-                        'Max ES Level': max_n, 'ES Level': 7, 'Target Cell Num': es7_target_cells, 'DRBn': 0,
+                        'Max ES Level': max_n, 'ES Level': 7, 'ES mode Type': '',
+                        'Target Cell Num': es7_target_cells, 'DRBn': 0,
                         'RBlow': rb_low, 'RBThreshold': -1,
                         **self._build_th_cols(-1, total_rb, t_target),
                         'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
@@ -3372,7 +3432,8 @@ class ESAnalyzerApp(AppDashboard):
 
                         sector_results.append({
                             'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6),
-                            'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells,
+                            'Max ES Level': max_n, 'ES Level': n, 'ES mode Type': self._calc_es_mode_type(n, drb_n, positive_bands_values),
+                            'Target Cell Num': target_cells,
                             'DRBn': drb_n, 'RBlow': rb_low, 'RBThreshold': th_n,
                             **self._build_th_cols(th_n, total_rb, t_target),
                             'Est. Saving': est_saving, 'Nc1': n_c1, 'Nc2': n_c2
@@ -3391,7 +3452,8 @@ class ESAnalyzerApp(AppDashboard):
 
                     sector_results.append({
                         'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6),
-                        'Max ES Level': max_n, 'ES Level': n, 'Target Cell Num': target_cells,
+                        'Max ES Level': max_n, 'ES Level': n, 'ES mode Type': self._calc_es_mode_type(n, drb_n, positive_bands_values),
+                        'Target Cell Num': target_cells,
                         'DRBn': drb_n, 'RBlow': rb_low, 'RBThreshold': inherited_th,
                         **self._build_th_cols(inherited_th, total_rb, t_target),
                         'Est. Saving': est_saving, 'Nc1': 0, 'Nc2': nc2
@@ -3405,7 +3467,7 @@ class ESAnalyzerApp(AppDashboard):
             if es7_target_cells:
                 sector_results.append({
                     'eNodeBID': enodeb, 'Sector': sector, 'Operating Hours': hours_str, 'Alpha': round(alpha, 6), 'Max ES Level': max_n, 'ES Level': 7,
-                    'Target Cell Num': es7_target_cells, 'DRBn': 0, 'RBlow': rb_low, 'RBThreshold': -1,
+                    'ES mode Type': '', 'Target Cell Num': es7_target_cells, 'DRBn': 0, 'RBlow': rb_low, 'RBThreshold': -1,
                     **self._build_th_cols(-1, total_rb, t_target),
                     'Est. Saving': 0.0, 'Nc1': 0, 'Nc2': 0
                 })
@@ -4478,6 +4540,173 @@ class ESAnalyzerApp(AppDashboard):
             cm_map[k] = resolved.apply(lambda r: r[0][i])
         cm_map['BoardType'] = resolved.apply(lambda r: r[1])
         return cm_map
+
+    _RUPT_COLUMNS = ['NE ID', 'Cell ID', 'RU Model', 'BID', 'PID', 'CID', 'PA shared',
+                      'CellOff', 'TxPathOff', 'DeepSleep', 'SuperSleep']
+
+    @staticmethod
+    def _rupt_norm_key(name):
+        return str(name).strip().lower().replace('-', '').replace('_', '').replace(' ', '')
+
+    @staticmethod
+    def _rupt_is_valid_val(v):
+        if pd.isna(v): return False
+        s = str(v).strip()
+        return s not in ('', '-', 'nan', 'none')
+
+    def _rupt_resolve_priority_cols(self, cm_map, synonym_names):
+        """synonym_names(우선순위 순서의 원본 후보 열 이름들)를 정규화해 cm_map에 실제로 존재하는
+        열들을 같은 우선순위 순서로 반환한다(중복 정규화 키는 한 번만)."""
+        resolved, seen = [], set()
+        for name in synonym_names:
+            key = self._rupt_norm_key(name)
+            if key in seen: continue
+            seen.add(key)
+            for c in cm_map.columns:
+                if self._rupt_norm_key(c) == key and c not in resolved:
+                    resolved.append(c)
+        return resolved
+
+    def _rupt_first_valid(self, row, col_list):
+        for c in col_list:
+            v = row[c]
+            if self._rupt_is_valid_val(v):
+                return str(v).strip()
+        return ''
+
+    def _rupt_match_ru_spec_row(self, ru_model, spec, spec_bcol):
+        """[r17] RU Model 문자열로 RU/MMU Spec DB(spec)에서 일치하는 행을 찾는다. 3단계 fallback:
+        (1) 전체 문자열 완전일치, (2) 마지막 한 글자를 제외한 접두어로 시작하는 첫 값,
+        (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 셋 다 실패하면 None(호출부에서 4개 열 모두 -1)."""
+        if not ru_model or spec_bcol is None or spec is None or spec.empty:
+            return None
+        model = str(ru_model).strip()
+        spec_vals = spec[spec_bcol].astype(str).str.strip()
+
+        exact = spec[spec_vals == model]
+        if not exact.empty:
+            return exact.iloc[0]
+
+        if len(model) > 1:
+            prefix1 = model[:-1]
+            pref_match = spec[spec_vals.str.startswith(prefix1) & (spec_vals != '')]
+            if not pref_match.empty:
+                return pref_match.iloc[0]
+
+        prefix2 = model.split('-')[0]
+        if prefix2 and prefix2 != model:
+            pref_match2 = spec[spec_vals.str.startswith(prefix2) & (spec_vals != '')]
+            if not pref_match2.empty:
+                return pref_match2.iloc[0]
+
+        return None
+
+    def _rupt_power_state_values(self, spec_row):
+        """spec_row(매칭된 RU/MMU Spec 행 또는 None)로부터 (CellOff, TxPathOff, DeepSleep, SuperSleep) =
+        각각 (Idle-PA off, Idle-Tx path off, Idle-Deep Sleep, Idle-Super Sleep)을 계산. spec_row가
+        None이면 4개 모두 -1. 개별 상태 값이 spec에 없거나(NaN) Idle이 없으면 그 상태만 -1."""
+        if spec_row is None:
+            return (-1, -1, -1, -1)
+
+        def _delta(state_col):
+            try:
+                idle = float(spec_row.get('Idle', np.nan))
+                val = float(spec_row.get(state_col, np.nan))
+            except (TypeError, ValueError):
+                return -1
+            if pd.isna(idle) or pd.isna(val):
+                return -1
+            return idle - val
+
+        return (_delta('PA off'), _delta('Tx path off'), _delta('Deep Sleep'), _delta('Super Sleep'))
+
+    def _build_ru_profile_table(self):
+        """[r17] RU profile table(rupt) - 각 탭의 CM/RU 관련 동작에서 공유해 재사용하기 위한 표.
+        self.cm_map_df_full(Cell-RU 매핑)과 self.ru_spec_df_internal(RU/MMU Spec)로부터 매번 새로
+        구성한다(별도 캐싱 없음 - CM/Spec 편집 직후에도 항상 최신 상태를 반영하기 위함).
+        열: NE ID/Cell ID/RU Model/BID/PID/CID/PA shared/CellOff/TxPathOff/DeepSleep/SuperSleep."""
+        cm = self.cm_map_df_full
+        if cm is None or cm.empty or 'eNB_ID' not in cm.columns or 'cell-num' not in cm.columns:
+            return pd.DataFrame(columns=self._RUPT_COLUMNS)
+
+        cm = cm.reset_index(drop=True).copy()
+        ne_id_s = cm['eNB_ID'].astype(str)
+        cell_id_s = cm['cell-num'].astype(str)
+
+        ru_model_cols = self._rupt_resolve_priority_cols(
+            cm, ['board-type', 'ru-board-type', 'board type', 'product-code', 'serial-number'])
+        bid_cols = self._rupt_resolve_priority_cols(
+            cm, ['connected-board-id', 'ru-board-id', 'board-id', 'Bid'])
+        pid_cols = self._rupt_resolve_priority_cols(
+            cm, ['connected-port-id', 'ru-port-id', 'port-id', 'Pid'])
+        cid_cols = self._rupt_resolve_priority_cols(
+            cm, ['cascade-id', 'ru-cascade-id', 'CasId', 'Cascade', 'Cid'])
+
+        rupt = pd.DataFrame(index=cm.index)
+        rupt['NE ID'] = ne_id_s
+        rupt['Cell ID'] = cell_id_s
+        rupt['RU Model'] = cm.apply(lambda r: self._rupt_first_valid(r, ru_model_cols), axis=1) if ru_model_cols else ''
+        rupt['BID'] = cm.apply(lambda r: self._rupt_first_valid(r, bid_cols), axis=1) if bid_cols else ''
+        rupt['PID'] = cm.apply(lambda r: self._rupt_first_valid(r, pid_cols), axis=1) if pid_cols else ''
+        rupt['CID'] = cm.apply(lambda r: self._rupt_first_valid(r, cid_cols), axis=1) if cid_cols else ''
+
+        # PA shared: cell-num과 PA-shared-cell(콤마/세미콜론 등으로 여러 값 가능, -1은 제외)의 union-find로
+        # NE ID 내에서 PA를 공유하는 cell-num들을 그룹화하고, 각 행에 그 그룹 전체(자신 포함, 중복제거)를 기재.
+        pa_col = next((c for c in cm.columns if self._rupt_norm_key(c) in ['pasharedcell', 'sharedcell']), None)
+        parent = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb: parent[ra] = rb
+
+        for i in range(len(cm)):
+            key = (ne_id_s.iat[i], cell_id_s.iat[i])
+            find(key)
+            if pa_col is not None:
+                for tok in re.split(r'[,;/]', str(cm[pa_col].iat[i])):
+                    tok = tok.strip()
+                    if not tok: continue
+                    num = pd.to_numeric(tok, errors='coerce')
+                    if pd.notna(num) and int(num) >= 0:
+                        union(key, (ne_id_s.iat[i], str(int(num))))
+
+        groups = {}
+        for i in range(len(cm)):
+            root = find((ne_id_s.iat[i], cell_id_s.iat[i]))
+            groups.setdefault(root, set()).add(cell_id_s.iat[i])
+
+        pa_shared_vals = []
+        for i in range(len(cm)):
+            root = find((ne_id_s.iat[i], cell_id_s.iat[i]))
+            members = sorted(groups[root], key=lambda x: (len(x), x))
+            pa_shared_vals.append(','.join(members))
+        rupt['PA shared'] = pa_shared_vals
+
+        # CellOff/TxPathOff/DeepSleep/SuperSleep: RU Model 3단계 fallback 매칭 결과를 RU Model별로 캐싱.
+        spec = self.ru_spec_df_internal
+        spec_bcol = None
+        if spec is not None and not spec.empty:
+            spec_bcol = next((c for c in spec.columns if self._rupt_norm_key(c) in ['boardtype', 'ruboardtype']), None)
+
+        match_cache = {}
+        for model in rupt['RU Model'].unique():
+            spec_row = self._rupt_match_ru_spec_row(model, spec, spec_bcol) if model else None
+            match_cache[model] = self._rupt_power_state_values(spec_row)
+
+        power_vals = rupt['RU Model'].map(match_cache)
+        rupt['CellOff'] = power_vals.map(lambda t: t[0])
+        rupt['TxPathOff'] = power_vals.map(lambda t: t[1])
+        rupt['DeepSleep'] = power_vals.map(lambda t: t[2])
+        rupt['SuperSleep'] = power_vals.map(lambda t: t[3])
+
+        return rupt[self._RUPT_COLUMNS]
 
     def _regression_metrics(self, y_true, y_pred):
         """[r13] R²/MSE/MAE를 함께 계산한다. sklearn이 설치되어 있으면 MSE/MAE는 sklearn.metrics를
