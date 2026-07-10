@@ -643,6 +643,49 @@ sector도 에너지 절감효과 결과표에 포함(절감 0):
     py_compile` 통과.
   - **참고**: 기존 test_deep_sleep_savings.py(레벨 단위 계산 가정)는 계산 방식 자체가 바뀌어 더 이상
     유효하지 않으므로 test_ru_centric_savings.py로 대체.
+
+[v17.6] (2026-07-10) 전체 코드 리뷰(정독) 결과 반영 - 버그 6건 수정 + 성능 최적화 1건 (4개 판단 사항은
+사용자 인터뷰로 확정):
+  - **[버그 1, 중요] Coe_paoff 누락(v17.5 회귀) 수정(사용자 확인: 절감 계산 시 곱함)**: v17.5에서 절감
+    계산을 rupt 기반으로 재작성하면서 기존(r16~v17.2)에 곱하던 Coe_paoff(실측 보정계수)가 조용히 빠져
+    Optimizer Est. Saving/NC2 경로(여전히 Coe 적용)와 결과가 불일치했다. rupt의 CellOff/DeepSleep 열
+    자체는 사용자 스펙 그대로 '순수 Spec 차이값'을 유지하고, 절감 Wh 계산 단계에서 신규
+    `_rupt_model_coe_map`(rupt 빌드와 동일한 3단계 RU Model 매칭으로 {RU Model: Coe_paoff} 구성, 미매칭
+    시 1.0)을 `_calc_cell_off_savings_by_ru`와 `_deep_sleep_bonus_delta_for_level` 양쪽에 곱한다.
+  - **[버그 2, 중요] RU 소모에너지 매칭에 eNB_ID 누락 수정**: `_sector_total_energy_wh`(절감효과 표의
+    소모에너지)와 `_calc_all_savings`(NC2 경로의 Target RU Consumed)가 Energy Stat에서 RU를 찾을 때
+    ru-board-id/ru-port-id/ru-cascade-id만 매칭하고 eNB_ID를 확인하지 않았다 - RU 번호는 사이트(eNB)
+    내부에서만 유일하므로(Learning 탭에 같은 취지의 주석 기존재) 여러 사이트 데이터에서 같은 번호의
+    다른 사이트 RU 에너지가 합산되어 소모에너지가 부풀려졌다. eNB_ID를 매칭 키에 포함.
+  - **[최적화] `_sector_total_energy_wh` -> `_sector_energy_wh_map`으로 벡터화**: sector×RU마다
+    df_estat 전체를 불리언 마스크로 재스캔(O(sector수×RU수×행수))하던 것을 (eNB+RU키+Hourly_TS)
+    groupby 1회 + CM (eNB,Sector,RU) 매핑 merge 1회로 대체해 (eNodeBID,Sector)별 Wh dict를 한 번에
+    계산(공유 RU가 여러 Sector에 걸치면 각 Sector에 모두 합산되는 기존 동작 보존).
+  - **[버그 3] PA-shared 유령 cell 처리(사용자 확인: 표기 포함 + 절감 차단)**: PA-shared-cell이 CM에
+    자기 행이 없는 cell을 참조하면 예전에는 조용히 버렸다 - 이제 스펙("합집합") 그대로 rupt의 PA
+    shared에 포함하고(union-find parent 키 전체로 그룹 구성), 절감 판정에서는 그 cell의 off 시점을 알
+    수 없으므로 그 그룹이 자동으로 '전체 off 불가' 처리된다(보수적, 과다 절감 방지). PA-shared-cell
+    토큰 파싱도 정규식 숫자 추출(r'-?[0-9]+') 기반으로 강화해 "(120)", "120; 130" 등 괄호/구분자 표기 수용.
+  - **[버그 4] 수동 ES 시간 모드의 Rawdata가 ES 시간만 담기던 문제 수정(사용자 확인: 24h로)**:
+    run_analysis가 수동 모드에서 트래픽을 ES 시간대로 미리 필터해서(문서상 'Rawdata=24시간 전체'와
+    불일치, auto 모드는 24h 정상) 같은 기간 시뮬레이션 재사용 시 여러 날의 윈도우가 이어붙어 전날
+    마지막 ES level이 다음날 첫 스텝으로 그대로 이어졌다(윈도우 진입 재판정 누락 -> 과대 절감).
+    시간 필터를 제거하고(정책 학습용 시간 제한은 `_do_manual_mode`가 sub_group에서 자체 적용하므로
+    정책 결과는 동일) Rawdata만 24시간 전체가 되도록 수정.
+  - **[버그 5] '에너지 분석 실행' overlay 재작성(사용자 확인)**: 특정 eNodeBID/Sector 선택 시 raw_df를
+    먼저 필터해 시뮬레이션하던 것을, 항상 전체 sector로 시뮬레이션한 뒤(cross-sector PA shared/Deep
+    Sleep 판정 정상화 - v17.0 '알려진 한계' 이 화면에서는 해소) 표시 시점에만 선택 행의 절감을 합산
+    하도록 변경. 절감률 분모도 '전체 SectorList 소모'가 아니라 화면에 표시 중인 선택 부분의 실제
+    소모(total_wh)로 통일(분모/분자 기준 불일치 수정).
+  - **[버그 6] 자잘한 결함 2건**: (a) `_load_auto_jsons`가 CWD 기준 상대경로로 *_auto.json을 찾아 다른
+    폴더에서 실행하면 자동 로드가 조용히 실패 -> 앱 폴더(_app_dir) 기준으로 수정. (b) `_filter_cm_tree`
+    가 CM 데이터가 빈 상태에서 검색어 입력 시 np.column_stack([]) 예외 -> empty 가드 추가.
+  - **검증**: 신규 test_r17_fixes.py - (1) Coe_paoff=2.0이면 CellOff/DS 보너스 정확히 2배(300/80Wh),
+    1.0이면 절반(150/40Wh) 하위 일관성, (2) 유령 cell '(999)' 표기 포함 + 그 그룹 절감 0 차단,
+    (3) 같은 RU 번호를 가진 두 eNB의 에너지가 섞이지 않음(200/1998Wh 정확 분리), (4) 수동 모드
+    run_analysis 스모크 테스트 - Rawdata가 24시간 전체를 담고 ES_Window_Index가 0~5시에만 표시되며
+    정책(Operating Hours)은 기존과 동일함을 확인. 기존 회귀 테스트 전체(capability/ES mode Type/rupt/
+    RU-centric savings/DS Count) 재실행해 모두 통과(Coe=1.0 fixture라 값 불변). `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -1097,6 +1140,10 @@ class AppBase(BaseTk):
         return traffic_df
 
     def _load_auto_jsons(self):
+        # [r17-후속5, 버그 수정] 기존에는 상대경로(현재 작업 디렉터리 기준)로 찾아서, 앱을 다른 폴더에서
+        # 실행하면(예: IDE/터미널의 CWD가 다른 경우) 자동 로드가 조용히 실패했다 - 다른 모든 파일
+        # 입출력과 동일하게 앱 폴더(_app_dir) 기준 절대경로로 찾는다.
+        app_dir = self._app_dir()
         files = {
             "CarrierConf_auto.json": "carrier_df_internal",
             "SectorList_auto.json": "sector_df_internal",
@@ -1105,8 +1152,9 @@ class AppBase(BaseTk):
             "CIQ_auto.json": "ciq_df_internal"
         }
         for fname, attr in files.items():
-            if os.path.exists(fname):
-                try: setattr(self, attr, pd.read_json(fname, dtype=str))
+            path = os.path.join(app_dir, fname)
+            if os.path.exists(path):
+                try: setattr(self, attr, pd.read_json(path, dtype=str))
                 except: pass
 
     def handle_file_drop(self, event):
@@ -1791,6 +1839,9 @@ class AppDashboard(AppEditors):
 
     def _filter_cm_tree(self, *args):
         query = self.search_var.get().lower()
+        # [r17-후속5, 버그 수정] CM 데이터가 아직 없는 상태에서 검색어를 입력하면 np.column_stack([])이
+        # 예외를 던졌다 - 빈 DataFrame이면 조용히 아무것도 하지 않는다.
+        if self.cm_map_df_full.empty: return
         if not query: return self._update_cm_treeview(self.cm_map_df_full)
         mask = np.column_stack([self.cm_map_df_full[col].astype(str).str.lower().str.contains(query, na=False) for col in self.cm_map_df_full])
         self._update_cm_treeview(self.cm_map_df_full.loc[mask.any(axis=1)])
@@ -1918,8 +1969,15 @@ class AppDashboard(AppEditors):
             hourly_trend['Energy_Scaled'] = hourly_trend['Energy_Wh'] / div
             dow_trend['Energy_Scaled'] = dow_trend['Energy_Wh'] / div
 
-            # [r15-후속] 절감 효과도 같은 화면에 함께 시각화(ES Level 시뮬레이션 기반, 대상 eNodeBID/Sector로
-            # 한정) — 평가 기간/평가 시간(공통 필터)에 대해 계산.
+            # [r15-후속, r17-후속5에서 재작성] 절감 효과도 같은 화면에 함께 시각화(ES Level 시뮬레이션 기반) —
+            # 평가 기간/평가 시간(공통 필터)에 대해 계산.
+            # [r17-후속5, 버그 수정(사용자 확인)] 예전에는 raw_df를 선택한 eNodeBID/Sector로 먼저 필터한 뒤
+            # 시뮬레이션했는데, 그러면 (a) 다른 Sector의 timeline이 없어 cross-sector PA shared/Deep Sleep
+            # 판정이 전부 '미충족' 처리되어 절감이 과소 계산되고(v17.0 '알려진 한계'), (b) '전체 합계' 행의
+            # 절감률이 "선택 부분의 절감 ÷ 전체 SectorList 소모"로 분모/분자 기준이 어긋났다.
+            # 이제 시뮬레이션은 항상 전체 sector로 돌리고(교차 판정 정상화), 표시할 때만 선택한
+            # eNodeBID/Sector 행의 절감을 합산하며, 절감률 분모도 화면에 표시 중인 선택 부분의 실제
+            # 소모(total_wh)로 통일한다.
             saved_wh, saving_pct = 0.0, None
             try:
                 s_date, e_date = self._get_eval_date_range()
@@ -1927,17 +1985,14 @@ class AppDashboard(AppEditors):
                     eval_hours = self._parse_eval_hours()
                     raw_df, _ = self._build_rawdata_for_period(s_date, e_date, self.exclude_dates_str.get())
                     if not raw_df.empty:
-                        if target_enb not in ('All', ''): raw_df = raw_df[raw_df['eNodeBID'].astype(str) == str(target_enb)]
-                        if target_sec not in ('All', ''): raw_df = raw_df[raw_df['Sector'].astype(str) == str(target_sec)]
-                        if not raw_df.empty:
-                            sim_timeline_df, sim_summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
-                            sim_saving_df = self._calc_es_level_simulation_savings(sim_summary_df, sim_timeline_df, s_date, e_date, eval_hours=eval_hours)
-                            if not sim_saving_df.empty:
-                                total_row = sim_saving_df[sim_saving_df['eNodeBID'].astype(str) == '전체 합계']
-                                if not total_row.empty:
-                                    saved_wh = float(total_row['절감에너지 [Wh]'].iloc[0])
-                                    pct_val = total_row['절감률 (%)'].iloc[0]
-                                    saving_pct = float(pct_val) if pd.notna(pct_val) else None
+                        sim_timeline_df, sim_summary_df = self._run_es_level_simulation(raw_df, eval_hours=eval_hours)
+                        sim_saving_df = self._calc_es_level_simulation_savings(sim_summary_df, sim_timeline_df, s_date, e_date, eval_hours=eval_hours)
+                        if not sim_saving_df.empty:
+                            sel = sim_saving_df[sim_saving_df['eNodeBID'].astype(str) != '전체 합계']
+                            if target_enb not in ('All', ''): sel = sel[sel['eNodeBID'].astype(str) == str(target_enb)]
+                            if target_sec not in ('All', ''): sel = sel[sel['Sector'].astype(str) == str(target_sec)]
+                            saved_wh = float(sel['절감에너지 [Wh]'].sum())
+                            saving_pct = (saved_wh / total_wh * 100) if total_wh > 0 else None
             except Exception as e:
                 logging.warning(f"[DEBUG] 절감 효과 시각화용 계산 실패: {e}")
 
@@ -2909,17 +2964,21 @@ class ESAnalyzerApp(AppDashboard):
         전력차를 N으로 나눠 각 그룹에 배분한다(그 RU가 물리적으로 한 번에 낼 수 있는 절감은 하나뿐이므로
         중복 계상 방지). 그룹의 멤버 cell들이 여러 Sector에 걸치면, 관련 Sector에 절감량을 균등 분배한다
         (사용자 확인).
+        [r17-후속5] 절감 W값은 rupt의 CellOff(순수 Spec 차이값)에 그 RU Model의 Coe_paoff(실측
+        보정계수, `_rupt_model_coe_map`)를 곱해 사용한다 - 기존(r16~v17.2) 동작 복원.
         반환: {(enodeb, sector): raw_wh(감마 적용 전)}."""
         acc = {}
         if rupt is None or rupt.empty or not cell_off_level:
             return acc
 
+        coe_map = self._rupt_model_coe_map(rupt)
         ru_groups = {}
         for _, r in rupt.drop_duplicates(subset=['NE ID', 'Cell ID']).iterrows():
             ne_id = str(r['NE ID'])
             key = (ne_id, r.get('BID', ''), r.get('PID', ''), r.get('CID', ''))
             pa_shared = str(r.get('PA shared', '') or '')
-            entry = ru_groups.setdefault(key, {}).setdefault(pa_shared, {'members': set(), 'cell_off': r.get('CellOff', -1)})
+            entry = ru_groups.setdefault(key, {}).setdefault(pa_shared, {
+                'members': set(), 'cell_off': r.get('CellOff', -1), 'coe': coe_map.get(r.get('RU Model', ''), 1.0)})
             entry['members'].update(re.findall(r'\d+', pa_shared))
 
         for (ne_id, bid, pid, cid), pa_map in ru_groups.items():
@@ -2933,6 +2992,7 @@ class ESAnalyzerApp(AppDashboard):
                     continue
                 if cell_off_val < 0:  # rupt 매칭 실패(-1) - 절감 데이터 없음
                     continue
+                cell_off_val *= info['coe']
                 members = []
                 ok = True
                 for c in info['members']:
@@ -2984,6 +3044,7 @@ class ESAnalyzerApp(AppDashboard):
             group_members.setdefault(enb, {}).setdefault(gid, []).append((sec, lv))
             group_cells.setdefault(enb, {}).setdefault(gid, set()).update(re.findall(r'\d+', str(r.get('Target Cell Num', ''))))
 
+        coe_map = self._rupt_model_coe_map(rupt)
         for enb, gid_map in group_members.items():
             for gid, members in gid_map.items():
                 all_off = self._members_all_off_series(level_wide_by_enb.get(enb), members, strict=True)
@@ -2993,7 +3054,7 @@ class ESAnalyzerApp(AppDashboard):
                 if eligible_steps <= 0:
                     continue
                 cells_str = ','.join(group_cells.get(enb, {}).get(gid, set()))
-                ds_delta = self._deep_sleep_bonus_delta_for_level(rupt, enb, cells_str)
+                ds_delta = self._deep_sleep_bonus_delta_for_level(rupt, enb, cells_str, coe_map=coe_map)
                 if ds_delta <= 0:
                     continue
                 wh = ds_delta * eligible_steps * 0.25
@@ -3006,12 +3067,14 @@ class ESAnalyzerApp(AppDashboard):
                     acc[acc_key] = acc.get(acc_key, 0.0) + share
         return acc
 
-    def _deep_sleep_bonus_delta_for_level(self, rupt, enodeb, target_cells_str):
+    def _deep_sleep_bonus_delta_for_level(self, rupt, enodeb, target_cells_str, coe_map=None):
         """[r17-후속2, r17-후속4부터 ES Level이 아니라 Deep Sleep Capability 그룹 전체의 합산 cell-num
         문자열로 호출됨] rupt(RU profile table)의 'DeepSleep' 열(=PA off-Deep Sleep, 이미 0 이상으로
         clamp된 '추가' 절감 W)을 이용해, target_cells_str에 연결된 고유 RU HW(BID+CID 기준 - Single
         Band 가정, port 무관)별 Deep Sleep 추가절감을 합산한다. RU Model이 RU/MMU Spec에서 매칭되지
-        않은 RU(rupt의 DeepSleep==-1)는 0으로 취급(추가절감 없음)."""
+        않은 RU(rupt의 DeepSleep==-1)는 0으로 취급(추가절감 없음).
+        [r17-후속5] coe_map({RU Model: Coe_paoff}, `_rupt_model_coe_map`)이 주어지면 RU별로 곱해
+        실측 보정을 적용한다(CellOff 절감과 동일 정책 - v17.5에서 빠졌던 보정 복원)."""
         if rupt is None or rupt.empty or not target_cells_str or pd.isna(target_cells_str) or str(target_cells_str) == '-1':
             return 0.0
         cells = re.findall(r'\d+', str(target_cells_str))
@@ -3023,13 +3086,14 @@ class ESAnalyzerApp(AppDashboard):
         ru_hw_keys = [c for c in ['BID', 'CID'] if c in sub.columns]
         unique_rus = sub.drop_duplicates(subset=ru_hw_keys) if ru_hw_keys else sub.drop_duplicates(subset=['DeepSleep'])
         total = 0.0
-        for v in unique_rus['DeepSleep']:
+        for v, model in zip(unique_rus['DeepSleep'], unique_rus['RU Model']):
             try:
                 fv = float(v)
             except (TypeError, ValueError):
                 continue
             if fv > 0:
-                total += fv
+                coe = coe_map.get(model, 1.0) if coe_map else 1.0
+                total += fv * coe
         return total
 
     def _compute_deep_sleep_eligible_steps(self, timeline_df):
@@ -3109,27 +3173,43 @@ class ESAnalyzerApp(AppDashboard):
         df_e['Hourly_TS'] = df_e['Timestamp'].dt.floor('h')
         return df_e
 
-    def _sector_total_energy_wh(self, enodeb, sector, df_estat):
-        """[r15-후속] (eNodeBID, Sector)에 속한 모든 Cell의 RU path를 CM 매핑(cm_map_df_full의 'Sector'
-        열, cell-num%10 기준)으로 찾아, 이미 기간 필터된 df_estat에서 해당 RU들의 총 소모 에너지[Wh]를
-        합산한다(공유 RU 중복 합산 방지를 위해 RU path 기준으로 먼저 dedupe)."""
-        if df_estat is None or df_estat.empty or self.cm_map_df_full.empty: return 0.0
-        cm_sub = self.cm_map_df_full[(self.cm_map_df_full['eNB_ID'].astype(str) == str(enodeb)) & (self.cm_map_df_full['Sector'].astype(str) == str(sector))]
-        if cm_sub.empty: return 0.0
+    def _sector_energy_wh_map(self, df_estat):
+        """[r15-후속의 _sector_total_energy_wh를 r17-후속5에서 벡터화 + 버그 수정하며 대체]
+        (eNodeBID, Sector)별 총 소모 에너지[Wh] dict를 한 번에 계산한다.
+
+        [버그 수정] 기존 구현은 Energy Stat에서 RU를 찾을 때 ru-board-id/ru-port-id/ru-cascade-id만
+        매칭하고 **eNB_ID를 확인하지 않았다** - RU 번호는 사이트(eNB) 내부에서만 유일하므로(Learning
+        탭에 같은 취지의 주석이 이미 있음) 여러 사이트가 섞인 데이터에서 같은 번호를 가진 다른 사이트
+        RU의 에너지가 합산되어 소모에너지가 부풀려졌다. 이제 eNB_ID를 매칭 키에 포함한다.
+
+        [최적화] sector×RU마다 df_estat 전체를 불리언 마스크로 재스캔(O(sector수×RU수×행수))하던 것을,
+        (eNB_ID+RU키+Hourly_TS) groupby 1회 -> RU별 Wh 합산 1회 -> CM의 (eNB_ID, Sector, RU) 매핑에
+        merge하는 방식으로 대체. 공유 RU가 CM에서 여러 Sector에 걸쳐 있으면 기존과 동일하게 각 Sector에
+        모두 합산된다(sector별 dedupe 후 합산 - 기존 동작 보존).
+        반환: {(enodeb, sector): total_wh}."""
+        result = {}
+        if df_estat is None or df_estat.empty or self.cm_map_df_full.empty: return result
         ru_keys = ['ru-board-id', 'ru-port-id', 'ru-cascade-id']
-        avail_keys = [c for c in ru_keys if c in cm_sub.columns and c in df_estat.columns]
-        if not avail_keys: return 0.0
-        unique_rus = cm_sub[avail_keys].drop_duplicates()
-        total_wh = 0.0
-        for _, ru in unique_rus.iterrows():
-            mask = pd.Series(True, index=df_estat.index)
-            for k in avail_keys: mask &= (df_estat[k] == ru[k])
-            ru_data = df_estat[mask]
-            if ru_data.empty: continue
-            ru_hr = ru_data.groupby('Hourly_TS', observed=True).agg({'RuPowerTot': 'sum', 'RuPowerCnt': 'sum'})
-            ru_hr['Energy_Wh'] = np.where(ru_hr['RuPowerCnt'] > 0, ru_hr['RuPowerTot'] / ru_hr['RuPowerCnt'], 0)
-            total_wh += ru_hr['Energy_Wh'].sum()
-        return total_wh
+        avail_keys = [c for c in ru_keys if c in self.cm_map_df_full.columns and c in df_estat.columns]
+        if not avail_keys or 'eNB_ID' not in df_estat.columns: return result
+
+        # 1) (eNB+RU)별 시간당 에너지 -> RU별 총 Wh (기존: RU별 Hourly 집계 후 Wh 합산과 동일 공식)
+        hourly = df_estat.groupby(['eNB_ID'] + avail_keys + ['Hourly_TS'], observed=True).agg(
+            {'RuPowerTot': 'sum', 'RuPowerCnt': 'sum'}).reset_index()
+        hourly['Energy_Wh'] = np.where(hourly['RuPowerCnt'] > 0, hourly['RuPowerTot'] / hourly['RuPowerCnt'], 0)
+        ru_wh = hourly.groupby(['eNB_ID'] + avail_keys, observed=True)['Energy_Wh'].sum().reset_index()
+
+        # 2) CM의 (eNB_ID, Sector, RU키) 유니크 조합에 RU별 Wh를 붙여 sector 단위로 합산
+        cm_pairs = self.cm_map_df_full[['eNB_ID', 'Sector'] + avail_keys].copy()
+        cm_pairs['eNB_ID'] = cm_pairs['eNB_ID'].astype(str)
+        cm_pairs['Sector'] = cm_pairs['Sector'].astype(str)
+        cm_pairs = cm_pairs.drop_duplicates()
+        ru_wh['eNB_ID'] = ru_wh['eNB_ID'].astype(str)
+        merged = pd.merge(cm_pairs, ru_wh, on=['eNB_ID'] + avail_keys, how='inner')
+        if merged.empty: return result
+        for (enb, sec), wh in merged.groupby(['eNB_ID', 'Sector'], observed=True)['Energy_Wh'].sum().items():
+            result[(str(enb), str(sec))] = float(wh)
+        return result
 
     def _get_all_sectorlist_pairs(self):
         """[r0-후속2] 현재 Target Cat_ID의 SectorList에 있는 모든 (eNodeBID, Sector) 쌍을 반환한다.
@@ -3202,6 +3282,8 @@ class ESAnalyzerApp(AppDashboard):
         cell_off_level = self._build_cell_off_level_map()
         cell_off_acc = self._calc_cell_off_savings_by_ru(rupt, cell_off_level, level_wide_by_enb)
         ds_bonus_acc = self._calc_deep_sleep_bonus_by_group(rupt, level_wide_by_enb) if deep_sleep_on else {}
+        # [r17-후속5] sector×RU마다 df_estat를 재스캔하지 않고 (eNodeBID, Sector)별 소모 Wh를 한 번에 계산.
+        sector_energy = self._sector_energy_wh_map(df_estat)
 
         rows = []
         covered_pairs = set()
@@ -3216,7 +3298,7 @@ class ESAnalyzerApp(AppDashboard):
                 saved_wh = (cell_off_wh + deep_sleep_bonus_wh_raw) * gamma2
                 deep_sleep_bonus_wh = deep_sleep_bonus_wh_raw * gamma2
 
-                consumed_wh = self._sector_total_energy_wh(enodeb, sector, df_estat)
+                consumed_wh = sector_energy.get(key, 0.0)
                 es_active = int(srow.get('ES Active Steps', 0))
                 violation_cnt = int(srow.get('Tput Violation Count', 0))
                 pct = (saved_wh / consumed_wh * 100) if consumed_wh else np.nan
@@ -3234,7 +3316,7 @@ class ESAnalyzerApp(AppDashboard):
         for enodeb, sector in self._get_all_sectorlist_pairs():
             if (enodeb, sector) in covered_pairs:
                 continue
-            consumed_wh = self._sector_total_energy_wh(enodeb, sector, df_estat)
+            consumed_wh = sector_energy.get((enodeb, sector), 0.0)
             rows.append({
                 'eNodeBID': enodeb, 'Sector': sector,
                 '소모에너지 [Wh]': round(consumed_wh, 2), '절감에너지 [Wh]': 0.0,
@@ -3436,6 +3518,10 @@ class ESAnalyzerApp(AppDashboard):
                         if df_energy_stat is not None and not df_energy_stat.empty:
                             mask = pd.Series(True, index=df_energy_stat.index)
                             if h_list: mask &= df_energy_stat['HourOfDay'].isin(h_list)
+                            # [r17-후속5, 버그 수정] RU 번호(Bid/RuPort/Cascade)는 eNB 내부에서만 유일하므로
+                            # eNB_ID도 반드시 매칭 - 없으면 같은 번호의 다른 사이트 RU 에너지가 합산된다.
+                            if 'eNB_ID' in df_energy_stat.columns:
+                                mask &= (df_energy_stat['eNB_ID'].astype(str) == str(enodeb))
                             for k in avail_keys:
                                 if k in df_energy_stat.columns: mask &= (df_energy_stat[k] == ru[k])
 
@@ -4259,7 +4345,13 @@ class ESAnalyzerApp(AppDashboard):
             if 'eNB_ID' in traffic_df.columns: traffic_df['eNB_ID'] = self._extract_int_id(traffic_df['eNB_ID'])
             if 'Sector' in traffic_df.columns: traffic_df['Sector'] = self._extract_int_id(traffic_df['Sector'])
 
-            traffic_df = self._filter_date_time(traffic_df, apply_hour_filter=not self.auto_optimize_time.get())
+            # [r17-후속5, 버그 수정] 수동 ES 시간 모드에서도 시간 필터를 여기서 적용하지 않는다(auto 모드와
+            # 동일하게 24시간 전체 유지). 정책 학습용 시간 제한은 _do_manual_mode가 sub_group을 만들 때
+            # 자체적으로 적용하므로 결과 정책은 동일하고, Rawdata(latest_optimizer_rawdata)만 문서대로
+            # "24시간 전체"가 된다 - 예전에는 수동 모드 Rawdata가 ES 시간만 담겨, 같은 기간 시뮬레이션
+            # 재사용 시 여러 날의 윈도우가 이어붙어 전날 마지막 ES level이 다음날 첫 스텝으로 그대로
+            # 이어지는(윈도우 진입 재판정 누락 -> 과대 절감) 문제가 있었다(사용자 확인).
+            traffic_df = self._filter_date_time(traffic_df, apply_hour_filter=False)
             if traffic_df.empty: raise ValueError("조건에 해당하는 트래픽 데이터가 없습니다.")
 
             conf_df = self.sector_df_internal[self.sector_df_internal['Cat_ID'].astype(str) == cat_id].copy()
@@ -4894,6 +4986,34 @@ class ESAnalyzerApp(AppDashboard):
             _delta('PA off', 'Super Sleep', clamp_zero=True),
         )
 
+    def _rupt_model_coe_map(self, rupt):
+        """[r17-후속5, Coe_paoff 재적용] rupt의 각 고유 RU Model에 대해 RU/MMU Spec DB의 Coe_paoff
+        (실측 보정계수)를 3단계 fallback 매칭(_rupt_match_ru_spec_row, rupt 빌드와 동일한 매칭)으로 찾아
+        {RU Model: coe} dict를 만든다. Spec에 없거나 값이 비어 있으면 1.0(보정 없음).
+        배경: rupt의 CellOff/DeepSleep 열 자체는 사용자 스펙 그대로 '순수 Spec 차이값'을 유지하되,
+        절감 Wh 계산 단계에서는 기존(r16~v17.2)과 동일하게 Coe_paoff를 곱해야 한다 - v17.5에서 rupt
+        기반으로 재작성하면서 이 보정이 조용히 빠져 Optimizer Est. Saving/NC2 경로(여전히 Coe 적용)와
+        결과가 불일치했던 회귀를 수정(사용자 확인)."""
+        coe_map = {}
+        if rupt is None or rupt.empty:
+            return coe_map
+        spec = self.ru_spec_df_internal
+        spec_bcol = None
+        if spec is not None and not spec.empty:
+            spec_bcol = next((c for c in spec.columns if self._rupt_norm_key(c) in ['boardtype', 'ruboardtype']), None)
+        for model in rupt['RU Model'].unique():
+            coe = 1.0
+            spec_row = self._rupt_match_ru_spec_row(model, spec, spec_bcol) if model else None
+            if spec_row is not None:
+                coe_val = spec_row.get('Coe_paoff', 1.0)
+                try:
+                    if pd.notna(coe_val) and str(coe_val).strip() != '':
+                        coe = float(coe_val)
+                except (TypeError, ValueError):
+                    coe = 1.0
+            coe_map[model] = coe
+        return coe_map
+
     def _build_ru_profile_table(self):
         """[r17] RU profile table(rupt) - 각 탭의 CM/RU 관련 동작에서 공유해 재사용하기 위한 표.
         self.cm_map_df_full(Cell-RU 매핑)과 self.ru_spec_df_internal(RU/MMU Spec)로부터 매번 새로
@@ -4944,17 +5064,22 @@ class ESAnalyzerApp(AppDashboard):
             key = (ne_id_s.iat[i], cell_id_s.iat[i])
             find(key)
             if pa_col is not None:
-                for tok in re.split(r'[,;/]', str(cm[pa_col].iat[i])):
-                    tok = tok.strip()
-                    if not tok: continue
-                    num = pd.to_numeric(tok, errors='coerce')
-                    if pd.notna(num) and int(num) >= 0:
-                        union(key, (ne_id_s.iat[i], str(int(num))))
+                # [r17-후속5] 토큰 파싱을 정규식 숫자 추출로 강화 - "(120)", "120; 130" 등 구분자/괄호
+                # 표기가 섞여 있어도 안전하게 인식한다(-1은 그대로 '공유 없음'으로 제외).
+                for tok in re.findall(r'-?\d+', str(cm[pa_col].iat[i])):
+                    num = int(tok)
+                    if num >= 0:
+                        union(key, (ne_id_s.iat[i], str(num)))
 
+        # [r17-후속5, 사용자 확인] PA-shared-cell이 참조하지만 CM에 자기 행이 없는 cell(유령 cell)도
+        # 스펙("cell-num과 PA-shared-cell의 합집합") 그대로 PA shared에 포함한다 - union-find의 parent에는
+        # 참조된 모든 (NE ID, cell) 키가 들어 있으므로 cm 행이 아니라 parent 키 전체로 그룹을 구성한다.
+        # 이렇게 하면 절감 판정(_calc_cell_off_savings_by_ru)에서 그 cell의 off 시점을 알 수 없어 그룹이
+        # 자동으로 '전체 off 불가' 처리된다(보수적, 과다 절감 방지 - 사용자 확인 사항).
         groups = {}
-        for i in range(len(cm)):
-            root = find((ne_id_s.iat[i], cell_id_s.iat[i]))
-            groups.setdefault(root, set()).add(cell_id_s.iat[i])
+        for key in parent:
+            root = find(key)
+            groups.setdefault(root, set()).add(key[1])
 
         pa_shared_vals = []
         for i in range(len(cm)):
