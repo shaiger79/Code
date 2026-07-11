@@ -15,7 +15,7 @@
 > 5. **저장소 정합**: 자매 프로젝트 `ESM/`(에너지 절감 분석)과 `LBM`(로드밸런싱, 예정)이 본 툴의 출력을
 >    소비한다. 출력 스키마·식별자 규칙은 ESM 호환을 최우선으로 유지한다.
 
-*Last Updated: 2026-07-10*
+*Last Updated: 2026-07-11*
 
 ---
 
@@ -54,8 +54,27 @@
 
 ## 3. 진행 이력 (Changelog)
 
+* **[r1] (2026-07-11) ENDC/DC·SA Steering 명시적 구현 — `trafficgen_r1.py` (현재 유일 활성 개발 파일)**
+  * `trafficgen_r0.py`를 복제해 시작. r0의 기능 전부 유지 + steering 계층 추가. (PR #30 머지 후 main에서
+    브랜치 재시작하여 진행.)
+  * **핵심 변경 — 사이트 수요 라우팅**: 이전엔 셀별 독립 offered load 였으나, 이제 사이트 전체 수요(Mbps,
+    `site_peak_dl_mbps`)를 사용자 클래스(Legacy-LTE / ENDC(NSA) / NR-SA)로 나눠 steering 정책대로
+    LTE 풀 / NR 풀로 라우팅 후 캐리어 용량비로 분배(`_route_demand`). 트래픽 보존(옮긴 만큼 목적지 부하↑).
+  * **`SteeringConfig` 레버**: 캐리어 on/off(`lte_enabled`/`nr_enabled`, off 셀은 sleep 전력=p_idle×0.12,
+    트래픽 0), `endc_split_nr`(ENDC 데이터 NR(SCG) 비중), `dc_release`(ENDC 전부 LTE anchor),
+    `nr_to_lte_offload`(로드밸런싱 강제 이전), `sa_fallback_to_lte`(NR 전면 off 시 SA 폴백). 프리셋:
+    baseline/nr_off/nr_all_off/dc_release/offload.
+  * **엔진**: `_generate_cell`이 이제 배정 수요(Mbps)+enabled 를 받아 offered=배정÷용량(>1이면 혼잡),
+    유저수는 offered 비례(수요 0이면 유저 0), 나머지 인과 체인은 r0 동일.
+  * **GUI**: Config 탭에 Steering 패널(프리셋/site peak/ENDC split/DC release/offload/셀 on-off 체크) 추가,
+    `_current_steering()`로 Generate 에 반영. `run_scenario()`/`run_headless_demo()`는 baseline vs nr_off 비교.
+  * **검증**: `py_compile` 통과 + headless 시나리오 비교 —
+    (1) NR-off 총에너지 절감 551.7→485.3 kWh, (2) 남은 NR 캐리어 부하 상승, (3) offload 시 LTE_util↑·NR_util↓,
+    (4) dc_release 시 LTE_util 38.6→75.1 상승, (5) 꺼진 셀 DL=0·sleep 전력 확인. (대용량 NR→소용량 LTE
+    오프로딩 시 LTE 혼잡으로 총 전달량↓ 하는 트레이드오프도 데이터로 재현됨.)
+
 * **[r0] (2026-07-10) TrafficGen v0 최초 구현 — 단일 사이트 LTE×3 + NR×3 오버레이 생성기 + GUI**
-  * 파일: `TrafficGen/trafficgen_r0.py` (현재 유일 활성 개발 파일).
+  * 파일: `TrafficGen/trafficgen_r0.py` (r1으로 대체됨 — 이후 수정 없음, 라운드 보존).
   * **토폴로지**: `build_default_topology()` — LTE 3캐리어(B1/2100, B3/1800, B7/2600, 각 20MHz/100RB)
     + NR 3캐리어(n78 100MHz/273RB ×2, n78 소역폭 1). 셀별 용량/에너지/유저 파라미터 부여.
   * **생성 엔진**(`TrafficGenEngine`): 15분 ROP 시계열. 일주기(diurnal, 점심/저녁 피크+주말 감쇠) 수요 →
@@ -76,8 +95,8 @@
 ## 4. 다음 단계 / 대기 (To-Do)
 
 1. **GUI 실환경 확인**: 사용자 로컬(tkinter 설치)에서 5탭 동작·시각화·다운로드 확인 필요(컨테이너 미검증).
-2. **ENDC/DC·SA steering 정교화**: 현재 v0는 캐리어별 독립 수요. 사이트 수요를 RAT로 분배하고 DC 해제/
-   NR off 시 LTE로 트래픽 이전하는 오프로딩 레버를 다음 라운드에 명시적 파라미터로 구현.
+2. ~~**ENDC/DC·SA steering**~~ ✅ [r1] 구현 완료(`SteeringConfig`, `_route_demand`). 후속: steering
+   파라미터를 시간대별로 변화(스케줄/이벤트)시키는 동적 정책, 사용자 클래스 비율의 지역/시간 변동.
 3. **멀티 사이트 확장**: 현재 1 사이트. 다중 사이트/섹터(방위각)로 확장.
 4. **ESM round-trip 검증**: 생성 CSV를 실제 ESM에 로드해 파싱·분석되는지 왕복 확인(컬럼명 최종 정합).
 5. **정답(ground truth) 라벨 출력 여부**: 이상/이벤트 주입 및 숨은 파라미터 동시 출력(애널리스트 검증용) — 사용자 확정 대기.

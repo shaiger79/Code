@@ -211,12 +211,15 @@
   * **LTE**: 멀티캐리어(커버리지 오버랩) **3 캐리어 = 3 셀** (예: B1/2100·B3/1800·B7/2600, 각 20MHz/100RB).
   * **NR**: **3 캐리어 = 3 셀** (예: n78 100MHz/273RB 위주).
 * **ENDC/NSA·SA 반영**: 현행 상용망은 NSA(ENDC, LTE 앵커 + NR SCG Dual Connectivity)로 운용. SA(NR 단독)도
-  포함 가능. → 향후 에너지세이빙/로드밸런싱(트래픽 오프로딩: NR off→LTE 이전, DC 해제→LTE anchor만 등)을
-  위해 **사이트 수요를 RAT/캐리어로 분배(steering)할 수 있는 구조**로 설계.
+  포함. → 에너지세이빙/로드밸런싱(트래픽 오프로딩: NR off→LTE 이전, DC 해제→LTE anchor만 등)을 위해
+  **사이트 수요를 사용자클래스(Legacy-LTE/ENDC/NR-SA)별로 나눠 RAT/캐리어로 분배(steering)하는 구조**로
+  설계. **[r1 구현 완료]** `SteeringConfig`(캐리어 on/off, `endc_split_nr`, `dc_release`,
+  `nr_to_lte_offload`, `sa_fallback_to_lte`) + `_route_demand`(트래픽 보존 라우팅).
 * **KPI 집계 4레벨**: ① Cell → ② LTE Sector(LTE 셀 aggregation) → ③ NR Sector(NR 셀 aggregation) →
   ④ LTE+NR Total. 각 레벨 간 지표 수준을 비교.
 * **GUI(필수)**: Tkinter + Matplotlib. 시계열/**CDF**/히스토그램 시각화 + KPI 테이블 비교 + CSV 다운로드
-  (ESM·LBM 연동). 구현: `TrafficGen/trafficgen_r0.py`.
+  (ESM·LBM 연동) + Steering 패널(프리셋/셀 on-off/split/offload). 활성 구현: `TrafficGen/trafficgen_r1.py`
+  (r0 → r1, steering 추가).
 
 ## 8. 오픈 퀘스천 (인터뷰 대상) ❓
 
