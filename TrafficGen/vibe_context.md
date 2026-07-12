@@ -72,12 +72,21 @@
   * **③ 셀별 UE 비율**(`ue_weight`, 토폴로지 신규 컬럼): 특정 셀의 유저 수 밀도 배수. 트래픽 분배
     (`load_weight`)와 **독립** — `_generate_cell`에서 conn(접속 유저)에만 곱함. UE↑ → active↑ →
     사용자당 자원↓ → IP Tput↓(트래픽량·에너지는 불변). 캐리어 에디터에서 셀별 편집.
+  * **④ IP Tput 의 volume/time 성분 분리 생성**(사용자 요청, 같은 r2에 후속 반영): IP Tput 을 단일값이
+    아니라 두 성분으로 생성 — `IpThruThpVoDLByte`(volume, KByte 스케일 = 전달 DL 볼륨의 ~0.95),
+    `IpThruThpDLTime`(time, ms). **ESM 정의 정합**(esm_r17.py:2411): `IP Tput[Mbps]=(Vol/Time)*8`.
+    time 성분은 `Vol÷rate` 로 유도되어 **활성 유저수↑ ⇒ ip_tput↓ ⇒ ThpTime↑**(여러 UE 활성시간 합이라
+    ROP 초과 가능=정상) → 사용자 강조("전송 소요시간은 유저 수의 함수")를 데이터로 구현. 집계 IP Tput 도
+    볼륨가중 평균 대신 **(ΣVol/ΣTime)*8** 로 변경(성분과 정확히 일치). PM CSV export 에 두 성분 컬럼 추가,
+    Visualize KPI 드롭다운에도 추가.
   * **부가**: `cell_summary_table()`(셀 단위 요약, 조정 효과 확인용) 추가, Generate/Compare 탭에 레벨요약+셀요약
     2단 표, Visualize Cell 레벨이 전체 셀(LTE+NR)을 밴드 라벨로 표시.
   * **검증**: `py_compile` 통과 + headless 데모 —
     (1) baseline 수치가 r1과 정확히 동일(551.74 kWh 등, 리팩터 하위호환), (2) LTE-1 `ue_weight=3.0` →
     Active 58.5→175.4(≈3×)·IP Tput 4.7→1.6 Mbps↓·**DL량/에너지 불변**(독립 레버 입증), (3) evening 패턴이
     총 DL 30261→25403 GB 로 다르게 산출, (4) NR 4번째 캐리어 추가 시 셀 4개로 정상 확장, (5) CSV 3종+PNG 산출.
+    **④ 검증**: 4032행 전부 `|IP Tput−(Vol/Time)*8|≈0.001`(ESM 재계산 일치), UE 3배 시 ThpVol 불변·
+    ThpTime≈3배↑·IP Tput 4.66→1.55↓, 집계 레벨도 성분과 일치, PM CSV 성분 컬럼 포함.
   * **GUI 미검증(주의)**: tkinter GUI 6탭은 컨테이너에서 실행 불가 → 사용자 로컬에서 확인 필요.
     엔진/집계/Export/플롯은 headless 검증 완료.
 
