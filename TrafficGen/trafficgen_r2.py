@@ -27,6 +27,7 @@ IpThruThpDLTime(time 성분) / UsedRB / nRB / AirMacDLByte / AirMacULByte / RuPo
 from __future__ import annotations
 
 import os
+import json
 import numpy as np
 import pandas as pd
 
@@ -575,6 +576,46 @@ def export_esm_csv(cell_df: pd.DataFrame, topology: pd.DataFrame, out_dir: str,
 
 
 # ---------------------------------------------------------------------------
+# 설정 저장/불러오기 (기본값) — 토폴로지 + 패턴 + steering + 실행 파라미터
+# ---------------------------------------------------------------------------
+CONFIG_FILENAME = "trafficgen_config.json"
+
+
+def default_config_path() -> str:
+    """설정 파일 경로(스크립트 폴더 기준, 없으면 CWD)."""
+    try:
+        base = os.path.dirname(os.path.abspath(__file__))
+    except NameError:  # pragma: no cover - 인터랙티브 환경
+        base = os.getcwd()
+    return os.path.join(base, CONFIG_FILENAME)
+
+
+def save_config(path: str, topology: pd.DataFrame, pattern: "TrafficPattern",
+                steering_params: dict, run_params: dict) -> str:
+    """현재 설정을 JSON 으로 저장(기본값)."""
+    data = {
+        "topology": json.loads(normalize_topology(topology).to_json(orient="records")),
+        "pattern": {
+            "site_peak_dl_mbps": float(pattern.site_peak_dl_mbps),
+            "peaks": [dict(hour=float(p.get("hour", 12)), amp=float(p.get("amp", 0.0)),
+                           width=float(p.get("width", 1.0))) for p in pattern.peaks],
+            "base_level": float(pattern.base_level),
+            "weekend_factor": float(pattern.weekend_factor),
+        },
+        "steering": dict(steering_params),
+        "run": dict(run_params),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+
+def load_config(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
 # 시각화 (Axes 주입식 → GUI/headless 공용)
 # ---------------------------------------------------------------------------
 def plot_kpi(ax, df: pd.DataFrame, kpi: str, plot_type: str = "time", label: str = ""):
@@ -621,11 +662,13 @@ class TrafficGenApp(_GUI_BASE):  # type: ignore[misc]
         super().__init__()
         self.title("TrafficGen r2 — LTE/NR Overlay KPI Generator (Carrier · Pattern · UE editable)")
         self.geometry("1140x800")
+        self.config_path = default_config_path()
         self.topology = build_default_topology()
         self.pattern_peaks = [dict(p) for p in TrafficPattern().peaks]
         self.cell_df = None
         self.agg = None
         self._build_ui()
+        self._try_autoload_config()
 
     # --- UI 구성 ---
     def _build_ui(self):
@@ -683,8 +726,11 @@ class TrafficGenApp(_GUI_BASE):  # type: ignore[misc]
         ttk.Button(btns, text="➕ Add", command=self._car_add).pack(side="left", padx=3)
         ttk.Button(btns, text="✏️ Update", command=self._car_update).pack(side="left", padx=3)
         ttk.Button(btns, text="🗑️ Delete", command=self._car_delete).pack(side="left", padx=3)
-        ttk.Button(btns, text="↺ Reset default", command=self._car_reset).pack(side="left", padx=3)
+        ttk.Button(btns, text="↺ Reset built-in", command=self._car_reset).pack(side="left", padx=3)
         ttk.Button(btns, text="⤵ Load form from default row", command=self._car_fill_template).pack(side="left", padx=3)
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(btns, text="💾 Save as Default", command=self._save_as_default).pack(side="left", padx=3)
+        ttk.Button(btns, text="📂 Load Default", command=self._load_default).pack(side="left", padx=3)
         self.car_status = tk.StringVar(value="")
         ttk.Label(self.tab_car, textvariable=self.car_status, foreground="#2255aa").pack(anchor="w", padx=8)
         self._refresh_car_tree()
@@ -731,9 +777,11 @@ class TrafficGenApp(_GUI_BASE):  # type: ignore[misc]
             self.car_status.set("수정할 행을 먼저 선택하세요."); return
         idx = self.car_tv.index(sel[0])
         row = self._form_row()
-        for c in TOPO_COLS:
-            self.topology.loc[idx, c] = row[c]
-        self.topology = normalize_topology(self.topology)
+        # 셀 단위 대입은 dtype 충돌(예: 문자열 '700' → int64 컬럼)을 일으키므로 행을 통째로 교체 후
+        # normalize_topology 로 형변환한다.
+        records = self.topology.to_dict("records")
+        records[idx] = {c: row[c] for c in TOPO_COLS}
+        self.topology = normalize_topology(pd.DataFrame(records))
         self._refresh_car_tree(); self._rebuild_cell_toggles()
         self.car_status.set(f"수정됨: index {idx}.")
 
@@ -749,7 +797,83 @@ class TrafficGenApp(_GUI_BASE):  # type: ignore[misc]
     def _car_reset(self):
         self.topology = build_default_topology()
         self._refresh_car_tree(); self._rebuild_cell_toggles()
-        self.car_status.set("기본 토폴로지로 초기화했습니다(LTE×3 + NR×3).")
+        self.car_status.set("내장 기본 토폴로지로 초기화했습니다(LTE×3 + NR×3).")
+
+    # --- 설정(기본값) 저장/불러오기 ---
+    def _steering_params(self) -> dict:
+        return dict(endc_split_nr=self.var_split.get(), dc_release=self.var_dcrel.get(),
+                    nr_to_lte_offload=self.var_offload.get(),
+                    lte_enabled=[v.get() for v in self.var_lte_on],
+                    nr_enabled=[v.get() for v in self.var_nr_on])
+
+    def _run_params(self) -> dict:
+        return dict(days=self.var_days.get(), step=self.var_step.get(), seed=self.var_seed.get())
+
+    def _save_as_default(self):
+        try:
+            save_config(self.config_path, self.topology, self._current_pattern(),
+                        self._steering_params(), self._run_params())
+            self.car_status.set(f"기본값으로 저장했습니다: {self.config_path}")
+        except Exception as e:  # pragma: no cover
+            messagebox.showerror("TrafficGen", f"기본값 저장 실패:\n{e}")
+
+    def _load_default(self):
+        if not os.path.exists(self.config_path):
+            self.car_status.set("저장된 기본값이 없습니다. 먼저 'Save as Default' 로 저장하세요."); return
+        try:
+            self._apply_config(load_config(self.config_path))
+            self.car_status.set(f"기본값을 불러왔습니다: {self.config_path}")
+        except Exception as e:  # pragma: no cover
+            messagebox.showerror("TrafficGen", f"기본값 불러오기 실패:\n{e}")
+
+    def _try_autoload_config(self):
+        if os.path.exists(self.config_path):
+            try:
+                self._apply_config(load_config(self.config_path))
+                self.car_status.set(f"저장된 기본값을 자동 불러왔습니다: {os.path.basename(self.config_path)}")
+            except Exception as e:  # pragma: no cover
+                self.car_status.set(f"기본값 자동 로드 실패(내장 기본 사용): {e}")
+
+    def _apply_config(self, data: dict):
+        """저장된 설정(dict)을 토폴로지/패턴/steering/실행 위젯에 반영."""
+        topo = data.get("topology")
+        if topo:
+            self.topology = normalize_topology(pd.DataFrame(topo))
+            self._refresh_car_tree()
+        self._rebuild_cell_toggles()
+        # 패턴
+        pat = data.get("pattern", {})
+        if "site_peak_dl_mbps" in pat:
+            self.var_speak.set(pat["site_peak_dl_mbps"])
+        if "weekend_factor" in pat:
+            self.var_weekend.set(pat["weekend_factor"])
+        if "base_level" in pat:
+            self.var_base.set(pat["base_level"])
+        if pat.get("peaks"):
+            self.pattern_peaks = [dict(hour=p.get("hour", 12), amp=p.get("amp", 0.0),
+                                       width=p.get("width", 1.0)) for p in pat["peaks"]]
+            self._refresh_pk_tree()
+        # steering
+        st = data.get("steering", {})
+        if "endc_split_nr" in st:
+            self.var_split.set(st["endc_split_nr"])
+        if "dc_release" in st:
+            self.var_dcrel.set(bool(st["dc_release"]))
+        if "nr_to_lte_offload" in st:
+            self.var_offload.set(st["nr_to_lte_offload"])
+        lte_en, nr_en = st.get("lte_enabled") or [], st.get("nr_enabled") or []
+        for i in range(min(len(self.var_lte_on), len(lte_en))):
+            self.var_lte_on[i].set(bool(lte_en[i]))
+        for i in range(min(len(self.var_nr_on), len(nr_en))):
+            self.var_nr_on[i].set(bool(nr_en[i]))
+        # 실행 파라미터
+        run = data.get("run", {})
+        if "days" in run:
+            self.var_days.set(int(run["days"]))
+        if "step" in run:
+            self.var_step.set(int(run["step"]))
+        if "seed" in run:
+            self.var_seed.set(int(run["seed"]))
 
     # ===== Traffic & Steering =====
     def _build_traffic_tab(self):
