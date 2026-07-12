@@ -79,6 +79,15 @@
     ROP 초과 가능=정상) → 사용자 강조("전송 소요시간은 유저 수의 함수")를 데이터로 구현. 집계 IP Tput 도
     볼륨가중 평균 대신 **(ΣVol/ΣTime)*8** 로 변경(성분과 정확히 일치). PM CSV export 에 두 성분 컬럼 추가,
     Visualize KPI 드롭다운에도 추가.
+  * **⑤ GUI 버그 수정 + 기본값 저장/불러오기**(사용자 GUI 실행 피드백):
+    * **버그**: `_car_update`가 `topology.loc[idx, c] = '700'`처럼 문자열을 int64 컬럼에 셀 단위로 대입해
+      최신 pandas 에서 `TypeError/LossySetitemError` 발생. → **행을 `to_dict('records')`로 통째 교체 후
+      `normalize_topology`로 형변환**하도록 수정(add/delete 는 이미 안전).
+    * **기본값 저장**(`save_config`/`load_config`/`default_config_path`, 파일 `trafficgen_config.json` =
+      스크립트 폴더, .gitignore 등록): 현재 토폴로지+패턴(양/피크/weekend/base)+steering(split/dc/offload/
+      셀 on-off)+실행(days/step/seed)을 JSON 저장. Carriers 탭에 `💾 Save as Default`/`📂 Load Default`
+      버튼 추가, 시작 시 파일 있으면 자동 불러오기(`_try_autoload_config`→`_apply_config`). ESM settings
+      자동 저장/불러오기 관례 준용. **검증**: 문자열 update 무오류, 설정 round-trip 동일, 불러온 설정 생성 OK.
   * **부가**: `cell_summary_table()`(셀 단위 요약, 조정 효과 확인용) 추가, Generate/Compare 탭에 레벨요약+셀요약
     2단 표, Visualize Cell 레벨이 전체 셀(LTE+NR)을 밴드 라벨로 표시.
   * **검증**: `py_compile` 통과 + headless 데모 —
