@@ -15,7 +15,11 @@
 > 5. **저장소 정합**: 자매 프로젝트 `ESM/`(에너지 절감 분석)과 `LBM`(로드밸런싱, 예정)이 본 툴의 출력을
 >    소비한다. 출력 스키마·식별자 규칙은 ESM 호환을 최우선으로 유지한다.
 
-*Last Updated: 2026-07-11*
+*Last Updated: 2026-07-12*
+
+> **워크플로우(2026-07-12 확정)**: 폰↔PC 양쪽에서 작업. 항상 최신 `main`에서 feature 브랜치를 파서
+> 작업 → 커밋·push → **PR 생성·병합**(main 직접 커밋 X). 작업 전 `git pull`. 현재 활성 개발 파일은
+> **`trafficgen_r2.py`**.
 
 ---
 
@@ -54,7 +58,30 @@
 
 ## 3. 진행 이력 (Changelog)
 
-* **[r1] (2026-07-11) ENDC/DC·SA Steering 명시적 구현 — `trafficgen_r1.py` (현재 유일 활성 개발 파일)**
+* **[r2] (2026-07-12) 사용자 편집 3종: 캐리어(주파수) CRUD + 트래픽 패턴 + 셀별 UE 비율 — `trafficgen_r2.py` (현재 유일 활성 개발 파일)**
+  * `trafficgen_r1.py`를 복제해 시작. 최신 `main`에서 브랜치 `claude/trafficgen-r2-carrier-pattern-ue` 로 진행.
+  * **① 캐리어(주파수) 편집**: 토폴로지가 3+3 고정이 아니라 임의 편집 가능. `normalize_topology()`(누락
+    컬럼 보정·식별자/숫자 형변환)로 표준화. GUI `📡 Carriers` 탭에 CRUD(행 선택→Update/Delete, 폼→Add,
+    Reset default, 템플릿 불러오기). 엔진/steering 은 임의 셀 수를 지원(`enabled_for` 길이 무관, on/off
+    토글을 토폴로지에서 동적 재구성 `_rebuild_cell_toggles`).
+  * **② 트래픽 패턴**(`TrafficPattern`): 트래픽 **양**(`site_peak_dl_mbps`) + **시간대 shape**(피크
+    hour/amp/width 목록의 가우시안 합, base_level, weekend_factor, noise). 프리셋 default/business/
+    evening/flat/night. **양을 r1의 SteeringConfig.site_peak_dl_mbps 에서 TrafficPattern 으로 이관**(양+시간대
+    한 곳 관리) → `_route_demand`는 절대 수요(Mbps) 시계열을 인자로 받도록 변경, Steering 은 라우팅/on-off만.
+    GUI `📶 Traffic & Steering` 탭에 패턴(양/프리셋/weekend/base + 피크 CRUD) + steering 패널.
+  * **③ 셀별 UE 비율**(`ue_weight`, 토폴로지 신규 컬럼): 특정 셀의 유저 수 밀도 배수. 트래픽 분배
+    (`load_weight`)와 **독립** — `_generate_cell`에서 conn(접속 유저)에만 곱함. UE↑ → active↑ →
+    사용자당 자원↓ → IP Tput↓(트래픽량·에너지는 불변). 캐리어 에디터에서 셀별 편집.
+  * **부가**: `cell_summary_table()`(셀 단위 요약, 조정 효과 확인용) 추가, Generate/Compare 탭에 레벨요약+셀요약
+    2단 표, Visualize Cell 레벨이 전체 셀(LTE+NR)을 밴드 라벨로 표시.
+  * **검증**: `py_compile` 통과 + headless 데모 —
+    (1) baseline 수치가 r1과 정확히 동일(551.74 kWh 등, 리팩터 하위호환), (2) LTE-1 `ue_weight=3.0` →
+    Active 58.5→175.4(≈3×)·IP Tput 4.7→1.6 Mbps↓·**DL량/에너지 불변**(독립 레버 입증), (3) evening 패턴이
+    총 DL 30261→25403 GB 로 다르게 산출, (4) NR 4번째 캐리어 추가 시 셀 4개로 정상 확장, (5) CSV 3종+PNG 산출.
+  * **GUI 미검증(주의)**: tkinter GUI 6탭은 컨테이너에서 실행 불가 → 사용자 로컬에서 확인 필요.
+    엔진/집계/Export/플롯은 headless 검증 완료.
+
+* **[r1] (2026-07-11) ENDC/DC·SA Steering 명시적 구현 — `trafficgen_r1.py` (r2로 대체됨 — 이후 수정 없음, 라운드 보존)**
   * `trafficgen_r0.py`를 복제해 시작. r0의 기능 전부 유지 + steering 계층 추가. (PR #30 머지 후 main에서
     브랜치 재시작하여 진행.)
   * **핵심 변경 — 사이트 수요 라우팅**: 이전엔 셀별 독립 offered load 였으나, 이제 사이트 전체 수요(Mbps,
@@ -94,10 +121,12 @@
 
 ## 4. 다음 단계 / 대기 (To-Do)
 
-1. **GUI 실환경 확인**: 사용자 로컬(tkinter 설치)에서 5탭 동작·시각화·다운로드 확인 필요(컨테이너 미검증).
-2. ~~**ENDC/DC·SA steering**~~ ✅ [r1] 구현 완료(`SteeringConfig`, `_route_demand`). 후속: steering
-   파라미터를 시간대별로 변화(스케줄/이벤트)시키는 동적 정책, 사용자 클래스 비율의 지역/시간 변동.
-3. **멀티 사이트 확장**: 현재 1 사이트. 다중 사이트/섹터(방위각)로 확장.
+1. **GUI 실환경 확인**: 사용자 로컬(tkinter 설치)에서 6탭(Carriers/Traffic&Steering/Generate/Visualize/
+   Compare/Export) 동작·캐리어 CRUD·패턴/피크 편집·UE 조정·시각화·다운로드 확인 필요(컨테이너 미검증).
+2. ~~**ENDC/DC·SA steering**~~ ✅ [r1]. ~~**캐리어 편집 / 트래픽 패턴 / 셀별 UE 비율**~~ ✅ [r2].
+   후속: steering/패턴을 시간대별로 변화시키는 동적 정책(스케줄/이벤트), 사용자 클래스 비율의 지역/시간 변동.
+3. **멀티 사이트 확장**: 현재 1 사이트. 다중 사이트/섹터(방위각)로 확장(캐리어 에디터가 eNB_ID/Sector 를
+   이미 다루므로 토대는 준비됨).
 4. **ESM round-trip 검증**: 생성 CSV를 실제 ESM에 로드해 파싱·분석되는지 왕복 확인(컬럼명 최종 정합).
 5. **정답(ground truth) 라벨 출력 여부**: 이상/이벤트 주입 및 숨은 파라미터 동시 출력(애널리스트 검증용) — 사용자 확정 대기.
 6. **KPI 세부 확정**: Failure 세부(RRC/E-RAB/Drop/HO) 컬럼명, Active/Connected 구분, RuPowerTot/Cnt의
