@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ESM run artifacts (created when running the app locally)
+ESM/Output/
+ESM/Input/
+ESM/esm_settings.json
+
+# OS / editor
+Thumbs.db
+.DS_Store

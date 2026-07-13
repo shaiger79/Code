@@ -241,6 +241,20 @@
     무관) / head 불일치→None / 완전일치 우선 / 빈 입력 등 8케이스 전부 통과. `python -m py_compile` 통과.
     (※ 실데이터 GUI 검증은 로컬 PC에서 추가 확인 권장.)
 
+* **[v17.11] (2026-07-13) 버그 수정: Spec 값 열 조회 정규화 - 'PA Off' 표기 차이로 CellOff=-1 되던 문제**
+  * **증상**: 실데이터에서 CM 'rf4431-660'이 Spec 'RF4431-660'과 매칭엔 성공(대소문자 무시)하는데도 "RU
+    Model 미매칭(CellOff=-1)"이 뜨고 절감율이 0.
+  * **원인**: board-type 열은 정규화(`_rupt_norm_key`)로 찾으면서, 값을 읽는 `_rupt_power_state_values`는
+    'Idle'/'PA off'를 하드코딩 이름으로 조회 → Spec 열이 'PA Off'(대문자 O)/'idle'/'Idle '(공백) 등이면
+    값이 NaN→CellOff=-1. 매칭은 됐는데 값만 못 읽는 비대칭 버그(진짜 미매칭 아님).
+  * **수정**: `_rupt_power_state_values`가 spec_row 열을 `_rupt_norm_key`로 정규화해 조회(board-type과 동일
+    규칙). 진단 메시지도 '미매칭 또는 Idle/PA off 값 누락'으로 정정.
+  * **검증**: repro_celloff.py - 'PA Off'/'idle'/'Idle ' 모두 CellOff 정상(41.406) + 정규표기·매칭 회귀
+    18케이스 무회귀. `python -m py_compile` 통과.
+  * **공식 확정(2026-07-13 사용자)**: CellOff 이득 = `Idle − PA off` 유지(Idle·PA off는 각 상태의 절대
+    소비전력). 따라서 Spec의 Idle 열에 값이 있어야 CellOff가 계산됨 - Idle이 비면 CellOff=-1로 남는 것이
+    정상 동작(데이터 문제).
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -265,6 +279,9 @@
   19. **[v17.10]** RU Model 스마트 매칭의 '완전일치 우선' 설계를 실데이터로 확인 - CM이 typo 접미어
       (예: '66d')를 그대로 담고 있는데 DB에도 같은 typo 행이 있는 경우, 정식 표기('660')로 강제 매핑할지
       아니면 현재처럼 완전일치를 존중할지 사용자 결정 대기.
+  20. **[v17.11, 확정]** CellOff 이득 공식은 `Idle − PA off`로 확정(2026-07-13 사용자). 값 열 조회 정규화
+      버그는 [v17.11]에서 해결. 남은 것은 데이터 점검뿐 — Spec의 `Idle` 열이 실제로 채워져 있어야 CellOff가
+      계산됨(비면 CellOff=-1이 정상). RF4431-660/LTE 행에 Idle 값이 있는지 실데이터로 확인 권장.
 * **[개발 환경] 프로젝트 분리**: ESM은 `shaiger79/Code` 리포의 **ESM 전용 브랜치 `esm-r0-cellru-mapping`**
   (ESM/·README.md만 존재, trafficgen 등 타 프로젝트 파일 없음)에서 진행하며 `main`과 병합하지 않는다
   (2026-07-13 사용자 결정). trafficgen과의 혼입은 main에서만 발생하므로 이 브랜치를 유지하는 것으로 분리 달성.
