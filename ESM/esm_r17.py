@@ -1408,21 +1408,31 @@ class AppBase(BaseTk):
 
     def _finalize_tree(self, tree):
         """[r17-후속6] 데이터가 채워진 직후 모든 Treeview에 공통으로 적용하는 마감 처리:
-        1) 줄무늬(zebra) 행 배경, 2) 열 너비 자동 조정(헤더+상위 60행 실측 폭 기준, 70~360px 클램프 -
-        기존에는 고정 100~140px이라 긴 헤더/값이 잘렸음), 3) 헤더 클릭 정렬(다시 클릭하면 역순)."""
+        1) 줄무늬(zebra) 행 배경, 2) 열 너비 자동 조정(헤더+상위 80행 실측 폭 기준), 3) 헤더 클릭 정렬.
+        [v17.13] 열 너비를 더 넉넉하게 조정: 일반 열 90~480px(가운데 정렬), 내용이 긴 열 ~760px,
+        Note/비고 등 긴 텍스트 열은 ~1600px + 좌측 정렬으로 가독성을 높인다(가로 스크롤바가 있어 넓어져도
+        무방). 기존에는 전부 70~360px·가운데 정렬이라 Note처럼 긴 열이 좁게 잘려 읽기 불편했음."""
         self._apply_tree_zebra(tree)
         try:
             body_font = tkfont.Font(family='Segoe UI', size=10)
             head_font = tkfont.Font(family='Segoe UI', size=10, weight='bold')
         except Exception:
             body_font = head_font = None
-        sample = tree.get_children('')[:60]
+        sample = tree.get_children('')[:80]
+        # [v17.13] Note/비고 등 긴 텍스트 열 이름(정규화 비교)
+        note_cols = {'note', '비고', 'remark', '사유', 'reason', 'memo', 'comment', 'description', 'desc'}
         for col in tree['columns']:
+            is_note = self._rupt_norm_key(col) in note_cols
             if body_font is not None:
                 max_px = head_font.measure(str(col))
                 for iid in sample:
                     max_px = max(max_px, body_font.measure(str(tree.set(iid, col))))
-                tree.column(col, width=min(max(max_px + 28, 70), 360), anchor=tk.CENTER)
+                wide = is_note or max_px > 380  # 내용이 실제로 긴 열도 넓게+좌측정렬
+                cap = 1600 if is_note else (760 if wide else 480)
+                tree.column(col, width=min(max(max_px + 36, 90), cap),
+                            minwidth=90, anchor=(tk.W if wide else tk.CENTER))
+            else:
+                tree.column(col, anchor=(tk.W if is_note else tk.CENTER))
             tree.heading(col, command=lambda t=tree, c=col: self._sort_tree_by_column(t, c, False))
 
     def _enable_canvas_mousewheel(self, canvas, hover_widget=None):
