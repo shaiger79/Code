@@ -255,6 +255,11 @@
     소비전력). 따라서 Spec의 Idle 열에 값이 있어야 CellOff가 계산됨 - Idle이 비면 CellOff=-1로 남는 것이
     정상 동작(데이터 문제).
 
+* **[v17.12] (2026-07-13) 버그 수정: Energy Dashboard eNodeBID/Sector 필터 기본값 'All' 복원**
+  * eNodeBID(및 Sector) 콤보박스가 CM 데이터 로드 전에는 빈칸으로 표시되던 문제 - 콤보 생성 시점에
+    `values=['All']`+`current(0)`으로 기본값을 초기화(예전 동작 복원). CM 처리 시 `['All']+enbs/secs`로
+    재채움되는 로직은 그대로. `py_compile` 통과 + Tk 콤보 기본값이 'All'로 나오는지 확인.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:

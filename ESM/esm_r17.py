@@ -790,6 +790,10 @@ CellOff가 -1로 빠지던 문제 해결 (`_rupt_power_state_values`):
   - **검증**: repro_celloff.py - 'PA Off'(대문자)/'idle'(소문자)/'Idle '(공백) 모두 CellOff가 정상 계산
     (41.406)됨을 확인, 정규 표기(S1)와 매칭 회귀 18케이스 무회귀. `python -m py_compile` 통과. (단 Idle
     값 자체가 비었거나 열이 없으면 여전히 -1 - 이는 데이터/의미 문제로 별도 확인.)
+
+[v17.12] (2026-07-13) 버그 수정: Energy Dashboard의 eNodeBID/Sector 필터 콤보박스가 데이터 로드 전
+빈칸으로 표시되던 문제 - 생성 시점에 기본값 'All'로 초기화(values=['All']+current(0)). CM 처리 시
+['All']+enbs/secs로 재채움되는 동작은 그대로. 예전처럼 기본값 All 복원.
 """
 
 import tkinter as tk
@@ -1872,9 +1876,15 @@ class AppDashboard(AppEditors):
         row0.pack(fill=tk.X, pady=2)
         ttk.Label(row0, text="eNodeBID:").pack(side=tk.LEFT, padx=5)
         self.energy_enb_combo = ttk.Combobox(row0, width=15, state='readonly')
+        # [v17.12] 생성 시점 기본값을 'All'로 초기화 - 데이터 로드 전에는 빈칸으로 보이던 문제 수정
+        # (CM 처리 시 ['All']+enbs로 재채움). Sector 콤보도 동일하게 기본값 'All'.
+        self.energy_enb_combo['values'] = ['All']
+        self.energy_enb_combo.current(0)
         self.energy_enb_combo.pack(side=tk.LEFT, padx=5)
         ttk.Label(row0, text="Sector:").pack(side=tk.LEFT, padx=5)
         self.energy_sec_combo = ttk.Combobox(row0, width=10, state='readonly')
+        self.energy_sec_combo['values'] = ['All']
+        self.energy_sec_combo.current(0)
         self.energy_sec_combo.pack(side=tk.LEFT, padx=5)
 
         row1 = ttk.Frame(ctrl_frame)
