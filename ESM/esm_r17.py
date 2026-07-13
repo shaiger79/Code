@@ -754,6 +754,25 @@ Spec 조회 수정:
   - **검증**: 신규 test_learning_case_insensitive.py - CM 'AAU-Q'(대문자)/Spec 'aau-q'(소문자) 합성
     데이터로 `_run_energy_curve_learning`을 end-to-end 실행해 Idle Reference=111.0/PAoff Reference=55.0가
     정상 매칭되고(NaN 아님) Idle/PA off Delta가 계산됨을 확인. 기존 회귀 테스트 전체(9종) 통과.
+
+[v17.10] (2026-07-13) RU Model↔Spec DB 매칭을 '스마트 매칭'으로 개편 (`_rupt_match_ru_spec_row`):
+  - **배경**: 사용자 보고 - ES 성능 이득(절감율) 계산 시 CM의 RU Model과 RU/MMU Spec DB의 board-type이
+    대소문자/접미어 표기 차이로 매칭에 실패해 절감율이 계산되지 않는 경우가 있었음. 대소문자 무시([v17.8])
+    만으로는 '-' 이후 suffix가 조금 다른 표기(예: '660' vs '66d')를 못 잡았고, 후보가 여럿일 때 DataFrame
+    순서상 첫 행을 무작정 고르던 문제도 있었음.
+  - **규칙**: (1) 대소문자 무시 완전일치('RF4431t-660'=='rf4431t-660'). (2) 완전일치가 없으면 '-' 이전
+    head(모델 family)가 같은 행들을 '동일 모델'로 보고, 그중 전체 모델명(head 포함 - '660'만이 아니라
+    'rf4431t-660' 전체) 우선순위가 가장 높은 행을 선택 - 앞자리부터 문자 단위로 비교하되 (a) 숫자>문자,
+    (b) 숫자끼리는 큰 값, (c) 문자끼리는 큰 코드가 우선(예: DB에 'rf4431t-660'/'rf4431t-66d'/'rf4431t-600'이
+    있으면 660, '66d'/'60d'면 66d 선택). (3) 그래도 없으면 head로 시작하는 첫 값(방어적 fallback). 셋 다 실패면
+    None. head가 다른 family('aau-999' 등)는 tail 숫자가 커도 애초에 후보에서 제외되어 섞이지 않는다.
+  - **구현**: 신규 `_ru_model_priority_key`(전체 모델명→우선순위 튜플 리스트, max()로 최상위 선택). 후보
+    선택은 index 라벨 대신 위치(reset_index+iloc) 기반이라 Spec DB에 중복 index가 있어도 안전.
+    `_rupt_model_coe_map` 등 이 함수를 쓰는 모든 경로가 동일하게 개선됨(단일 수정점).
+  - **주의(설계 선택)**: 완전일치가 존재하면 그것을 우선한다 - CM이 정확히 'rf4431t-66d'이고 DB에도 '66d'가
+    있으면 660이 아니라 66d를 반환(실데이터 표기 존중). '완전일치보다도 항상 660 우선'이 필요하면 재논의.
+  - **검증**: test_ru_match.py - 대소문자 완전일치, 660 vs 66d→660, 66d vs 60d→66d(순서 무관), head 불일치
+    →None, 완전일치 우선, 빈 입력 처리 등 8케이스 전부 통과. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -5151,34 +5170,70 @@ class ESAnalyzerApp(AppDashboard):
                 return str(v).strip()
         return ''
 
+    @staticmethod
+    def _ru_model_priority_key(model_str):
+        """[v17.10] RU Model 전체 문자열('-' 이전 head 포함, 예: 'rf4431t-660')의 우선순위 키. 같은 모델
+        family(= '-' 이전 head가 동일)로 묶인 여러 Spec 후보 중 '더 정식으로 보이는' 표기를 고르기 위해,
+        문자열 전체를 앞에서부터 문자 단위로 비교한다(주의: '660'만 떼어 비교하는 게 아니라 'rf4431t-660'
+        전체가 identity - head는 반드시 일치해야 후보가 되고, 비교 키도 head를 포함한 전체 문자열로 만든다).
+        각 문자를 (계급, 값) 튜플로 매핑: 숫자면 (1, 숫자값), 그 외 문자면 (0, ord) - 즉 (a) 숫자가 문자보다
+        우선, (b) 숫자끼리는 큰 값이 우선, (c) 문자끼리는 큰 코드가 우선. 앞에서부터 처음으로 달라지는
+        자리에서 우선순위가 높은 쪽이 이긴다(head가 같으니 실제 우열은 '-' 이후에서 갈린다).
+        예) 'rf4431t-660' vs 'rf4431t-66d' → 마지막 자리 '0'(숫자) vs 'd'(문자)에서 숫자 승 → 660 선택.
+            'rf4431t-66d' vs 'rf4431t-600' → '-' 뒤 2번째 자리 '6' vs '0'에서 큰 숫자 승 → 66d 선택.
+        튜플 리스트를 반환하며 max()로 최상위를 고른다(공통 prefix면 더 긴 쪽이 우선)."""
+        key = []
+        for ch in str(model_str):
+            key.append((1, int(ch)) if ch.isdigit() else (0, ord(ch)))
+        return key
+
     def _rupt_match_ru_spec_row(self, ru_model, spec, spec_bcol):
-        """[r17] RU Model 문자열로 RU/MMU Spec DB(spec)에서 일치하는 행을 찾는다. 3단계 fallback:
-        (1) 전체 문자열 완전일치, (2) 마지막 한 글자를 제외한 접두어로 시작하는 첫 값,
-        (3) 첫 '-' 이전까지의 접두어로 시작하는 첫 값. 셋 다 실패하면 None(호출부에서 4개 열 모두 -1).
-        [r17-후속7, 버그 수정] 비교를 대소문자 무시로 수정 - 기존 다른 모든 Spec 조회 경로
-        (`_calculate_est_saving`/`_compute_deep_sleep_capability` 등)는 `.lower()` 비교인데 여기만
-        대소문자를 구분해서, CM과 Spec DB의 표기 케이스가 다르면(실데이터에서 흔함) 전부 미매칭(-1)
-        처리되어 v17.5부터 절감 에너지가 모든 sector에서 0으로 나오는 회귀가 있었다."""
+        """[r17] RU Model 문자열로 RU/MMU Spec DB(spec)에서 일치하는 행을 찾는다.
+        [v17.10, 스마트 매칭 개편] 모든 비교는 대소문자 무시(예: 'RF4431t-660' == 'rf4431t-660'):
+        (1) 대소문자 무시 완전일치.
+        (2) 완전일치가 없으면 '-' 이전 head(모델 family)가 같은 행들을 '동일 모델'로 보고, 그중 전체 모델명
+            우선순위(_ru_model_priority_key, head 포함 - '660'만이 아니라 'rf4431t-660' 전체로 비교)가 가장
+            높은 행을 선택 - 예: DB에 'rf4431t-660'/'rf4431t-66d'/'rf4431t-600'이 있으면 660을, '66d'/'60d'
+            (즉 'rf4431t-66d'/'rf4431t-60d')면 66d를 선택. (동률이면 먼저 나온 행.)
+        (3) 그래도 없으면 head로 시작하는(startswith) 첫 값 - head 자체가 잘려 표기된 옛 데이터 대비 방어적 fallback.
+        셋 다 실패하면 None(호출부에서 4개 열 모두 -1).
+        직전([v17.8])에는 (2)/(3)이 각각 'model[:-1] startswith'/'head startswith 첫 값'이라 후보가 여럿일
+        때 DataFrame 순서상 첫 행을 무작정 골랐는데, (2)를 head 일치 + tail 우선순위 선택으로 교체해 660/66d
+        같은 표기 차이에서도 정식 표기를 안정적으로 고르도록 개선했다. 대소문자 무시는 [v17.8] 회귀 수정에서 도입."""
         if not ru_model or spec_bcol is None or spec is None or spec.empty:
             return None
         model = str(ru_model).strip().lower()
+        if not model:
+            return None
         spec_vals = spec[spec_bcol].astype(str).str.strip().str.lower()
+        nonempty = spec_vals != ''
 
-        exact = spec[spec_vals == model]
+        # (1) 대소문자 무시 완전일치
+        exact = spec[nonempty & (spec_vals == model)]
         if not exact.empty:
             return exact.iloc[0]
 
-        if len(model) > 1:
-            prefix1 = model[:-1]
-            pref_match = spec[spec_vals.str.startswith(prefix1) & (spec_vals != '')]
-            if not pref_match.empty:
-                return pref_match.iloc[0]
+        model_head = model.split('-', 1)[0]
+        if not model_head:
+            return None
 
-        prefix2 = model.split('-')[0]
-        if prefix2 and prefix2 != model:
-            pref_match2 = spec[spec_vals.str.startswith(prefix2) & (spec_vals != '')]
-            if not pref_match2.empty:
-                return pref_match2.iloc[0]
+        # (2) head(모델 family)가 같은 후보만 모아, 그 안에서 '전체 모델명'(head 포함) 우선순위 최상위 선택.
+        #     head가 다른 행은 애초에 후보에서 제외되므로 'rf4431t-660'을 'aau-999' 같은 다른 family와 섞어
+        #     비교하지 않는다(위치 기반 - index 중복 안전).
+        spec_heads = spec_vals.str.split('-', n=1).str[0]
+        head_mask = nonempty & (spec_heads == model_head)
+        if head_mask.any():
+            cand = spec[head_mask].reset_index(drop=True)
+            cand_vals = spec_vals[head_mask].reset_index(drop=True)
+            best_pos = max(range(len(cand_vals)),
+                           key=lambda i: self._ru_model_priority_key(cand_vals.iloc[i]))
+            return cand.iloc[best_pos]
+
+        # (3) head로 시작하는 첫 값 (방어적 fallback)
+        if model_head != model:
+            pref = spec[nonempty & spec_vals.str.startswith(model_head)]
+            if not pref.empty:
+                return pref.iloc[0]
 
         return None
 
