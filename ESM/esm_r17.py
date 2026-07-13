@@ -790,6 +790,27 @@ CellOff가 -1로 빠지던 문제 해결 (`_rupt_power_state_values`):
   - **검증**: repro_celloff.py - 'PA Off'(대문자)/'idle'(소문자)/'Idle '(공백) 모두 CellOff가 정상 계산
     (41.406)됨을 확인, 정규 표기(S1)와 매칭 회귀 18케이스 무회귀. `python -m py_compile` 통과. (단 Idle
     값 자체가 비었거나 열이 없으면 여전히 -1 - 이는 데이터/의미 문제로 별도 확인.)
+
+[v17.12] (2026-07-13) 버그 수정: Energy Dashboard의 eNodeBID/Sector 필터 콤보박스가 데이터 로드 전
+빈칸으로 표시되던 문제 - 생성 시점에 기본값 'All'로 초기화(values=['All']+current(0)). CM 처리 시
+['All']+enbs/secs로 재채움되는 동작은 그대로. 예전처럼 기본값 All 복원.
+
+[v17.13] (2026-07-13) 가독성 개선: 결과 Treeview 열 너비 확대 + Note/비고 등 긴 텍스트 열 좌측정렬
+(`_finalize_tree`, 일반 90~480px / 긴 열 ~760px / Note류 ~1600px, 가로 스크롤바 활용).
+
+[v17.14] (2026-07-13) 기능 개선: ES 정책이 없는 sector도 Intermediate Data에 rawdata로 포함
+(`run_analysis`):
+  - **배경**: ES 운영시간 자동 최적화 시 일부 sector는 유효한 ES 윈도우가 하나도 안 잡혀 ES 정책이
+    생성되지 않는데(`_do_auto_mode`의 final_sets 비어 있음), 이 경우 `inter`가 비어 그 sector가
+    Intermediate Data에서 통째로 빠졌다. 사용자가 "ES 정책 유무와 무관하게 Intermediate에 데이터가
+    있어야 rawdata로 원인 분석이 쉽다"고 요청.
+  - **수정**: sector별로 `inter`가 비면(=ES 정책 없음) 그 sector의 rawdata(`_build_window_rawdata` 결과,
+    24h 전체·ES_Window_Index=0)를 `ES_Policy='None (no ES window)'`로 표시해 intermediate_data_list에
+    추가. inter_df 생성 시 정책 sector 행의 ES_Policy(NaN)는 'Applied (ES window)'로 채워 한눈에 구분.
+  - **한계**: 모든 sector가 no-policy면 output_results가 비어 결과 창 자체가 안 뜨는 기존 게이트는
+    유지(사용자 보고는 '몇몇 sector' 케이스) - 필요 시 별도 처리.
+  - **검증**: 스키마가 다른 정책 inter/no-policy raw를 concat해 ES_Policy 라벨이 정확히 구분되고 두 sector가
+    모두 포함됨을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -1404,21 +1425,31 @@ class AppBase(BaseTk):
 
     def _finalize_tree(self, tree):
         """[r17-후속6] 데이터가 채워진 직후 모든 Treeview에 공통으로 적용하는 마감 처리:
-        1) 줄무늬(zebra) 행 배경, 2) 열 너비 자동 조정(헤더+상위 60행 실측 폭 기준, 70~360px 클램프 -
-        기존에는 고정 100~140px이라 긴 헤더/값이 잘렸음), 3) 헤더 클릭 정렬(다시 클릭하면 역순)."""
+        1) 줄무늬(zebra) 행 배경, 2) 열 너비 자동 조정(헤더+상위 80행 실측 폭 기준), 3) 헤더 클릭 정렬.
+        [v17.13] 열 너비를 더 넉넉하게 조정: 일반 열 90~480px(가운데 정렬), 내용이 긴 열 ~760px,
+        Note/비고 등 긴 텍스트 열은 ~1600px + 좌측 정렬으로 가독성을 높인다(가로 스크롤바가 있어 넓어져도
+        무방). 기존에는 전부 70~360px·가운데 정렬이라 Note처럼 긴 열이 좁게 잘려 읽기 불편했음."""
         self._apply_tree_zebra(tree)
         try:
             body_font = tkfont.Font(family='Segoe UI', size=10)
             head_font = tkfont.Font(family='Segoe UI', size=10, weight='bold')
         except Exception:
             body_font = head_font = None
-        sample = tree.get_children('')[:60]
+        sample = tree.get_children('')[:80]
+        # [v17.13] Note/비고 등 긴 텍스트 열 이름(정규화 비교)
+        note_cols = {'note', '비고', 'remark', '사유', 'reason', 'memo', 'comment', 'description', 'desc'}
         for col in tree['columns']:
+            is_note = self._rupt_norm_key(col) in note_cols
             if body_font is not None:
                 max_px = head_font.measure(str(col))
                 for iid in sample:
                     max_px = max(max_px, body_font.measure(str(tree.set(iid, col))))
-                tree.column(col, width=min(max(max_px + 28, 70), 360), anchor=tk.CENTER)
+                wide = is_note or max_px > 380  # 내용이 실제로 긴 열도 넓게+좌측정렬
+                cap = 1600 if is_note else (760 if wide else 480)
+                tree.column(col, width=min(max(max_px + 36, 90), cap),
+                            minwidth=90, anchor=(tk.W if wide else tk.CENTER))
+            else:
+                tree.column(col, anchor=(tk.W if is_note else tk.CENTER))
             tree.heading(col, command=lambda t=tree, c=col: self._sort_tree_by_column(t, c, False))
 
     def _enable_canvas_mousewheel(self, canvas, hover_widget=None):
@@ -1872,9 +1903,15 @@ class AppDashboard(AppEditors):
         row0.pack(fill=tk.X, pady=2)
         ttk.Label(row0, text="eNodeBID:").pack(side=tk.LEFT, padx=5)
         self.energy_enb_combo = ttk.Combobox(row0, width=15, state='readonly')
+        # [v17.12] 생성 시점 기본값을 'All'로 초기화 - 데이터 로드 전에는 빈칸으로 보이던 문제 수정
+        # (CM 처리 시 ['All']+enbs로 재채움). Sector 콤보도 동일하게 기본값 'All'.
+        self.energy_enb_combo['values'] = ['All']
+        self.energy_enb_combo.current(0)
         self.energy_enb_combo.pack(side=tk.LEFT, padx=5)
         ttk.Label(row0, text="Sector:").pack(side=tk.LEFT, padx=5)
         self.energy_sec_combo = ttk.Combobox(row0, width=10, state='readonly')
+        self.energy_sec_combo['values'] = ['All']
+        self.energy_sec_combo.current(0)
         self.energy_sec_combo.pack(side=tk.LEFT, padx=5)
 
         row1 = ttk.Frame(ctrl_frame)
@@ -4743,7 +4780,16 @@ class ESAnalyzerApp(AppDashboard):
 
                 output_results.extend(res)
                 intermediate_data_list.extend(inter)
-                if raw is not None and not raw.empty: rawdata_list.append(raw)
+                if raw is not None and not raw.empty:
+                    rawdata_list.append(raw)
+                    # [v17.14] ES 정책이 하나도 생성되지 않은 sector(ES 윈도우 없음)는 inter가 비어 그동안
+                    # Intermediate Data에서 통째로 빠졌다. 그런 sector도 원인을 rawdata로 분석할 수 있도록
+                    # 해당 sector의 rawdata(24h 전체)를 'ES_Policy=None'으로 표시해 Intermediate에 추가한다
+                    # (사용자 요청: ES 정책 유무와 무관하게 Intermediate에 데이터가 있어야 함).
+                    if not inter:
+                        raw_np = raw.copy()
+                        raw_np['ES_Policy'] = 'None (no ES window)'
+                        intermediate_data_list.append(raw_np)
 
             if output_results:
                 out_df = pd.DataFrame(output_results)
@@ -4765,6 +4811,10 @@ class ESAnalyzerApp(AppDashboard):
                 if intermediate_data_list:
                     inter_df = pd.concat(intermediate_data_list, ignore_index=True)
                     if 'eNB_ID' in inter_df.columns: inter_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)
+                    # [v17.14] ES_Policy 열이 생겼으면(=no-policy sector rawdata가 섞였으면), 정책 sector
+                    # 행은 NaN이므로 'Applied'로 채워 정책 유무를 한눈에 구분할 수 있게 한다.
+                    if 'ES_Policy' in inter_df.columns:
+                        inter_df['ES_Policy'] = inter_df['ES_Policy'].fillna('Applied (ES window)')
 
                 eval_df = pd.DataFrame(self.hourly_eval_records) if self.auto_optimize_time.get() and self.hourly_eval_records else None
                 if eval_df is not None and 'eNB_ID' in eval_df.columns: eval_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)

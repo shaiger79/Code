@@ -255,6 +255,30 @@
     소비전력). 따라서 Spec의 Idle 열에 값이 있어야 CellOff가 계산됨 - Idle이 비면 CellOff=-1로 남는 것이
     정상 동작(데이터 문제).
 
+* **[v17.12] (2026-07-13) 버그 수정: Energy Dashboard eNodeBID/Sector 필터 기본값 'All' 복원**
+  * eNodeBID(및 Sector) 콤보박스가 CM 데이터 로드 전에는 빈칸으로 표시되던 문제 - 콤보 생성 시점에
+    `values=['All']`+`current(0)`으로 기본값을 초기화(예전 동작 복원). CM 처리 시 `['All']+enbs/secs`로
+    재채움되는 로직은 그대로. `py_compile` 통과 + Tk 콤보 기본값이 'All'로 나오는지 확인.
+
+* **[v17.13] (2026-07-13) 가독성 개선: 결과 Treeview 열 너비 확대 + Note/비고 열 좌측정렬**
+  * 사용자 요청 - 결과 창 열 간격이 너무 좁고, 특히 Note/비고처럼 내용이 긴 열이 좁게 잘려 불편.
+  * `_finalize_tree`(모든 결과표 공통 마감) 열 너비 로직 개선: 일반 열 90~480px(가운데), 내용이 긴 열
+    ~760px, Note/비고/remark/사유 등 긴 텍스트 열은 ~1600px + **좌측 정렬**(측정 상위 60→80행). 가로
+    스크롤바가 있어 넓어져도 무방(사용자 확인).
+  * 검증: py_compile + Tk 실측(비고 열 847px/anchor=w, 일반 열 90~136px/center 확인).
+
+* **[v17.14] (2026-07-13) 기능 개선: ES 정책 없는 sector도 Intermediate Data에 rawdata로 포함**
+  * **배경**: ES 운영시간 자동 최적화 시 유효 ES 윈도우가 하나도 없어 ES 정책이 생성되지 않는 sector는
+    `inter`가 비어 Intermediate Data에서 통째로 빠졌음. 사용자 요청: ES 정책 유무와 무관하게 Intermediate에
+    데이터가 있어야 rawdata로 미동작 원인을 분석하기 쉽다.
+  * **수정(`run_analysis`)**: sector별 `inter`가 비면 그 sector의 rawdata(24h 전체, ES_Window_Index=0)를
+    `ES_Policy='None (no ES window)'`로 표시해 intermediate_data_list에 추가. inter_df의 정책 sector 행은
+    ES_Policy를 'Applied (ES window)'로 채워 구분.
+  * **한계**: 모든 sector가 no-policy면 output_results가 비어 결과 창 자체가 안 뜨는 게이트는 유지(사용자
+    보고는 '몇몇 sector' 케이스). 필요 시 별도 처리 - To-Do 21.
+  * **검증**: 스키마 상이한 정책 inter/no-policy raw concat 시 ES_Policy 라벨 정확·두 sector 모두 포함 확인.
+    `python -m py_compile` 통과. (실데이터 GUI 확인 권장.)
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -282,6 +306,9 @@
   20. **[v17.11, 확정]** CellOff 이득 공식은 `Idle − PA off`로 확정(2026-07-13 사용자). 값 열 조회 정규화
       버그는 [v17.11]에서 해결. 남은 것은 데이터 점검뿐 — Spec의 `Idle` 열이 실제로 채워져 있어야 CellOff가
       계산됨(비면 CellOff=-1이 정상). RF4431-660/LTE 행에 Idle 값이 있는지 실데이터로 확인 권장.
+  21. **[v17.14]** 모든 sector가 ES 정책 없음(no-policy)이면 output_results가 비어 결과 창이 아예 안 뜨는
+      게이트(`if output_results:`)가 남아 있음 - 이 경우에도 Intermediate(rawdata)만이라도 보여줄지 결정 필요
+      (out_df 빈 경우 정렬 KeyError 방지 등 처리 동반).
 * **[개발 환경] 프로젝트 분리**: ESM은 `shaiger79/Code` 리포의 **ESM 전용 브랜치 `esm-r0-cellru-mapping`**
   (ESM/·README.md만 존재, trafficgen 등 타 프로젝트 파일 없음)에서 진행하며 `main`과 병합하지 않는다
   (2026-07-13 사용자 결정). trafficgen과의 혼입은 main에서만 발생하므로 이 브랜치를 유지하는 것으로 분리 달성.
