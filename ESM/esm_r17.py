@@ -773,6 +773,23 @@ Spec 조회 수정:
     있으면 660이 아니라 66d를 반환(실데이터 표기 존중). '완전일치보다도 항상 660 우선'이 필요하면 재논의.
   - **검증**: test_ru_match.py - 대소문자 완전일치, 660 vs 66d→660, 66d vs 60d→66d(순서 무관), head 불일치
     →None, 완전일치 우선, 빈 입력 처리 등 8케이스 전부 통과. `python -m py_compile` 통과.
+
+[v17.11] (2026-07-13) 버그 수정: RU/MMU Spec 값 열 조회를 정규화해 'PA Off'(대소문자/공백 차이)에서도
+CellOff가 -1로 빠지던 문제 해결 (`_rupt_power_state_values`):
+  - **증상**: 사용자 실데이터에서 CM RU Model 'rf4431-660'이 Spec의 'RF4431-660'과 (대소문자 무시로)
+    매칭에는 성공하는데도 결과에 "RU Model 'rf4431-660'이 RU/MMU Spec에 미매칭(CellOff=-1)"이 뜨고
+    절감율이 계산되지 않았음.
+  - **원인**: board-type 열은 `_rupt_norm_key`(대소문자·공백·'-'·'_' 무시)로 견고하게 찾는데, 값을 읽는
+    `_rupt_power_state_values._delta`는 'Idle'/'PA off' 등을 하드코딩 문자열로 그대로 조회. Spec DB의 열
+    표기가 조금만 달라도(예: 'PA Off' 대문자 O, 'idle' 소문자, 'Idle ' 뒷공백) 값이 NaN→CellOff=-1이
+    되고, 호출부가 이를 'RU Model 미매칭'으로 잘못 표시(진짜 미매칭이 아님).
+  - **수정**: `_rupt_power_state_values`가 spec_row의 열 이름을 `_rupt_norm_key`로 정규화한 조회 dict를
+    만들어 'Idle'/'PA off'/'Tx path off'/'Deep Sleep'/'Super Sleep'을 표기 차이와 무관하게 읽도록 함
+    (board-type 탐지와 동일 규칙). `_calc_cell_off_savings_by_ru`의 진단 메시지도 '미매칭 또는 Idle/PA
+    off 값 누락' 두 원인을 함께 안내하도록 수정.
+  - **검증**: repro_celloff.py - 'PA Off'(대문자)/'idle'(소문자)/'Idle '(공백) 모두 CellOff가 정상 계산
+    (41.406)됨을 확인, 정규 표기(S1)와 매칭 회귀 18케이스 무회귀. `python -m py_compile` 통과. (단 Idle
+    값 자체가 비었거나 열이 없으면 여전히 -1 - 이는 데이터/의미 문제로 별도 확인.)
 """
 
 import tkinter as tk
@@ -3229,8 +3246,8 @@ class ESAnalyzerApp(AppDashboard):
                     cell_off_val = float(info['cell_off'])
                 except (TypeError, ValueError):
                     continue
-                if cell_off_val < 0:  # rupt 매칭 실패(-1) - 절감 데이터 없음
-                    _note(f"RU Model '{info['model']}'이 RU/MMU Spec에 미매칭(CellOff=-1)")
+                if cell_off_val < 0:  # CellOff=-1: RU Model 미매칭 또는 Idle/PA off 값 누락
+                    _note(f"RU Model '{info['model']}' CellOff=-1 (RU/MMU Spec 미매칭이거나 그 행의 Idle/PA off 값 누락)")
                     continue
                 cell_off_val *= info['coe']
                 if missing:
@@ -5245,14 +5262,27 @@ class ESAnalyzerApp(AppDashboard):
         적용하고, Deep Sleep은 그 위에 얹는 추가 절감이기 때문(Idle 기준으로 계산하면 PA off 절감분을
         중복 차감하게 됨). 결과가 음수(=Spec DB에 Deep/Super Sleep 소비전력이 PA off보다 크게 잘못
         입력된 경우 등)이면 0으로 clamp한다(추가 절감이 없을 뿐, 손해로 계산되면 안 됨). spec_row가
-        None이거나 개별 상태 값이 spec에 없으면(NaN) 그 항목은 -1."""
+        None이거나 개별 상태 값이 spec에 없으면(NaN) 그 항목은 -1.
+        [v17.11, 버그 수정] 값 열('Idle'/'PA off'/'Tx path off'/'Deep Sleep'/'Super Sleep') 조회를
+        board-type 열 탐지와 동일하게 `_rupt_norm_key` 정규화(대소문자·공백·'-'·'_' 무시)로 수행한다.
+        예전에는 열 이름을 하드코딩 문자열로 그대로(`spec_row.get('PA off')`) 조회해서, Spec DB의 열
+        표기가 조금만 달라도(예: 'PA Off' 대문자 O, 'idle' 소문자, 'Idle ' 뒷공백) 값이 NaN→해당 항목
+        -1로 빠지고, 호출부(`_calc_cell_off_savings_by_ru`)가 이를 'RU Model 미매칭'으로 잘못 표시했다.
+        board-type 매칭은 이미 정규화로 성공하는데 값 조회만 실패하던 비대칭을 해소한다."""
         if spec_row is None:
             return (-1, -1, -1, -1)
 
+        # 정규화 키 -> 값 (board-type 탐지와 동일한 _rupt_norm_key, 첫 등장 우선)
+        norm_vals = {}
+        for col, v in spec_row.items():
+            k = self._rupt_norm_key(col)
+            if k not in norm_vals:
+                norm_vals[k] = v
+
         def _delta(base_col, state_col, clamp_zero=False):
             try:
-                base = float(spec_row.get(base_col, np.nan))
-                val = float(spec_row.get(state_col, np.nan))
+                base = float(norm_vals.get(self._rupt_norm_key(base_col), np.nan))
+                val = float(norm_vals.get(self._rupt_norm_key(state_col), np.nan))
             except (TypeError, ValueError):
                 return -1
             if pd.isna(base) or pd.isna(val):
