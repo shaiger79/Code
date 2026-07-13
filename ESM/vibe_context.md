@@ -212,6 +212,35 @@
   * **검증**: test_bug_report_fixes.py(케이스 불일치 3단계 매칭+70Wh 복원, 비고 3종, alpha=0 Note,
     정상 케이스 무회귀) + 기존 회귀 전체 통과.
 
+* **[v17.9] (2026-07-10) 대소문자 감사 후속 - Learning 탭 ref_lookup 수정**
+  * board-type/RU Model↔Spec DB 대조 경로를 전수 감사. `_calculate_est_saving`/`_calc_all_savings`/
+    `_compute_deep_sleep_capability`/`_rupt_match_ru_spec_row`는 이미 `.lower()` 일관됐고, Learning
+    Energy Curve 탭의 `ref_lookup`(Board Type별 Idle/PA off 레퍼런스)만 원본 케이스로 조회하고 있었음.
+  * CM 'AAU-Q' vs Spec 'aau-q'처럼 케이스가 다르면 Idle/PA off Reference가 NaN → Delta/Coe 보정 컬럼
+    전부 깨짐. 키 생성·조회 양쪽을 `.strip().lower()`로 통일(first-wins). 이로써 5개 경로 전부 일관.
+  * **검증**: test_learning_case_insensitive.py(케이스 불일치 합성데이터 end-to-end, Idle Ref=111/
+    PAoff Ref=55 정상 매칭) + 기존 회귀 전체(9종) 통과.
+
+* **[v17.10] (2026-07-13) RU Model↔Spec DB '스마트 매칭' 개편 (`_rupt_match_ru_spec_row`)**
+  * **배경**: 사용자 보고 - ES 성능 이득(절감율) 계산 시 CM의 RU Model이 대소문자/'-' 이후 접미어 표기
+    차이로 RU/MMU Spec DB의 board-type과 매칭에 실패해 절감율이 계산되지 않는 경우가 있었음. 대소문자
+    무시([v17.8])만으로는 '660' vs '66d' 같은 접미어 차이를 못 잡았고, 후보가 여럿일 때 DataFrame 순서상
+    첫 행을 무작정 고르던 문제도 있었음.
+  * **매칭 규칙(신규)**: (1) 대소문자 무시 완전일치('RF4431t-660'=='rf4431t-660'). (2) 완전일치가 없으면
+    '-' 이전 head(모델 family)가 같은 행들을 '동일 모델'로 보고, 그중 **전체 모델명**('660'만이 아니라
+    'rf4431t-660' 전체, head 포함) 우선순위가 가장 높은 행 선택 - 앞자리부터 문자 단위 비교: **숫자>문자**,
+    **숫자끼리는 큰 값**, **문자끼리는 큰 코드** 우선(예: DB에 'rf4431t-660'/'rf4431t-66d'/'rf4431t-600'이면
+    660, '66d'/'60d'면 66d 선택). (3) 그래도 없으면 head로 시작하는 첫 값(방어적 fallback). head가 다른
+    family('aau-999' 등)는 tail 숫자가 커도 후보에서 제외되어 섞이지 않음.
+  * **구현**: 신규 헬퍼 `_ru_model_priority_key`(전체 모델명→우선순위 튜플 리스트, max()로 선택). 후보
+    선택은 위치(reset_index+iloc) 기반이라 Spec DB 중복 index에도 안전. 이 함수를 쓰는 모든 경로
+    (`_rupt_model_coe_map` 등)가 단일 수정점으로 함께 개선됨.
+  * **설계 선택(확인 필요)**: 완전일치가 존재하면 그것을 우선한다 - CM이 정확히 'rf4431t-66d'이고 DB에도
+    '66d'가 있으면 660이 아니라 66d를 반환(실데이터 표기 존중). '완전일치보다도 항상 660 우선'을 원하면 재논의.
+  * **검증**: 신규 test_ru_match.py(scratchpad) - 대소문자 완전일치 / 660 vs 66d→660 / 66d vs 60d→66d(순서
+    무관) / head 불일치→None / 완전일치 우선 / 빈 입력 등 8케이스 전부 통과. `python -m py_compile` 통과.
+    (※ 실데이터 GUI 검증은 로컬 PC에서 추가 확인 권장.)
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -233,8 +262,14 @@
   16. **[v17.3에서 제기 → v17.4에서 해결]** "하나 낮은 레벨까지만 대상" 문의는 실제로는 그룹 판정의 `>=`/`>` 버그를 가리킨 것으로 확인되어 [v17.4]에서 수정 완료(esm_r17.py [v17.4] 항목 참고).
   17. **[v17.5, 중요]** CellOff/Deep Sleep 절감이 이제 rupt의 실제 'PA shared'/'BID'/'PID'/'CID' 값에 크게 의존하므로, 실제 CM 데이터에서 이 값들이 올바르게 채워지는지(특히 PA-shared-cell 원본 컬럼명이 실제 Excel과 일치하는지, Dual Band RU 케이스가 실데이터에 실제로 존재하는지) 실데이터로 검증 필요.
   18. **[v17.5]** Cross-sector 그룹의 절감량을 관련 Sector에 "균등 분배"하기로 결정했는데, 이는 각 Sector의 개별 절감량이 실제 물리적 기여도가 아니라 대표값 성격이라는 뜻 — 전체 합계는 정확하지만 Sector별 순위/비교가 필요한 용도라면 이 점을 유의해야 함(사용자에게 이미 설명함, 추가 확인 불필요하나 리포트 사용 시 참고).
+  19. **[v17.10]** RU Model 스마트 매칭의 '완전일치 우선' 설계를 실데이터로 확인 - CM이 typo 접미어
+      (예: '66d')를 그대로 담고 있는데 DB에도 같은 typo 행이 있는 경우, 정식 표기('660')로 강제 매핑할지
+      아니면 현재처럼 완전일치를 존중할지 사용자 결정 대기.
+* **[개발 환경] 프로젝트 분리**: ESM은 `shaiger79/Code` 리포의 **ESM 전용 브랜치 `esm-r0-cellru-mapping`**
+  (ESM/·README.md만 존재, trafficgen 등 타 프로젝트 파일 없음)에서 진행하며 `main`과 병합하지 않는다
+  (2026-07-13 사용자 결정). trafficgen과의 혼입은 main에서만 발생하므로 이 브랜치를 유지하는 것으로 분리 달성.
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---
-*Last Updated: 2026-07-10*
+*Last Updated: 2026-07-13*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
