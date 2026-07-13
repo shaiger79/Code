@@ -794,6 +794,23 @@ CellOff가 -1로 빠지던 문제 해결 (`_rupt_power_state_values`):
 [v17.12] (2026-07-13) 버그 수정: Energy Dashboard의 eNodeBID/Sector 필터 콤보박스가 데이터 로드 전
 빈칸으로 표시되던 문제 - 생성 시점에 기본값 'All'로 초기화(values=['All']+current(0)). CM 처리 시
 ['All']+enbs/secs로 재채움되는 동작은 그대로. 예전처럼 기본값 All 복원.
+
+[v17.13] (2026-07-13) 가독성 개선: 결과 Treeview 열 너비 확대 + Note/비고 등 긴 텍스트 열 좌측정렬
+(`_finalize_tree`, 일반 90~480px / 긴 열 ~760px / Note류 ~1600px, 가로 스크롤바 활용).
+
+[v17.14] (2026-07-13) 기능 개선: ES 정책이 없는 sector도 Intermediate Data에 rawdata로 포함
+(`run_analysis`):
+  - **배경**: ES 운영시간 자동 최적화 시 일부 sector는 유효한 ES 윈도우가 하나도 안 잡혀 ES 정책이
+    생성되지 않는데(`_do_auto_mode`의 final_sets 비어 있음), 이 경우 `inter`가 비어 그 sector가
+    Intermediate Data에서 통째로 빠졌다. 사용자가 "ES 정책 유무와 무관하게 Intermediate에 데이터가
+    있어야 rawdata로 원인 분석이 쉽다"고 요청.
+  - **수정**: sector별로 `inter`가 비면(=ES 정책 없음) 그 sector의 rawdata(`_build_window_rawdata` 결과,
+    24h 전체·ES_Window_Index=0)를 `ES_Policy='None (no ES window)'`로 표시해 intermediate_data_list에
+    추가. inter_df 생성 시 정책 sector 행의 ES_Policy(NaN)는 'Applied (ES window)'로 채워 한눈에 구분.
+  - **한계**: 모든 sector가 no-policy면 output_results가 비어 결과 창 자체가 안 뜨는 기존 게이트는
+    유지(사용자 보고는 '몇몇 sector' 케이스) - 필요 시 별도 처리.
+  - **검증**: 스키마가 다른 정책 inter/no-policy raw를 concat해 ES_Policy 라벨이 정확히 구분되고 두 sector가
+    모두 포함됨을 확인. `python -m py_compile` 통과.
 """
 
 import tkinter as tk
@@ -4763,7 +4780,16 @@ class ESAnalyzerApp(AppDashboard):
 
                 output_results.extend(res)
                 intermediate_data_list.extend(inter)
-                if raw is not None and not raw.empty: rawdata_list.append(raw)
+                if raw is not None and not raw.empty:
+                    rawdata_list.append(raw)
+                    # [v17.14] ES 정책이 하나도 생성되지 않은 sector(ES 윈도우 없음)는 inter가 비어 그동안
+                    # Intermediate Data에서 통째로 빠졌다. 그런 sector도 원인을 rawdata로 분석할 수 있도록
+                    # 해당 sector의 rawdata(24h 전체)를 'ES_Policy=None'으로 표시해 Intermediate에 추가한다
+                    # (사용자 요청: ES 정책 유무와 무관하게 Intermediate에 데이터가 있어야 함).
+                    if not inter:
+                        raw_np = raw.copy()
+                        raw_np['ES_Policy'] = 'None (no ES window)'
+                        intermediate_data_list.append(raw_np)
 
             if output_results:
                 out_df = pd.DataFrame(output_results)
@@ -4785,6 +4811,10 @@ class ESAnalyzerApp(AppDashboard):
                 if intermediate_data_list:
                     inter_df = pd.concat(intermediate_data_list, ignore_index=True)
                     if 'eNB_ID' in inter_df.columns: inter_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)
+                    # [v17.14] ES_Policy 열이 생겼으면(=no-policy sector rawdata가 섞였으면), 정책 sector
+                    # 행은 NaN이므로 'Applied'로 채워 정책 유무를 한눈에 구분할 수 있게 한다.
+                    if 'ES_Policy' in inter_df.columns:
+                        inter_df['ES_Policy'] = inter_df['ES_Policy'].fillna('Applied (ES window)')
 
                 eval_df = pd.DataFrame(self.hourly_eval_records) if self.auto_optimize_time.get() and self.hourly_eval_records else None
                 if eval_df is not None and 'eNB_ID' in eval_df.columns: eval_df.rename(columns={'eNB_ID': 'eNodeBID'}, inplace=True)
