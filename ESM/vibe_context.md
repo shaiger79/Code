@@ -291,6 +291,55 @@
   (`_LTE` 접미 파라미터, band 처리, RB 계산 등)이며, NR 대응을 어떻게 확장할지는 사용자와 상세 스펙 협의 예정.
 * 신규 변경은 v18.1, v18.2 …로 이 섹션에 기록한다.
 
+### 5-2-1. LTE+NR ESM 기본 지침 (2026-07-14 사용자 제공, r18 전체 로드맵)
+
+1. LTE/NR 각각 동작 가능(망 환경 LTE / NR / LTE+NR 모두). LTE 기존 동작은 최대한 유지하되 NR 연동 추가.
+2. NR ESM도 철학 동일: Traffic offloading 기반 UE 체감품질 보장 + 최대 에너지 절감.
+3. **EE(Energy Efficiency) 지표 추가**: EE = Traffic volume(DL+UL) / 소모에너지.
+4. NR은 coverage band를 우선순위 기반으로 설정 **가능/생략 모두 허용**.
+5. LTE+NR 연동 = **NR traffic을 LTE가 받아주는 단방향**(반대 동작 미고려).
+6. LTE가 생성하는 정책 외에 **NR→LTE ES policy** 생성 필요: LTE 망품질이 열화되면 NR에 적용된 ES를 해제.
+7. NR은 sector 합산 KPI를 쓰지 않고 **Band 단위 합산**(RU/MMU 기본). Band-to-Band offloading 시 target
+   band 망품질에 따라 source band의 ES 해제 가능.
+8. **NR은 KPI time sample(15분)들이 band 단위로 동기화**되어야 함. 예: n77(offloading)→n66(target)로
+   offloading해 n77 off 시, 시간동기화된 n77 usedRB를 같은 시간 n66 usedRB에 더함. n66 기준 offloading
+   후 UsedRB↔Predicted Tput scatter로 NC1/NC2를 찾고, Required Tput NR(20Mbps, configurable)로 threshold
+   결정(n77 ES level leaving threshold). N1 조건 sample과 동일시간 n77 sample을 식별해 n77 UsedRB
+   판별식으로 entering 조건 설정. Candidate Threshold(search range max)부터 1씩 감소하며 N1(기존 동일)/
+   N2(식별 sample 중 candidate 이하 수)로 entering threshold 결정. Tput은 기존처럼 margin 고려 수식.
+9. NR-NR/NR-LTE offloading은 **COR(Coverage Overlap Ratio)** 비율로 결정(LTE는 항상 100% 가정이었음).
+   COR은 DB matrix로 시작. CM 위경도로 거리<=10m & Azimuth 최근접=100%/나머지 0%. 위경도/Azimuth 없으면
+   cu-coloc-conf CM 정보로 특정. 그것도 없으면 통계기반 추정(추후 설명) → **일단 ES 미적용으로 분류**.
+
+### 5-2-2. r18 구현 이력
+
+* **[v18.1] (2026-07-14) NR 데이터 모델 기반 구축 (단계 1/N — 데이터 기반만)**
+  * **사용자 결정(인터뷰)**: ① NR은 **별도 파일 세트**(NR Traffic / NR BandList / NR CarrierConf)로 로드,
+    ② NR 정책 DB는 **NR 전용 BandList 신설**(Band 단위, LTE SectorList의 sector·B컬럼 방식 대체),
+    ③ COR은 **DB Editor 테이블 + CM 자동생성**, ④ 이번 증분은 **데이터 기반부터 단계적으로**(지시 8의
+    threshold 탐색 알고리즘·시뮬레이션·EE 산출은 다음 라운드).
+  * **DB Editor 리팩터 + NR 3종 신설**: mode별 중첩 삼항 분기를 `_EDITOR_SPECS` 레지스트리(mode→내부
+    attr/탭 라벨/신규행 기본 컬럼)와 `_editor_get_df`/`_editor_set_df`로 통일. 기존 LTE 4종
+    (carrier/sector/ru_spec/ciq) 동작 불변. 신규: **NR BandList**(`Cat_ID/eNB_ID/Band/nRB`, nRB 부호로
+    ES 대상(+)/미적용·coverage(-) 구분), **NR CarrierConf**(`Cat_ID/Band/cell-num/CoveragePriority/
+    ES capability/ES priority/OffloadTargetBand`), **COR Matrix**(long: `eNB_ID_src/cell_src/eNB_ID_tgt/
+    cell_tgt/COR/Method`). NR DB 스키마는 지시 8 알고리즘 확정 전까지 **잠정**(사용자 편집 가능).
+  * **Data I/O/고급설정**: NR Traffic(CSV) 입력창 추가. NR 파라미터 신설 — `required_tput_nr`(20Mbps),
+    `tput_margin_nr`, `cor_distance_m`(10m), `ee_metric_on`(EE = Volume/소모에너지, 지시 3).
+  * **CM 파싱 확장**: `Latitude`/`Longitude`/`Azimuth`(CM 직접)/`cu-coloc-conf` 컬럼 인식. CM에 Azimuth가
+    이미 있으면 CIQ 병합 skip(Azimuth_x/_y 분할 방지).
+  * **COR 자동 산출**(`_build_cor_matrix_from_cm`): source cell마다 (1)위경도+Azimuth 있으면 거리<=10m 중
+    Azimuth 최근접 대상=100%(geo), (2)없으면 cu-coloc-conf 동일값 대상=100%(coloc), (3)둘 다 없으면 ES
+    미적용(none, 0%). long 포맷에 없는 쌍은 암묵적 0%. CM 처리 시 COR이 비어 있을 때만 자동 호출(수동
+    편집분 보존), COR Matrix 탭에 '🧭 CM에서 자동 생성' 버튼 제공. 하버사인 거리 + 원형 방위각차 헬퍼
+    (`_haversine_m`/`_azimuth_diff`).
+  * **검증**: py_compile 통과. COR 단위 테스트(geo 최근접/거리초과 none/coloc 페어/none/컬럼스키마/
+    하버사인 111m/방위각차 원형) 통과. 에디터 레지스트리 7모드 get/set·기본컬럼 테스트 통과. **전체 앱
+    인스턴스화 스모크**(7개 편집 탭 빌드, NR 상태·타이틀 v18.1 확인) 통과.
+  * **다음 단계(예정)**: NR BandList/CarrierConf 실스키마 확정 → band 시간동기화 데이터 준비(15분 sample
+    band 단위 정렬, n77 usedRB→n66 합산) → 지시 8 threshold 탐색(NC1/NC2, entering/leaving) → NR ES 정책
+    생성/시뮬레이션 → EE 지표 → NR→LTE ES 해제(지시 5) → COR 통계기반 추정 fallback.
+
 ## 6. 진행 중인 작업 및 다음 단계 (To-Do / Next Steps)
 
 * **다음 결정 대기**:
@@ -321,13 +370,21 @@
   21. **[v17.14]** 모든 sector가 ES 정책 없음(no-policy)이면 output_results가 비어 결과 창이 아예 안 뜨는
       게이트(`if output_results:`)가 남아 있음 - 이 경우에도 Intermediate(rawdata)만이라도 보여줄지 결정 필요
       (out_df 빈 경우 정렬 KeyError 방지 등 처리 동반).
-  22. **[r18, 주요 목표]** NR(5G) ES 정책 최적화 기능 추가 - 사용자와 스펙 협의 필요: NR의 ES 대상 단위
-      (SSB/beam/cell?), NR 트래픽/전력 지표, LTE와 공통화할 부분과 NR 전용 로직 분리 범위 등.
+  22. **[r18, 주요 목표 / v18.1에서 데이터 기반 착수]** NR(5G) ES 정책 최적화. 기본 지침 10개 §5-2-1 확정.
+      데이터 모델 기반(별도 파일 세트, NR BandList DB, COR matrix, CM 위경도 파싱)은 [v18.1]에서 구축.
+      **남은 주요 작업(다음 라운드)**: (a) NR BandList/CarrierConf 실스키마를 실데이터로 확정(현재 잠정),
+      (b) band 단위 15분 sample 시간동기화 데이터 준비(n77 usedRB→같은 시각 n66 합산), (c) 지시 8의
+      threshold 탐색(n66 UsedRB↔Predicted Tput scatter로 NC1/NC2, Required Tput NR 기반 leaving, candidate
+      감소로 entering N1/N2), (d) NR ES 정책 생성/성능예측 시뮬레이션, (e) EE 지표(Volume/소모에너지) 산출,
+      (f) NR→LTE ES 해제 동작(지시 5: LTE 망품질 열화 시), (g) COR 통계기반 추정 fallback(추후 사용자 설명).
+  23. **[v18.1, 확인 대기]** COR 자동 산출의 가정 검증 필요 — ① `cu-coloc-conf`의 실제 값 포맷/의미(현재
+      "같은 값=colocated 그룹" 가정), ② 실 CM에 Latitude/Longitude/Azimuth/cu-coloc-conf 컬럼명이 파서
+      인식 목록과 일치하는지, ③ offloading 후보를 NR cell로 한정할지(현재는 CM 전체 cell 대상으로 산출).
 * **[개발 환경] 프로젝트 분리**: ESM은 `shaiger79/Code` 리포의 **ESM 전용 브랜치 `esm-r0-cellru-mapping`**
   (ESM/·README.md만 존재, trafficgen 등 타 프로젝트 파일 없음)에서 진행하며 `main`과 병합하지 않는다
   (2026-07-13 사용자 결정). trafficgen과의 혼입은 main에서만 발생하므로 이 브랜치를 유지하는 것으로 분리 달성.
 * **다음 대기 작업**: 사용자가 실데이터/실제 환경으로 재확인한 결과를 알려줄 예정.
 
 ---
-*Last Updated: 2026-07-13*
+*Last Updated: 2026-07-14 (v18.1 — NR 데이터 모델 기반 구축)*
 *AI Directive Status: Active (Always Read First, Always Update Post-Task)*
