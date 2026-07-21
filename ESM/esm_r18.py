@@ -5,6 +5,26 @@
 활성 개발 파일이고, esm_r17.py는 이 상태(v17.14)로 동결(보존)한다. r18 목표: NR(5G)에 대한 ES 정책 최적화
 기능 추가(기존 LTE 위주 로직에 NR 대응 확장). 이하는 r17까지의 누적 이력이다.
 
+[v18.1] (2026-07-14) NR(5G) 데이터 모델 기반 구축 (단계 1/N). 사용자 결정: NR은 별도 파일 세트로 로드,
+Band(RU/MMU) 단위 집계, COR은 DB Editor 테이블+CM 자동생성. 이번 라운드는 데이터 기반만(threshold 탐색
+알고리즘/시뮬레이션/EE 산출은 다음 라운드).
+  - 신규 DB 3종(mode 레지스트리 기반으로 DB Editor 리팩터): NR BandList(eNB_ID+Band 단위, nRB 부호로
+    ES 대상/미적용), NR CarrierConf(Band↔cell-num + CoveragePriority/ES capability/ES priority/
+    OffloadTargetBand), COR Matrix(long 포맷: source cell→target cell overlap %와 Method). 기존 LTE
+    4종(carrier/sector/ru_spec/ciq) 편집 로직은 중첩 삼항 분기를 _EDITOR_SPECS 레지스트리+
+    _editor_get_df/_editor_set_df로 통일(동작 불변, 회귀 테스트 통과).
+  - Data I/O: NR Traffic(CSV) 별도 입력창 추가. Optimizer 고급설정에 NR 파라미터(Required IP Tput_NR
+    20Mbps/IP Tput Margin_NR/COR 동일위치 거리 10m/EE 지표 on) 신설.
+  - CM 파싱 확장: Latitude/Longitude/Azimuth(CM 직접)/cu-coloc-conf 컬럼 인식(COR 산출용, 지시 10).
+    CM에 Azimuth가 이미 있으면 CIQ 병합을 건너뜀(Azimuth_x/_y 분할 방지).
+  - COR 자동 산출(_build_cor_matrix_from_cm): source cell마다 (1)위경도+Azimuth 있으면 거리<=10m 중
+    Azimuth 최근접 대상=100%(geo), (2)없으면 cu-coloc-conf 동일값 대상=100%(coloc), (3)둘 다 없으면
+    ES 미적용(none, 0%). CM 처리 시 COR이 비어 있으면 자동 호출(수동 편집분 미덮어쓰기), COR Matrix 탭에
+    '🧭 CM에서 자동 생성' 버튼도 제공.
+  - 검증: py_compile 통과, COR 산출 단위 테스트(geo 최근접/거리초과 none/coloc 페어/none/컬럼스키마/
+    하버사인·방위각차) 통과, 에디터 레지스트리 7모드 get/set·기본컬럼 테스트 통과, 전체 앱 인스턴스화
+    스모크(7개 편집 탭 빌드, NR 상태/타이틀 v18.1) 통과.
+
 New round (based on ESM_r16_0, which already includes everything from ESM_r15_0 plus Deep Sleep) -
 reworks the Deep Sleep feature: it becomes an explicit on/off Optimizer option (default off) that,
 when on, adds a 'Deep Sleep Capability' column to the ESM Output Result (numeric RU-sharing group id,
@@ -954,12 +974,15 @@ class AppBase(BaseTk):
                                  bordercolor=self.BG_COLOR, arrowcolor='#5B7BB2')
             self.style.map(sb, background=[('active', '#A9C3E8')])
 
-        self.title("ESM — Energy Saving Manager (r18 · v18.0)")
+        self.title("ESM — Energy Saving Manager (r18 · v18.1)")
         self.geometry("1150x950")
         self.minsize(1000, 720)
         self.configure(bg=self.BG_COLOR)
 
         self.traffic_file, self.cm_file, self.ciq_file, self.energy_stat_file = tk.StringVar(), tk.StringVar(), tk.StringVar(), tk.StringVar()
+        # [v18.1] NR(5G) 트래픽은 LTE와 별도 파일 세트로 로드한다(사용자 결정 2026-07-14). NR BandList/
+        # NR CarrierConf는 DB Editors 탭에서 로드하고, NR Traffic만 Data I/O에 별도 입력창을 둔다.
+        self.nr_traffic_file = tk.StringVar()
         self.target_cat_id = tk.StringVar(value="1")
         self.tput_threshold, self.tput_margin, self.guarantee_ratio = tk.DoubleVar(value=5.0), tk.DoubleVar(value=1.0), tk.DoubleVar(value=0.9)
         self.threshold_rblowutil, self.coe_low, self.rblow_multiplier = tk.DoubleVar(value=0.8), tk.DoubleVar(value=1.0), tk.DoubleVar(value=0.5)
@@ -984,6 +1007,17 @@ class AppBase(BaseTk):
         self.iir_coef_tput_lte = tk.DoubleVar(value=0.25)
         self.iir_coef_prb_lte = tk.DoubleVar(value=0.25)
 
+        # [v18.1] NR(5G) ES 정책 최적화용 파라미터(지시 4/9/10). LTE와 철학은 같으나 값/단위가 달라 "_NR" 태그로
+        # 구분한다. 이번 라운드(데이터 기반)에서는 상태만 준비하고, threshold 탐색 알고리즘/시뮬레이션은 다음 라운드.
+        #   - required_tput_nr: NR 최소보장 목표 IP Tput(Mbps, 지시 9 - n77 leaving threshold 결정에 사용, 기본 20)
+        #   - tput_margin_nr:   NR Tput margin(Mbps) - LTE와 동일하게 목표 Tput에 더해 실효 임계 산출
+        #   - cor_distance_m:   COR 자동 산출 시 "동일 위치"로 볼 최대 거리(m, 지시 10, 기본 10)
+        #   - ee_metric_on:     Energy Efficiency(EE = Volume(DL+UL)/소모에너지) 지표 산출 on/off(지시 4)
+        self.required_tput_nr = tk.DoubleVar(value=20.0)
+        self.tput_margin_nr = tk.DoubleVar(value=1.0)
+        self.cor_distance_m = tk.DoubleVar(value=10.0)
+        self.ee_metric_on = tk.BooleanVar(value=True)
+
         self.auto_optimize_time = tk.BooleanVar(value=False)
         self.max_time_windows = tk.IntVar(value=1)
         self.no_es_hours = tk.StringVar(value="11,12,13,14")
@@ -993,6 +1027,17 @@ class AppBase(BaseTk):
         self.sector_df_internal = pd.DataFrame()
         self.ru_spec_df_internal = pd.DataFrame()
         self.ciq_df_internal = pd.DataFrame()
+        # [v18.1] NR(5G) ES 정책 최적화용 신규 DB 테이블(별도 파일 세트로 로드/편집).
+        #   - nr_bandlist_df_internal: NR BandList - LTE SectorList(sector 합산)와 달리 Band(RU/MMU) 단위로
+        #     한 행씩(eNB_ID+Band). nRB 부호로 ES 적용대상(+)/미적용·coverage 고정(-)을 구분(LTE와 동일 관례).
+        #   - nr_carrier_df_internal: NR CarrierConf - Band↔cell-num 매핑 + CoveragePriority/ES capability/
+        #     ES priority(지시 5: coverage band는 우선순위 기반 설정 가능/생략 가능) + Offloading target band.
+        #   - cor_df_internal: COR(Coverage Overlap Ratio) matrix(long 포맷) - source cell -> target cell의
+        #     overlap 비율(%)과 산출 방법(geo/coloc/none). CM 위경도+Azimuth로 자동 생성(_build_cor_matrix),
+        #     DB Editor에서 수동 편집 가능. 지시 10 참고.
+        self.nr_bandlist_df_internal = pd.DataFrame()
+        self.nr_carrier_df_internal = pd.DataFrame()
+        self.cor_df_internal = pd.DataFrame()
         self.cm_map_df_full = pd.DataFrame()
         self.ru_profile_df = pd.DataFrame()  # [r17] RU profile table(rupt) - 탭 간 공유, _build_ru_profile_table() 참고
         self.hourly_eval_records = []
@@ -1530,17 +1575,21 @@ class AppBase(BaseTk):
 
         file_frame = ttk.Frame(self.frame_data_io, style='Card.TFrame', padding=15)
         file_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(file_frame, text="Traffic Data (CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=5)
+        ttk.Label(file_frame, text="Traffic Data (LTE, CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=0, column=0, sticky=tk.W, pady=5)
         ttk.Entry(file_frame, textvariable=self.traffic_file, width=50).grid(row=0, column=1, padx=10)
         ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.traffic_file)).grid(row=0, column=2)
-        ttk.Label(file_frame, text="Energy Stat Data (CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(file_frame, textvariable=self.energy_stat_file, width=50).grid(row=1, column=1, padx=10)
-        ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.energy_stat_file)).grid(row=1, column=2)
-        ttk.Label(file_frame, text="CM Data (Excel):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=2, column=0, sticky=tk.W, pady=5)
-        ttk.Entry(file_frame, textvariable=self.cm_file, width=50).grid(row=2, column=1, padx=10)
-        ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.cm_file)).grid(row=2, column=2)
+        # [v18.1] NR(5G) 트래픽은 별도 파일 세트(사용자 결정). NR BandList/NR CarrierConf는 DB Editors 탭에서 로드.
+        ttk.Label(file_frame, text="Traffic Data (NR, CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(file_frame, textvariable=self.nr_traffic_file, width=50).grid(row=1, column=1, padx=10)
+        ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.nr_traffic_file)).grid(row=1, column=2)
+        ttk.Label(file_frame, text="Energy Stat Data (CSV):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(file_frame, textvariable=self.energy_stat_file, width=50).grid(row=2, column=1, padx=10)
+        ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.energy_stat_file)).grid(row=2, column=2)
+        ttk.Label(file_frame, text="CM Data (Excel):", style='Card.TLabel', font=('Segoe UI', 10, 'bold')).grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(file_frame, textvariable=self.cm_file, width=50).grid(row=3, column=1, padx=10)
+        ttk.Button(file_frame, text="찾기", style='Primary.TButton', command=lambda: self.browse_file(self.cm_file)).grid(row=3, column=2)
 
-        ttk.Button(file_frame, text="🔄 CM 데이터 로드 및 CIQ 병합", style='Success.TButton', command=self._process_cm_ciq_data).grid(row=3, column=0, columnspan=3, pady=15)
+        ttk.Button(file_frame, text="🔄 CM 데이터 로드 및 CIQ 병합", style='Success.TButton', command=self._process_cm_ciq_data).grid(row=4, column=0, columnspan=3, pady=15)
 
         view_frame = ttk.LabelFrame(self.frame_data_io, text=" [ Cell-RU Mapping & Azimuth Viewer ] ", padding=10)
         view_frame.pack(fill=tk.BOTH, expand=True, pady=10)
@@ -1626,6 +1675,18 @@ class AppBase(BaseTk):
         ttk.Label(self.advanced_frame, text="Deep Sleep 기능 사용:").grid(row=9, column=0, sticky=tk.W, pady=5)
         ttk.Checkbutton(self.advanced_frame, text="On (기본값: Off)", variable=self.deep_sleep_enabled).grid(row=9, column=1, sticky=tk.W, padx=10)
 
+        # [v18.1] NR(5G) 전용 파라미터(지시 4/9/10) - 이번 라운드는 값만 준비, 알고리즘은 다음 라운드.
+        ttk.Separator(self.advanced_frame, orient='horizontal').grid(row=10, column=0, columnspan=2, sticky='ew', pady=(10, 4))
+        ttk.Label(self.advanced_frame, text="── NR (5G) 설정 ──", font=('Segoe UI', 10, 'bold')).grid(row=11, column=0, columnspan=2, sticky=tk.W)
+        ttk.Label(self.advanced_frame, text="Required IP Tput_NR (Mbps):").grid(row=12, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.required_tput_nr, width=15).grid(row=12, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="IP Tput Margin_NR (Mbps):").grid(row=13, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.tput_margin_nr, width=15).grid(row=13, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="COR 동일위치 거리(m):").grid(row=14, column=0, sticky=tk.W, pady=5)
+        ttk.Entry(self.advanced_frame, textvariable=self.cor_distance_m, width=15).grid(row=14, column=1, sticky=tk.W, padx=10)
+        ttk.Label(self.advanced_frame, text="Energy Efficiency(EE) 지표:").grid(row=15, column=0, sticky=tk.W, pady=5)
+        ttk.Checkbutton(self.advanced_frame, text="On (EE = Volume(DL+UL)/소모에너지)", variable=self.ee_metric_on).grid(row=15, column=1, sticky=tk.W, padx=10)
+
         bottom_frame = ttk.Frame(self.frame_main)
         bottom_frame.pack(fill=tk.BOTH, expand=True, side=tk.BOTTOM)
         self.run_btn = ttk.Button(bottom_frame, text="▶ 최적화 결과 화면으로 보기 (Run & View)", style='Success.TButton', command=self.run_analysis)
@@ -1698,38 +1759,47 @@ class AppBase(BaseTk):
     def _build_learning_ui(self): pass
 
 class AppEditors(AppBase):
+    # [v18.1] DB Editor 테이블 레지스트리 - mode -> (내부 attr, 탭 라벨, 신규행 기본 컬럼).
+    # 기존 LTE 4종에 NR 3종(NR BandList / NR CarrierConf / COR Matrix)을 추가했다. 각 편집 메서드는
+    # 이 레지스트리로 attr/기본컬럼을 조회해 mode별 중첩 삼항 분기를 없앤다(모드가 7개로 늘어 유지보수).
+    _EDITOR_SPECS = {
+        'carrier':    ('carrier_df_internal',     ' CarrierConf ',    ['Cat_ID', 'band', 'DSS']),
+        'sector':     ('sector_df_internal',      ' SectorList ',     ['Cat_ID', 'eNB_ID', 'Sector']),
+        'ru_spec':    ('ru_spec_df_internal',     ' RU/MMU Spec ',    ['board-type', 'Tech', 'I/F', 'S_PA', 'Idle', 'Tx path off', 'PA off', 'Coe_paoff', 'Deep Sleep', 'Super Sleep']),
+        'ciq':        ('ciq_df_internal',         ' CIQ Azimuth ',    ['eNB_ID', 'cell-num', 'Azimuth']),
+        'nr_band':    ('nr_bandlist_df_internal', ' NR BandList ',    ['Cat_ID', 'eNB_ID', 'Band', 'nRB']),
+        'nr_carrier': ('nr_carrier_df_internal',  ' NR CarrierConf ', ['Cat_ID', 'Band', 'cell-num', 'CoveragePriority', 'ES capability', 'ES priority', 'OffloadTargetBand']),
+        'cor':        ('cor_df_internal',         ' COR Matrix ',     ['eNB_ID_src', 'cell_src', 'eNB_ID_tgt', 'cell_tgt', 'COR', 'Method']),
+    }
+    _EDITOR_ORDER = ['carrier', 'sector', 'ru_spec', 'ciq', 'nr_band', 'nr_carrier', 'cor']
+
+    def _editor_get_df(self, mode):
+        return getattr(self, self._EDITOR_SPECS[mode][0])
+
+    def _editor_set_df(self, mode, df):
+        setattr(self, self._EDITOR_SPECS[mode][0], df)
+
     def _build_editors_ui(self):
         editor_notebook = ttk.Notebook(self.frame_editors)
         editor_notebook.pack(fill=tk.BOTH, expand=True)
 
-        frames = {
-            'carrier': ttk.Frame(editor_notebook), 'sector': ttk.Frame(editor_notebook),
-            'ru_spec': ttk.Frame(editor_notebook), 'ciq': ttk.Frame(editor_notebook)
-        }
+        self.editor_trees = {}
+        for mode in self._EDITOR_ORDER:
+            _attr, label, _cols = self._EDITOR_SPECS[mode]
+            frame = ttk.Frame(editor_notebook)
+            editor_notebook.add(frame, text=label)
+            tree = self._create_empty_treeview(frame)
+            self.editor_trees[mode] = tree
 
-        editor_notebook.add(frames['carrier'], text=" CarrierConf ")
-        editor_notebook.add(frames['sector'], text=" SectorList ")
-        editor_notebook.add(frames['ru_spec'], text=" RU/MMU Spec ")
-        editor_notebook.add(frames['ciq'], text=" CIQ Azimuth ")
-
-        self.tree_carrier = self._create_empty_treeview(frames['carrier'])
-        self.tree_sector = self._create_empty_treeview(frames['sector'])
-        self.tree_ruspec = self._create_empty_treeview(frames['ru_spec'])
-        self.tree_ciq = self._create_empty_treeview(frames['ciq'])
-
-        editors = [
-            (frames['carrier'], 'carrier', self.tree_carrier),
-            (frames['sector'], 'sector', self.tree_sector),
-            (frames['ru_spec'], 'ru_spec', self.tree_ruspec),
-            (frames['ciq'], 'ciq', self.tree_ciq)
-        ]
-
-        for frame, mode, tree in editors:
             top_frame = ttk.Frame(frame)
             top_frame.pack(fill=tk.X, pady=5, before=tree.master)
             ttk.Button(top_frame, text="Excel/CSV 로드", command=lambda m=mode: self._load_editor_excel(m)).pack(side=tk.LEFT, padx=2)
             ttk.Button(top_frame, text="JSON 불러오기", command=lambda m=mode: self._load_editor_json(m)).pack(side=tk.LEFT, padx=2)
             ttk.Button(top_frame, text="JSON 저장하기", command=lambda m=mode: self._save_editor_json(m)).pack(side=tk.LEFT, padx=2)
+            # [v18.1] COR Matrix 탭에는 CM 위경도/Azimuth(+cu-coloc-conf)로부터 자동 생성하는 버튼을 추가한다.
+            if mode == 'cor':
+                ttk.Button(top_frame, text="🧭 CM에서 자동 생성", style='Primary.TButton',
+                           command=self._build_cor_matrix_from_cm).pack(side=tk.LEFT, padx=(10, 2))
             ttk.Label(top_frame, text="(더블 클릭 수정)", foreground="gray").pack(side=tk.RIGHT, padx=5)
 
             tree.bind("<Double-1>", lambda e, t=tree, m=mode: self._edit_tree_row(t, m))
@@ -1739,14 +1809,11 @@ class AppEditors(AppBase):
             ttk.Button(bot_frame, text="➕ 열 추가", command=lambda m=mode: self._add_editor_col(m)).pack(side=tk.LEFT, padx=2)
             ttk.Button(bot_frame, text="🗑️ 행 삭제", command=lambda t=tree, m=mode: self._delete_editor_row(t, m)).pack(side=tk.RIGHT, padx=2)
 
-        for mode in ['carrier', 'sector', 'ru_spec', 'ciq']:
+        for mode in self._EDITOR_ORDER:
             self._refresh_editor_tree(mode)
 
     def _refresh_editor_tree(self, mode):
-        if mode == 'carrier': tree, df = self.tree_carrier, self.carrier_df_internal
-        elif mode == 'sector': tree, df = self.tree_sector, self.sector_df_internal
-        elif mode == 'ru_spec': tree, df = self.tree_ruspec, self.ru_spec_df_internal
-        else: tree, df = self.tree_ciq, self.ciq_df_internal
+        tree, df = self.editor_trees[mode], self._editor_get_df(mode)
 
         tree.delete(*tree.get_children())
         if df.empty: return
@@ -1777,11 +1844,7 @@ class AppEditors(AppBase):
                 keep = [c for c in ['eNB_ID', 'cell-num', 'Azimuth'] if c in df.columns]
                 if keep: df = df[keep].drop_duplicates()
 
-            if mode == 'carrier': self.carrier_df_internal = df.copy()
-            elif mode == 'sector': self.sector_df_internal = df.copy()
-            elif mode == 'ru_spec': self.ru_spec_df_internal = df.copy()
-            else: self.ciq_df_internal = df.copy()
-
+            self._editor_set_df(mode, df.copy())
             self._refresh_editor_tree(mode)
             messagebox.showinfo("성공", f"{mode.title()} 데이터가 로드되었습니다.")
         except Exception as e: messagebox.showerror("오류", f"로드 실패:\n{e}")
@@ -1791,19 +1854,12 @@ class AppEditors(AppBase):
         if not filepath: return
         try:
             df = pd.read_json(filepath, orient='records', dtype=str)
-            if mode == 'carrier': self.carrier_df_internal = df
-            elif mode == 'sector': self.sector_df_internal = df
-            elif mode == 'ru_spec': self.ru_spec_df_internal = df
-            else: self.ciq_df_internal = df
+            self._editor_set_df(mode, df)
             self._refresh_editor_tree(mode)
         except Exception as e: messagebox.showerror("오류", f"JSON 로드 실패:\n{e}")
 
     def _save_editor_json(self, mode):
-        if mode == 'carrier': df = self.carrier_df_internal
-        elif mode == 'sector': df = self.sector_df_internal
-        elif mode == 'ru_spec': df = self.ru_spec_df_internal
-        else: df = self.ciq_df_internal
-
+        df = self._editor_get_df(mode)
         if df.empty: return messagebox.showwarning("경고", "저장할 데이터가 없습니다.")
         filepath = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON Files", "*.json")])
         if filepath:
@@ -1813,53 +1869,36 @@ class AppEditors(AppBase):
             except Exception as e: messagebox.showerror("오류", f"저장 실패:\n{e}")
 
     def _add_editor_col(self, mode):
-        if mode == 'carrier': df = self.carrier_df_internal
-        elif mode == 'sector': df = self.sector_df_internal
-        elif mode == 'ru_spec': df = self.ru_spec_df_internal
-        else: df = self.ciq_df_internal
-
+        df = self._editor_get_df(mode)
         col_name = simpledialog.askstring("열 추가", "추가할 열 이름을 입력하세요:")
         if col_name:
             df[col_name] = ""
-            if mode == 'carrier': self.carrier_df_internal = df
-            elif mode == 'sector': self.sector_df_internal = df
-            elif mode == 'ru_spec': self.ru_spec_df_internal = df
-            else: self.ciq_df_internal = df
+            self._editor_set_df(mode, df)
             self._refresh_editor_tree(mode)
 
     def _add_editor_row(self, mode):
-        if mode == 'carrier':
-            if self.carrier_df_internal.empty: self.carrier_df_internal = pd.DataFrame(columns=['Cat_ID', 'band', 'DSS'])
-            self.carrier_df_internal = pd.concat([self.carrier_df_internal, pd.DataFrame([{c: "" for c in self.carrier_df_internal.columns}])], ignore_index=True)
-        elif mode == 'sector':
-            if self.sector_df_internal.empty: self.sector_df_internal = pd.DataFrame(columns=['Cat_ID', 'eNB_ID', 'Sector'])
-            self.sector_df_internal = pd.concat([self.sector_df_internal, pd.DataFrame([{c: "" for c in self.sector_df_internal.columns}])], ignore_index=True)
-        elif mode == 'ru_spec':
-            if self.ru_spec_df_internal.empty: self.ru_spec_df_internal = pd.DataFrame(columns=['board-type', 'Tech', 'I/F', 'S_PA', 'Idle', 'Tx path off', 'PA off', 'Coe_paoff', 'Deep Sleep', 'Super Sleep'])
-            self.ru_spec_df_internal = pd.concat([self.ru_spec_df_internal, pd.DataFrame([{c: "" for c in self.ru_spec_df_internal.columns}])], ignore_index=True)
-        else:
-            if self.ciq_df_internal.empty: self.ciq_df_internal = pd.DataFrame(columns=['eNB_ID', 'cell-num', 'Azimuth'])
-            self.ciq_df_internal = pd.concat([self.ciq_df_internal, pd.DataFrame([{c: "" for c in self.ciq_df_internal.columns}])], ignore_index=True)
+        df = self._editor_get_df(mode)
+        if df.empty:
+            df = pd.DataFrame(columns=list(self._EDITOR_SPECS[mode][2]))
+        df = pd.concat([df, pd.DataFrame([{c: "" for c in df.columns}])], ignore_index=True)
+        self._editor_set_df(mode, df)
         self._refresh_editor_tree(mode)
 
     def _delete_editor_row(self, tree, mode):
         selected = tree.selection()
         if not selected: return
-        df = self.carrier_df_internal if mode == 'carrier' else (self.sector_df_internal if mode == 'sector' else (self.ru_spec_df_internal if mode == 'ru_spec' else self.ciq_df_internal))
+        df = self._editor_get_df(mode)
         for item in selected:
             if int(item) in df.index: df = df.drop(int(item))
         df = df.reset_index(drop=True)
-        if mode == 'carrier': self.carrier_df_internal = df
-        elif mode == 'sector': self.sector_df_internal = df
-        elif mode == 'ru_spec': self.ru_spec_df_internal = df
-        else: self.ciq_df_internal = df
+        self._editor_set_df(mode, df)
         self._refresh_editor_tree(mode)
 
     def _edit_tree_row(self, tree, mode):
         selected = tree.selection()
         if not selected: return
         idx = int(selected[0])
-        df = self.carrier_df_internal if mode == 'carrier' else (self.sector_df_internal if mode == 'sector' else (self.ru_spec_df_internal if mode == 'ru_spec' else self.ciq_df_internal))
+        df = self._editor_get_df(mode)
 
         popup = tk.Toplevel(self)
         popup.title("행 편집")
@@ -1886,10 +1925,7 @@ class AppEditors(AppBase):
 
         def save_edit():
             for col, ent in entries.items(): df.at[idx, col] = str(ent.get())
-            if mode == 'carrier': self.carrier_df_internal = df
-            elif mode == 'sector': self.sector_df_internal = df
-            elif mode == 'ru_spec': self.ru_spec_df_internal = df
-            else: self.ciq_df_internal = df
+            self._editor_set_df(mode, df)
             self._refresh_editor_tree(mode)
             popup.destroy()
 
@@ -2010,6 +2046,13 @@ class AppDashboard(AppEditors):
                 elif cl in ['connecteddigitalunitboardid', 'ruboardid', 'bid']: col_map[c] = 'ru-board-id'
                 elif cl in ['connecteddigitalunitportid', 'ruportid', 'ruport', 'portid']: col_map[c] = 'ru-port-id'
                 elif cl in ['cascaderadiounitid', 'rucascadeid', 'cascade', 'cascadeid']: col_map[c] = 'ru-cascade-id'
+                # [v18.1] COR(Coverage Overlap Ratio) 자동 산출용 지리정보(지시 10). CM에 위경도/Azimuth가
+                # 직접 있으면 여기서 인식하고, 없으면 Azimuth는 CIQ에서 병합한다. cu-coloc-conf는 위경도/
+                # Azimuth가 없을 때 offloading 대상을 특정하는 fallback CM 정보다.
+                elif cl in ['latitude', 'lat']: col_map[c] = 'Latitude'
+                elif cl in ['longitude', 'lon', 'lng', 'long']: col_map[c] = 'Longitude'
+                elif cl in ['azimuth', 'azimuthangle', 'antazimuth', 'antennaazimuth']: col_map[c] = 'Azimuth'
+                elif 'coloc' in cl: col_map[c] = 'cu-coloc-conf'
             cm_df.rename(columns=col_map, inplace=True)
 
             for col in ['eNB_ID', 'cell-num', 'ru-board-id', 'ru-port-id', 'ru-cascade-id']:
@@ -2022,7 +2065,9 @@ class AppDashboard(AppEditors):
             else: cm_df['Sector'] = ''
 
             ciq_df = self._normalize_core_cols(self.ciq_df_internal.copy())
-            if not ciq_df.empty and 'eNB_ID' in ciq_df.columns and 'cell-num' in ciq_df.columns and 'Azimuth' in ciq_df.columns:
+            # [v18.1] CM에 Azimuth가 이미 있으면(직접 인식) CIQ 병합을 건너뛴다 - 병합하면 Azimuth_x/_y로
+            # 쪼개져 이후 COR 산출이 컬럼을 못 찾는다. CM에 Azimuth가 없을 때만(기존 동작) CIQ에서 가져온다.
+            if 'Azimuth' not in cm_df.columns and not ciq_df.empty and 'eNB_ID' in ciq_df.columns and 'cell-num' in ciq_df.columns and 'Azimuth' in ciq_df.columns:
                 ciq_df['eNB_ID'] = self._extract_int_id(ciq_df['eNB_ID'])
                 ciq_df['cell-num'] = self._extract_int_id(ciq_df['cell-num'])
                 ciq_sub = ciq_df[['eNB_ID', 'cell-num', 'Azimuth']].drop_duplicates()
@@ -2030,6 +2075,10 @@ class AppDashboard(AppEditors):
 
             self.cm_map_df_full = cm_df
             self.ru_profile_df = self._build_ru_profile_table()
+            # [v18.1] NR COR(Coverage Overlap Ratio) matrix를 CM 지리정보로 자동 산출한다(지시 10). COR
+            # 에디터를 사용자가 이미 수동 편집한 경우 덮어쓰지 않도록, 비어 있을 때만 자동 생성한다.
+            if self.cor_df_internal.empty:
+                self._build_cor_matrix_from_cm(silent=True)
             self._update_cm_treeview(self.cm_map_df_full)
             self.status_label.config(text="CM 처리 완료", fg=self.ACCENT_GREEN)
 
@@ -2125,6 +2174,120 @@ class AppDashboard(AppEditors):
         if not query: return self._update_cm_treeview(self.cm_map_df_full)
         mask = np.column_stack([self.cm_map_df_full[col].astype(str).str.lower().str.contains(query, na=False) for col in self.cm_map_df_full])
         self._update_cm_treeview(self.cm_map_df_full.loc[mask.any(axis=1)])
+
+    # ------------------------------------------------------------------
+    # [v18.1] NR COR(Coverage Overlap Ratio) matrix 자동 산출 (지시 10)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        """두 위경도(도 단위) 사이 거리를 m로 반환(하버사인). lat2/lon2는 numpy 배열 가능(브로드캐스트)."""
+        R = 6371000.0
+        p1, p2 = np.radians(lat1), np.radians(lat2)
+        dphi = np.radians(lat2 - lat1)
+        dlmb = np.radians(lon2 - lon1)
+        a = np.sin(dphi / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlmb / 2.0) ** 2
+        return 2.0 * R * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+
+    @staticmethod
+    def _azimuth_diff(a, b):
+        """두 방위각(도) 사이의 원형 차이(0~180)."""
+        d = np.abs(a - b) % 360.0
+        return np.minimum(d, 360.0 - d)
+
+    def _build_cor_matrix_from_cm(self, silent=False):
+        """[v18.1] CM 지리정보로 NR COR matrix(long 포맷)를 자동 산출한다(지시 10).
+
+        각 source cell(eNB_ID, cell-num)에 대해:
+          1) 위경도 + Azimuth가 모두 있으면: 거리<=cor_distance_m(기본 10m)인 다른 cell 중 Azimuth가
+             가장 유사한 대상 1개를 COR=100%(Method='geo')로 기록. (나머지 대상은 0%이므로 행 생략)
+          2) 위경도/Azimuth가 없으면: cu-coloc-conf 값이 같은(비어있지 않은) 다른 cell을 colocated
+             대상으로 특정해 COR=100%(Method='coloc').
+          3) 둘 다 없으면: ES 미적용으로 분류(Method='none', COR=0, 대상 없음).
+
+        long 포맷 컬럼: eNB_ID_src / cell_src / eNB_ID_tgt / cell_tgt / COR / Method.
+        여기 나열되지 않은 (source,target) 쌍의 COR은 암묵적으로 0%다. 결과는 self.cor_df_internal에
+        저장하고 COR Matrix 에디터를 갱신한다. 사용자가 수동 편집한 뒤에는 CM 재처리 시 자동으로
+        덮어쓰지 않는다(_process_cm_ciq_data에서 cor가 비어 있을 때만 호출).
+
+        NOTE(확인 대기): cu-coloc-conf의 실제 값 포맷/의미(같은 값=colocated 그룹 가정)와, offloading
+        후보를 NR로 한정할지 여부는 지시 9의 알고리즘 구현 시점에 실데이터로 재확인 필요(To-Do)."""
+        cm = self.cm_map_df_full
+        if cm is None or cm.empty:
+            if not silent:
+                messagebox.showwarning("COR 자동 생성", "CM 데이터가 없습니다. 먼저 CM 데이터를 로드/처리해주세요.")
+            return
+
+        cols_l = {str(c).strip().lower(): c for c in cm.columns}
+        def col(*names):
+            for nm in names:
+                if nm in cols_l: return cm[cols_l[nm]]
+            return None
+
+        enb = col('enb_id')
+        cell = col('cell-num')
+        if enb is None or cell is None:
+            if not silent:
+                messagebox.showwarning("COR 자동 생성", "CM에 eNB_ID/cell-num 컬럼이 없어 COR을 산출할 수 없습니다.")
+            return
+
+        n = len(cm)
+        enb_a = enb.astype(str).to_numpy()
+        cell_a = cell.astype(str).to_numpy()
+        lat_s, lon_s, az_s = col('latitude'), col('longitude'), col('azimuth')
+        lat_a = pd.to_numeric(lat_s, errors='coerce').to_numpy() if lat_s is not None else np.full(n, np.nan)
+        lon_a = pd.to_numeric(lon_s, errors='coerce').to_numpy() if lon_s is not None else np.full(n, np.nan)
+        az_a = pd.to_numeric(az_s, errors='coerce').to_numpy() if az_s is not None else np.full(n, np.nan)
+        coloc_s = col('cu-coloc-conf')
+        coloc_a = coloc_s.astype(str).str.strip().to_numpy() if coloc_s is not None else np.full(n, '', dtype=object)
+
+        D = self.cor_distance_m.get() if hasattr(self, 'cor_distance_m') else 10.0
+        idx_all = np.arange(n)
+        has_geo = ~np.isnan(lat_a) & ~np.isnan(lon_a) & ~np.isnan(az_a)
+
+        recs = []
+        matched_geo = matched_coloc = classified_none = 0
+        for i in range(n):
+            tgt_i = None
+            method = 'none'
+            if has_geo[i]:
+                dist = self._haversine_m(lat_a[i], lon_a[i], lat_a, lon_a)
+                cand = has_geo & (idx_all != i) & (dist <= D)
+                if cand.any():
+                    azd = self._azimuth_diff(az_a[i], az_a)
+                    azd = np.where(cand, azd, np.inf)
+                    j = int(np.argmin(azd))
+                    if np.isfinite(azd[j]):
+                        tgt_i, method = j, 'geo'
+            if tgt_i is None and str(coloc_a[i]).strip() not in ('', 'nan', 'none', '-1'):
+                # cu-coloc-conf 값이 같은 다른 cell을 colocated 대상으로 특정(fallback).
+                same = (coloc_a == coloc_a[i]) & (idx_all != i)
+                if same.any():
+                    tgt_i, method = int(np.flatnonzero(same)[0]), 'coloc'
+
+            if tgt_i is not None:
+                recs.append({'eNB_ID_src': enb_a[i], 'cell_src': cell_a[i],
+                             'eNB_ID_tgt': enb_a[tgt_i], 'cell_tgt': cell_a[tgt_i],
+                             'COR': 100, 'Method': method})
+                if method == 'geo': matched_geo += 1
+                else: matched_coloc += 1
+            else:
+                recs.append({'eNB_ID_src': enb_a[i], 'cell_src': cell_a[i],
+                             'eNB_ID_tgt': '', 'cell_tgt': '',
+                             'COR': 0, 'Method': 'none'})
+                classified_none += 1
+
+        cor_cols = list(self._EDITOR_SPECS['cor'][2])
+        self.cor_df_internal = pd.DataFrame(recs, columns=cor_cols)
+        if hasattr(self, 'editor_trees') and 'cor' in getattr(self, 'editor_trees', {}):
+            self._refresh_editor_tree('cor')
+        if not silent:
+            messagebox.showinfo("COR 자동 생성 완료",
+                                f"COR matrix를 CM 지리정보로 산출했습니다.\n\n"
+                                f"- 전체 source cell: {n}개\n"
+                                f"- 위경도+Azimuth 기반(geo, 100%): {matched_geo}개\n"
+                                f"- cu-coloc-conf 기반(coloc, 100%): {matched_coloc}개\n"
+                                f"- 대상 미특정(none, ES 미적용): {classified_none}개\n\n"
+                                f"DB Editors ▸ COR Matrix 탭에서 확인/수정할 수 있습니다.")
 
     def _parse_energy_stat_raw(self):
         """Energy Stat CSV를 로드/정규화만 하고 Dashboard의 날짜/시간 필터는 적용하지 않는 원본 파서.
